@@ -94,3 +94,17 @@ Not a step of the plan: the setup that the plan starts from. No library code.
 - **Learned:**
   - The plan's Facts for `tls-crypt-v2` were exact (SPEC §21 O10). The message `TLS: Initial packet from` is not logged for a `CONTROL_WKC_V1` (SPEC §21 O11): the first version of the test waited for it and failed, while the server had in fact accepted the packet.
 
+## Step 1.8: the reliability layer (2026-11-21, tag `step-1.8`)
+
+- **Built:** `internal/reliable`, with no I/O, no goroutine and no clock:
+  - `Sender` (`NewSender(initialTimeout)`, `CanSend`, `Len`, `Queue`, `Due`, `NextDeadline`, `Ack`) and `Outgoing`: ids from 0, a window of 6, the wait of 2 s that doubles up to 128 s, the fast retransmission after three later packets are acknowledged, the opcode kept for each packet (a reset or a `CONTROL_WKC_V1` stays what it was when it is sent again).
+  - `Receiver` (zero value ready; `Receive`, `HasPendingAcks`, `Acks`): in-order delivery with a window of 12, acknowledgement of copies, a list of at most 8 acknowledgements to send, and the repetition of recent ones in later packets.
+  - The constants `SendWindow`, `ReceiveWindow`, `MaxAcks`. Ids are compared as serial numbers, so wrapping works (tested).
+- **OpenVPN files used as reference:** `reliable.c` (`reliable_send`, `reliable_send_purge`, `reliable_send_timeout`, `reliable_mark_active_outgoing`, `reliable_wont_break_sequentiality`, `reliable_not_replay`, `reliable_ack_write`, `copy_acks_to_mru`), `reliable.h` (the constants), `ssl.c` (`tls_pre_decrypt`, the receive side). The structure is not theirs: a slice of entries in id order for the sender, a map of early packets for the receiver, and "due" lists instead of one buffer at a time.
+- **Checks that ran:** `scripts/check.sh`, all thirteen OK. There is no parser in this step, so no fuzz target; the property test takes its place.
+- **Tests:** the retransmission times (sent at 0, 2, 6, 14, 30, 62, 126, 254, 382 s), the window of 6 (and its error route), the fast retransmission, repeated acknowledgements counting once, wrapping ids, the opcodes kept, receive windows (the last id kept, the next dropped), copies acknowledged, the list of 8 acknowledgements, the repetition of recent ones (newest first, 8 at most), the room of a packet. The property test runs a `Sender` and a `Receiver` over a simulated link in virtual time (no real sleep): 6 kinds of link (clean, reordering, duplicates, 10%, 30% and 60% loss) times 12 fixed seeds; each time all 150 payloads arrive once, in order.
+- **Learned:**
+  - The plan's Facts are right. One thing they leave open: OpenVPN acknowledges a copy of any older packet, and keeps a packet that is up to 11 ahead; both are as the Facts say, and are in SPEC §7.2 now.
+  - **A deviation (SPEC §20 V6):** OpenVPN's fast retransmission counts every acknowledgement of a later id, and the peer repeats ids in each packet, so one lost packet followed by one acknowledged packet whose ack is repeated three times is sent again at once. The code counts each later packet once. The wire is unchanged.
+  - A receiver that kept every early packet and acknowledged all of them would let a peer grow the list of acknowledgements without bound; the list is capped at 8 as the packet format requires, and a packet that finds it full is dropped to be sent again.
+

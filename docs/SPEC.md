@@ -212,6 +212,8 @@ The connections, listeners and resolver of `vpnnet` return what gVisor's `gonet`
 - Each control packet has a 32-bit id, starting at 0, with no gaps; a retransmission keeps its id. Acks are single ids, up to 8 in a packet, sent in `ACK_V1` or on other packets.
 - The numbers the peer depends on are OpenVPN's: 6 packets in the send window, 12 in the receive window. The retransmission starts from OpenVPN's timing: after 2 seconds (`--tls-timeout`), doubling each time up to 128 seconds, and at once when three later packets were acked.
 - TLS bytes are cut into control packets so that no packet is larger than the limit of §6.
+- Acknowledgements: a received packet is acknowledged when it is new and less than 12 ahead of the next expected id, and also when it is a copy of one already taken (its acknowledgement may have been lost). A packet more than 11 ahead, or one that arrives when 8 acknowledgements wait unsent, is dropped without an acknowledgement; the peer sends it again. Each outgoing packet repeats the most recently acknowledged ids while there is room (up to 8), as OpenVPN does.
+- Ids are compared with serial number arithmetic. A hard reset must have id 0 (the session checks that; the layer does not know opcodes).
 
 ### 7.3 Handshake (source `ssl.c`, `ssl_pkt.c`, `session_id.c`)
 1. The client sends `CONTROL_HARD_RESET_CLIENT_V2` (`V3` with `tls-crypt-v2`) with a random 64-bit session id.
@@ -383,6 +385,7 @@ HKDF, AES-GCM, HMAC, SHA-2, TLS and X.509 come from the standard library. Any ot
 - **V3** The profile parser refuses what it cannot honor instead of warning and going on (§12).
 - **V4** `internal/wire` parses strictly: an `ACK_V1` with bytes after its acknowledgements is refused (OpenVPN ignores them; no real server sends them), and the opcodes 1, 2 and 12 to 31 are refused (OpenVPN 2.7.9 accepts 3 to 11 only).
 - **V5** `internal/keys` refuses a static key file of 128 bytes (one key), which OpenVPN reads for `tls-auth` with no direction. `openvpn --genkey` writes 256 bytes, and a profile with an older key can be given a new one.
+- **V6** `internal/reliable` counts, for the fast retransmission, only the first acknowledgement of each later packet. OpenVPN counts every acknowledgement of a later id against the earlier packets, so an id that the peer repeats in each packet (as OpenVPN itself does, §7.2) can bring on a retransmission that no loss asked for. The wire does not change, and the draft's rule ("three packets sent later were acknowledged") is kept as written.
 
 ## 21. Observations
 
