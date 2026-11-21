@@ -225,6 +225,14 @@ func (s *Server) launch(t testing.TB, args []string) string {
 	return "openvpn was not ready after 10 seconds:\n" + s.Log()
 }
 
+// Stop ends the server now, without waiting for the end of the test, and
+// returns when the process has been waited for. It is safe to call more than
+// once; the cleanup of Start calls it again.
+func (s *Server) Stop(t testing.TB) {
+	t.Helper()
+	s.stop(t)
+}
+
 // stop ends the server's process group: SIGTERM, and SIGKILL if it is still
 // there after 3 seconds. It returns when the process has been waited for.
 func (s *Server) stop(t testing.TB) {

@@ -123,3 +123,22 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - The real server starts no session from an `ACK_V1` alone (SPEC §21 O7, O11); in the finished client the third packet is the ClientHello. Until step 1.11 the handshake therefore ends with the acknowledgement being sent, and this is written in SPEC §7.3.
   - A write to the link that blocks (a full TCP buffer) stops the loop, and so the handling of what arrives. It ends when the link is closed, so `Close` always works. A separate writer goroutine is for a later step if a test needs it.
 
+## Step 1.10: the handshake against the real server (2026-11-21, tag `step-1.10`)
+
+- **Built:** `Dial`, `Dialer` (`NetDialer`, `DialContext`, `Config`) and the exported tags `TagDialFailed` and `TagUnsupportedNetwork` in `dial.go`: `udp`, `udp4`, `udp6` make a connected socket and a `PacketClient`; `tcp`, `tcp4`, `tcp6` a `Client`. `Dial` returns after `HandshakeContext`, and closes the link when it fails. The context of `Dial` bounds the connecting and the handshake, not the life of the `Conn`. `internal/servertest`: `Server.Stop` (the server ends at once; used to get a port that refuses). The `servertest` helpers that make the key files existed since step 1.5.
+- **OpenVPN files used as reference:** `doc/man-sections/tls-options.rst` (`--tls-auth`, `--tls-crypt`, `--tls-crypt-v2`, `--auth`), through steps 1.5 to 1.7.
+- **Checks that ran:** `scripts/check.sh`, all OK (it now also lints the files of the `gopenvpn_server` tag, which were not linted before; they had no finding), including these tests under `scripts/vpn-ns.sh`. No parser: no fuzz target.
+- **Proof (the real server 2.7.9, `TestDialWithRealServer`, 10 rows):**
+  - UDP, no protection, `tls-auth` SHA-1, `tls-auth` SHA-256, `tls-crypt`: `Valid packet (P_ACK_V1) with HMAC challenge from peer ([AF_INET]127.0.0.1:52267), accepting new connection.` and `UDPv4 READ [62] from [AF_INET]127.0.0.1:52267: P_ACK_V1 kid=0 pid=[ #2 ]`.
+  - UDP, `tls-crypt-v2`: `Valid packet (P_CONTROL_WKC_V1) with HMAC challenge from peer (...), accepting new connection.`
+  - TCP, `tls-auth`: `TCPv4_SERVER READ [42] ...: P_CONTROL_HARD_RESET_CLIENT_V2 kid=0 pid=[ #1 ] ...`, `TLS: Initial packet from [AF_INET]127.0.0.1:54892, sid=cc99e47c 7bff7280`, then `READ [50] ...: P_ACK_V1 kid=0 pid=[ #2 ] [ 0 ] DATA len=0`.
+  - TCP, `tls-crypt-v2`: `READ [353] ...: P_CONTROL_HARD_RESET_CLIENT_V3 kid=0 pid=[ #251658241 ]`, `TLS: Initial packet from ...`, `READ [62] ...: P_ACK_V1 kid=0 pid=[ #251658242 ]`.
+  - A client with another `tls-crypt` key: `TagHandshakeTimeout` after the 3 seconds of `HandshakeTimeout`, and the server's log has `tls-crypt unwrap error: packet authentication failed` and no `sending HMAC based reset challenge` (`TestDialWithTheWrongKey`).
+  - A TCP server that is gone: `TagDialFailed`, and `errors.Is(err, syscall.ECONNREFUSED)` (`TestDialRefused`).
+- **Tests without a server:** `Dial` through `Dialer.DialContext` over the in-process peer for the six networks and the five protections; an unsupported network (six values) with its route; a dial that fails (a function that fails, a refused connection, a context that is done) with its route and metadata; `Dial` closes the link when the handshake fails, after exactly `HandshakeTimeout`; a context that ends after `Dial` does not end the connection; a TCP listener that does not speak OpenVPN gives `TagHandshakeTimeout`.
+- **Learned:**
+  - **The plan's Facts were wrong on one point, as step 1.9 found:** `TLS: Initial packet from` is not in the log of a UDP handshake that does not start with a hard reset it keeps state for; the log shows `Valid packet (...) with HMAC challenge ... accepting new connection.` (SPEC §21 O12). Over TCP the line is there, at the reset.
+  - An `ACK_V1` is enough as a third packet over UDP for everything but `tls-crypt-v2`, so the handshake as it is now needs no empty packet there. When TLS comes (step 1.11) the first TLS bytes take the place of that acknowledgement.
+  - The hook that the plan asks for, to stop after the reset exchange, is not needed yet: the handshake of `Conn` is the reset exchange. Step 1.11 adds an unexported field of `Config` for the tests of this exchange when `HandshakeContext` starts to run TLS.
+  - The tag `TagUnsupportedNetwork` and the other new tags are in SPEC §14.3.
+

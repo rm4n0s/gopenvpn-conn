@@ -90,3 +90,13 @@ func TestWaitLogTimesOutWithTheLog(t *testing.T) {
 		t.Errorf("WaitLog did not fail with the log: failed=%v msg=%q", rec.failed, rec.msg)
 	}
 }
+
+func TestStopEndsTheServerAtOnce(t *testing.T) {
+	s := Start(t, Options{})
+	pid := s.PID()
+	s.Stop(t)
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Errorf("the server process %d is still there after Stop: %v", pid, err)
+	}
+	s.Stop(t) // again: nothing happens
+}
