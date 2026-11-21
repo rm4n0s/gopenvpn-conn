@@ -90,3 +90,18 @@ func controlBody(t testing.TB, packetID uint32, payload []byte) []byte {
 	}
 	return body
 }
+
+// newCryptPair makes the wrappers of the two ends of one tls-crypt connection.
+func newCryptPair(t testing.TB, clk *clock) (client, server Wrapper) {
+	t.Helper()
+	key := testKey(0x50)
+	client, err := NewTLSCrypt(key, clk.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err = NewTLSCryptServer(key, clk.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, server
+}

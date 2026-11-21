@@ -158,3 +158,69 @@ func TestTLSAuthRefusedByRealServer(t *testing.T) {
 		t.Errorf("the server took a packet with the wrong key for a reset:\n%s", got)
 	}
 }
+
+// TestTLSCryptWithRealServer does for tls-crypt what TestTLSAuthWithRealServer
+// does for tls-auth: the reset is encrypted, the server decrypts it and its
+// answer, encrypted with the other key, decrypts here.
+func TestTLSCryptWithRealServer(t *testing.T) {
+	keyFile := servertest.GenKey(t, "tls-crypt")
+	f, err := os.Open(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	key, err := keys.ParseStaticKey(f)
+	if err != nil {
+		t.Fatalf("the key that openvpn made does not parse: %v", err)
+	}
+	srv := servertest.Start(t, servertest.Options{Extra: []string{"--tls-crypt", keyFile, "--verb", "7"}})
+
+	w, err := NewTLSCrypt(key, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, sid := resetExchange(t, w, srv.Addr(), 5*time.Second)
+	if answer == nil {
+		t.Fatalf("the server did not answer; its log:\n%s", srv.Log())
+	}
+	if answer.Opcode != wire.HardResetServerV2 {
+		t.Errorf("the answer is %v, want CONTROL_HARD_RESET_SERVER_V2", answer.Opcode)
+	}
+	if len(answer.Acks) != 1 || answer.Acks[0] != 0 {
+		t.Errorf("acks = %v, want [0]", answer.Acks)
+	}
+	if answer.RemoteSessionID != sid {
+		t.Errorf("the server's session id for us is %v, want %v", answer.RemoteSessionID, sid)
+	}
+	if answer.PacketID != 0 || answer.SessionID.IsZero() {
+		t.Errorf("packet id %d, session id %v", answer.PacketID, answer.SessionID)
+	}
+	srv.WaitLog(t, "Reset packet from client, sending HMAC based reset challenge", 2*time.Second)
+}
+
+func TestTLSCryptRefusedByRealServer(t *testing.T) {
+	serverKeyFile := servertest.GenKey(t, "tls-crypt")
+	srv := servertest.Start(t, servertest.Options{Extra: []string{"--tls-crypt", serverKeyFile, "--verb", "7"}})
+
+	// Another key: the packet does not decrypt to anything that authenticates.
+	w, err := NewTLSCrypt(testKey(0x77), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer, _ := resetExchange(t, w, srv.Addr(), time.Second); answer != nil {
+		t.Fatalf("the server answered a packet with the wrong key: %+v", answer)
+	}
+	srv.WaitLog(t, "tls-crypt unwrap error", 2*time.Second)
+	if got := srv.Log(); strings.Contains(got, "sending HMAC based reset challenge") {
+		t.Errorf("the server took a packet with the wrong key for a reset:\n%s", got)
+	}
+
+	// A tls-auth packet is not a tls-crypt packet either.
+	auth, err := NewTLSAuth(testKey(0x77), keys.Inverse, sha1.New, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer, _ := resetExchange(t, auth, srv.Addr(), time.Second); answer != nil {
+		t.Fatalf("a tls-crypt server answered a tls-auth packet: %+v", answer)
+	}
+}
