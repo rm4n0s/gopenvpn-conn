@@ -44,7 +44,7 @@ func TestDialer(t *testing.T) {
 			t.Run(tt.network+"/"+p.name, func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					before := runtime.NumGoroutine()
-					d, asked := dialerOver(t, tt.kind, p, vpntest.NoFault, &Config{ControlWrap: p.wrap(t)})
+					d, asked := dialerOver(t, tt.kind, p, vpntest.NoFault, &Config{ControlWrap: p.wrap(t), resetOnly: true})
 					conn, err := d.Dial(t.Context(), tt.network, "vpn.example:1194")
 					if err != nil {
 						t.Fatal(err)
@@ -88,7 +88,7 @@ func TestDialFunction(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	_, err = Dial(ctx, "tcp", ln.Addr().String(), &Config{HandshakeTimeout: 300 * time.Millisecond})
+	_, err = Dial(ctx, "tcp", ln.Addr().String(), &Config{HandshakeTimeout: 300 * time.Millisecond, resetOnly: true})
 	appErr, ok := errors.FromError(err)
 	if !ok || appErr.Tag != TagHandshakeTimeout {
 		t.Fatalf("Dial = %v, want %s", err, TagHandshakeTimeout)
@@ -161,7 +161,7 @@ func TestDialClosesTheLinkWhenTheHandshakeFails(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var link net.Conn
 		d := &Dialer{
-			Config: &Config{HandshakeTimeout: 5 * time.Second},
+			Config: &Config{HandshakeTimeout: 5 * time.Second, resetOnly: true},
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 				link, _ = pair(t, kinds[0], protections()[0], vpntest.Silent)
 				return link, nil
@@ -186,7 +186,7 @@ func TestDialClosesTheLinkWhenTheHandshakeFails(t *testing.T) {
 
 func TestDialContextOfTheCallerEndsOnlyTheHandshake(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		d, _ := dialerOver(t, kinds[0], protections()[0], vpntest.NoFault, nil)
+		d, _ := dialerOver(t, kinds[0], protections()[0], vpntest.NoFault, &Config{resetOnly: true})
 		ctx, cancel := context.WithCancel(t.Context())
 		conn, err := d.Dial(ctx, "udp", "x:1")
 		if err != nil {

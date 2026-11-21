@@ -144,7 +144,7 @@ func TestHandshake(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					before := runtime.NumGoroutine()
 					link, server := pair(t, k, p, vpntest.NoFault)
-					cfg := &Config{ControlWrap: p.wrap(t)}
+					cfg := &Config{ControlWrap: p.wrap(t), resetOnly: true}
 					conn := newClient(k, link, cfg)
 					if err := conn.HandshakeContext(t.Context()); err != nil {
 						t.Fatal(err)
@@ -175,13 +175,20 @@ func TestHandshake(t *testing.T) {
 	}
 }
 
-func TestNilConfigIsTheZeroConfig(t *testing.T) {
+func TestNilConfigIsRefusedForWantOfTLS(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		link, _ := pair(t, kinds[0], protections()[0], vpntest.NoFault)
-		conn := PacketClient(link, nil)
-		closeAtEnd(t, conn)
-		if err := conn.HandshakeContext(t.Context()); err != nil {
-			t.Fatal(err)
+		for name, cfg := range map[string]*Config{"nil": nil, "zero": {}} {
+			conn := PacketClient(link, cfg)
+			err := conn.HandshakeContext(t.Context())
+			appErr, ok := errors.FromError(err)
+			if !ok || appErr.Tag != tagInvalidConfig || !appErr.HasRoute("PacketClient->newConn.InvalidConfig") || appErr.Metadata["field"] != "TLS" {
+				t.Errorf("%s config: HandshakeContext = %v, want an invalid config for TLS", name, err)
+			}
+			if err := conn.Close(); err != nil {
+				t.Errorf("Close = %v", err)
+			}
+			link, _ = pair(t, kinds[0], protections()[0], vpntest.NoFault)
 		}
 	})
 }
@@ -199,7 +206,7 @@ func TestHandshakeTimeout(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				link, _ := pair(t, kinds[0], protections()[0], vpntest.Silent)
-				conn := PacketClient(link, &Config{HandshakeTimeout: tt.timeout})
+				conn := PacketClient(link, &Config{HandshakeTimeout: tt.timeout, resetOnly: true})
 				closeAtEnd(t, conn)
 				start := time.Now()
 				err := conn.HandshakeContext(t.Context())
@@ -221,7 +228,7 @@ func TestHandshakeTimeout(t *testing.T) {
 func TestHandshakeCanceled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		link, _ := pair(t, kinds[0], protections()[0], vpntest.Silent)
-		conn := PacketClient(link, nil)
+		conn := PacketClient(link, &Config{resetOnly: true})
 		closeAtEnd(t, conn)
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
@@ -234,7 +241,7 @@ func TestHandshakeCanceled(t *testing.T) {
 func TestConfigCanBeSharedAndIsNotChanged(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := protections()[4]
-		cfg := &Config{ControlWrap: p.wrap(t), HandshakeTimeout: time.Minute}
+		cfg := &Config{ControlWrap: p.wrap(t), HandshakeTimeout: time.Minute, resetOnly: true}
 		want := *cfg
 		for i := 0; i < 3; i++ {
 			link, _ := pair(t, kinds[0], p, vpntest.NoFault)

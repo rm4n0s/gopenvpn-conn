@@ -23,13 +23,18 @@ const (
 	// cause (an io.EOF, a closed connection) can be found with errors.Is.
 	// Metadata: "op" ("read" or "write").
 	TagLinkFailed = session.TagLinkFailed
+	// TagTLSHandshakeFailed: the TLS handshake with the server failed: a
+	// certificate that does not verify, a client certificate that the server
+	// refuses, no TLS version in common. The cause, a crypto/tls or x509
+	// error, can be found with errors.Is and errors.As.
+	TagTLSHandshakeFailed = session.TagTLSHandshakeFailed
 )
 
 // Conn is one session with a server.
 //
 // The data channel (Read and Write of IP packets) and the rest of net.Conn come
-// with the later steps of the library; so far a Conn completes the exchange of
-// resets with the server.
+// with the later steps of the library; so far a Conn completes the TLS
+// handshake with the server.
 type Conn struct {
 	s *session.Session
 }
@@ -55,10 +60,14 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 	opts := session.Options{
 		Link: link, Stream: stream, Logger: config.Logger,
 		HandshakeTimeout: config.HandshakeTimeout,
+		TLS:              config.TLS, ResetOnly: config.resetOnly,
 	}
 	switch {
 	case config.HandshakeTimeout < 0:
 		opts.Err = errors.New(tagInvalidConfig, "the handshake timeout is negative", "field", "HandshakeTimeout")
+		return &Conn{s: session.New(opts)}
+	case config.TLS == nil && !config.resetOnly:
+		opts.Err = errors.New(tagInvalidConfig, "Config.TLS is required: the server must be verified", "field", "TLS")
 		return &Conn{s: session.New(opts)}
 	case config.HandshakeTimeout == 0:
 		opts.HandshakeTimeout = DefaultHandshakeTimeout

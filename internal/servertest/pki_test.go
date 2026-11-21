@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//go:build linux
-
 package servertest
 
 import (
@@ -10,6 +8,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -87,7 +86,11 @@ func TestPKIFilesLoad(t *testing.T) {
 	if len(p.ClientCert.Certificate) != 1 || p.ClientCert.PrivateKey == nil {
 		t.Errorf("ClientCert is not a certificate with its key: %+v", p.ClientCert)
 	}
-	if info, err := os.Stat(p.ServerKeyFile); err != nil || info.Mode().Perm() != 0o600 {
+	if len(p.ServerCert.Certificate) != 1 || p.ServerCert.PrivateKey == nil {
+		t.Errorf("ServerCert is not a certificate with its key: %+v", p.ServerCert)
+	}
+	// Windows has no file modes of this kind.
+	if info, err := os.Stat(p.ServerKeyFile); err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o600) {
 		t.Errorf("the server key file must be mode 0600: %v %v", info, err)
 	}
 }
@@ -99,5 +102,21 @@ func TestPKIsAreDifferent(t *testing.T) {
 	}
 	if _, err := readCert(t, b.ServerCertFile).Verify(x509.VerifyOptions{Roots: a.CAPool}); err == nil {
 		t.Error("a server certificate verifies against the CA of another PKI")
+	}
+}
+
+func TestPKIWithALargeClientCertificate(t *testing.T) {
+	small := NewPKI(t)
+	large := NewPKIWith(t, PKIOptions{ClientCertNames: 60})
+	smallSize, largeSize := len(small.ClientCert.Certificate[0]), len(large.ClientCert.Certificate[0])
+	if largeSize < 10000 || largeSize < 10*smallSize {
+		t.Errorf("the large certificate is %d bytes (the small one %d), want at least 10000", largeSize, smallSize)
+	}
+	cert, err := x509.ParseCertificate(large.ClientCert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{Roots: large.CAPool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		t.Errorf("the large client certificate does not verify: %v", err)
 	}
 }

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//go:build linux
-
 package servertest
 
 import (
@@ -12,10 +10,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,7 +34,16 @@ type PKI struct {
 
 	CACert     *x509.Certificate
 	CAPool     *x509.CertPool // trusts only CACert
+	ServerCert tls.Certificate
 	ClientCert tls.Certificate
+}
+
+// PKIOptions change what NewPKIWith makes.
+type PKIOptions struct {
+	// ClientCertNames adds that many long DNS names to the client
+	// certificate, which makes it large (about 200 bytes a name): a test that
+	// needs a TLS handshake that does not fit one control packet uses it.
+	ClientCertNames int
 }
 
 // NewPKI makes a PKI in a directory that is removed when the test ends. The
@@ -42,6 +51,12 @@ type PKI struct {
 // DNS name "server" and the address 127.0.0.1; the client certificate has the
 // client auth usage and the common name "client".
 func NewPKI(t testing.TB) *PKI {
+	t.Helper()
+	return NewPKIWith(t, PKIOptions{})
+}
+
+// NewPKIWith is NewPKI with options.
+func NewPKIWith(t testing.TB, opts PKIOptions) *PKI {
 	t.Helper()
 	dir := t.TempDir()
 	now := time.Now()
@@ -75,10 +90,15 @@ func NewPKI(t testing.TB) *PKI {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}, caCert, &serverKey.PublicKey, caKey)
 
+	var clientNames []string
+	for i := 0; i < opts.ClientCertNames; i++ {
+		clientNames = append(clientNames, fmt.Sprintf("%03d.%s.example.test", i, strings.Repeat("a", 60)+"."+strings.Repeat("b", 60)+"."+strings.Repeat("c", 50)))
+	}
 	clientKey := newKey(t)
 	clientDER := sign(t, &x509.Certificate{
 		SerialNumber:          newSerial(t),
 		Subject:               pkix.Name{CommonName: "client"},
+		DNSNames:              clientNames,
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(24 * time.Hour),
 		BasicConstraintsValid: true,
@@ -102,6 +122,10 @@ func NewPKI(t testing.TB) *PKI {
 	writePEM(t, p.ServerKeyFile, "PRIVATE KEY", marshalKey(t, serverKey))
 	writePEM(t, p.ClientCertFile, "CERTIFICATE", clientDER)
 	writePEM(t, p.ClientKeyFile, "PRIVATE KEY", marshalKey(t, clientKey))
+	p.ServerCert = tls.Certificate{
+		Certificate: [][]byte{serverDER},
+		PrivateKey:  serverKey,
+	}
 	p.ClientCert = tls.Certificate{
 		Certificate: [][]byte{clientDER},
 		PrivateKey:  clientKey,

@@ -5,6 +5,7 @@ package session
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"time"
@@ -71,15 +72,37 @@ func (s *Session) loop() {
 		return
 	}
 	complete := false
+	tlsReady := s.tlsReady // nil once it has fired, and in ResetOnly mode
+	if s.opts.ResetOnly {
+		tlsReady = nil
+	}
 	for {
+		// What crypto/tls has written is taken once the server's reset is in,
+		// and only when the bytes of the last write are all in packets.
+		var outbound <-chan []byte
+		if !s.opts.ResetOnly && s.serverResetSeen && len(s.pending) == 0 {
+			outbound = s.out
+		}
+		select {
+		case msg := <-outbound:
+			s.pending = msg
+		default:
+		}
 		if err := s.flush(); err != nil {
 			s.fail(err)
 			return
 		}
-		if !complete && s.serverResetSeen && s.thirdSent && s.sender.Len() == 0 {
-			complete = true
-			handshake.Stop()
-			close(s.ready)
+		if !complete {
+			switch {
+			case s.opts.ResetOnly:
+				complete = s.serverResetSeen && s.thirdSent && s.sender.Len() == 0
+			default:
+				complete = tlsReady == nil
+			}
+			if complete {
+				handshake.Stop()
+				close(s.ready)
+			}
 		}
 		if at, ok := s.sender.NextDeadline(); ok {
 			retransmit.Reset(max(0, time.Until(at)))
@@ -91,6 +114,10 @@ func (s *Session) loop() {
 			return
 		case pkt := <-s.in:
 			s.handle(pkt)
+		case msg := <-outbound:
+			s.pending = msg
+		case <-tlsReady:
+			tlsReady = nil
 		case err := <-s.readErr:
 			s.fail(err)
 			return
@@ -115,6 +142,9 @@ func (s *Session) closeLink() {
 // flush sends the packets that are due, with the acknowledgements that wait
 // on them, and an ACK_V1 when acknowledgements still wait.
 func (s *Session) flush() error {
+	if err := s.fillSender(); err != nil {
+		return err
+	}
 	for _, o := range s.sender.Due(time.Now()) {
 		c := wire.Control{Opcode: o.Opcode, SessionID: s.sid, PacketID: o.ID, Payload: o.Payload}
 		s.addAcks(&c)
@@ -128,6 +158,27 @@ func (s *Session) flush() error {
 		if err := s.send(&c); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// fillSender cuts what crypto/tls wrote into control packets, as many as the
+// send window has room for. The first packet after the reset is a
+// CONTROL_WKC_V1, with less room, when the server asked for the wrapped key.
+//
+// OpenVPN: ssl.c write_outgoing_tls_ciphertext.
+func (s *Session) fillSender() error {
+	for len(s.pending) > 0 && s.sender.CanSend() {
+		op, room := wire.ControlV1, s.budget
+		if s.wkcAsked && !s.wkcSent {
+			op, room = wire.ControlWKCV1, max(minPayload, room-s.wkcLen)
+			s.wkcSent = true
+		}
+		n := min(room, len(s.pending))
+		if _, err := s.sender.Queue(op, s.pending[:n:n]); err != nil {
+			return err
+		}
+		s.pending = s.pending[n:]
 	}
 	return nil
 }
@@ -236,6 +287,12 @@ func (s *Session) handle(raw []byte) {
 	if op == wire.AckV1 {
 		return
 	}
+	if !s.opts.ResetOnly && s.adapter.queued() >= inboundLimit {
+		// Not acknowledged, so the server sends it again when TLS has caught
+		// up. Its acknowledgements were taken above.
+		s.drop("the TLS side has not read what is waiting", nil)
+		return
+	}
 	payloads, ack := s.receiver.Receive(c.PacketID, c.Payload)
 	if !ack {
 		s.drop("not accepted by the reliability layer", nil)
@@ -244,9 +301,12 @@ func (s *Session) handle(raw []byte) {
 	if op == wire.HardResetServerV2 && !s.serverResetSeen {
 		s.serverResetSeen = true
 		s.wkcAsked = resend
-		if resend && !s.wkcQueued {
-			// The server asks for the wrapped key again. Until TLS has bytes to
-			// send, an empty packet carries it, and the acknowledgement.
+		if len(payloads) > 0 {
+			payloads = payloads[1:] // the payload of the reset is the TLVs, not TLS
+		}
+		if resend && s.opts.ResetOnly && !s.wkcQueued {
+			// The server asks for the wrapped key again, and there is no TLS
+			// to send it with: an empty packet carries it, and the acknowledgement.
 			s.wkcQueued = true
 			if _, err := s.sender.Queue(wire.ControlWKCV1, nil); err != nil {
 				s.fail(err)
@@ -254,10 +314,27 @@ func (s *Session) handle(raw []byte) {
 			}
 		}
 	}
-	for range payloads {
-		// The bytes of TLS, until step 1.11.
-		s.drop("TLS bytes, and no TLS yet", nil)
+	for _, p := range payloads {
+		if s.opts.ResetOnly {
+			s.drop("TLS bytes, and no TLS in this mode", nil)
+			continue
+		}
+		s.adapter.push(p)
 	}
+}
+
+// tlsMain runs the TLS handshake over the control channel. It is a goroutine
+// of the session: it ends when the handshake does, and when the session ends
+// (the conn that crypto/tls reads and writes then fails).
+func (s *Session) tlsMain() {
+	defer s.wg.Done()
+	conn := tls.Client(s.adapter, s.tlsCfg)
+	if err := conn.Handshake(); err != nil {
+		s.fail(errors.NewErr(TagTLSHandshakeFailed, err))
+		return
+	}
+	s.tlsConn = conn
+	close(s.tlsReady)
 }
 
 // drop counts a packet that is not used, and says why at the debug level.

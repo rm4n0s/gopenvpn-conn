@@ -88,7 +88,7 @@ func TestDialWithRealServer(t *testing.T) {
 				srv := servertest.Start(t, servertest.Options{Proto: proto, Extra: append([]string{"--verb", "7"}, extra...)})
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				conn, err := Dial(ctx, proto, srv.Addr(), &Config{ControlWrap: wrap})
+				conn, err := Dial(ctx, proto, srv.Addr(), &Config{ControlWrap: wrap, resetOnly: true})
 				if err != nil {
 					t.Fatalf("Dial: %v\nserver log:\n%s", err, srv.Log())
 				}
@@ -132,7 +132,7 @@ func TestDialWithTheWrongKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	start := time.Now()
-	conn, err := Dial(ctx, "udp", srv.Addr(), &Config{ControlWrap: wrap, HandshakeTimeout: 3 * time.Second})
+	conn, err := Dial(ctx, "udp", srv.Addr(), &Config{ControlWrap: wrap, HandshakeTimeout: 3 * time.Second, resetOnly: true})
 	if conn != nil {
 		t.Fatal("Dial returned a connection with the wrong key")
 	}

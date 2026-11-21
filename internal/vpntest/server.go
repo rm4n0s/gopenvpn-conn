@@ -4,12 +4,15 @@ package vpntest
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rm4n0s/errors"
 
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/reliable"
@@ -44,6 +47,10 @@ type ServerOptions struct {
 	// AskForWKc makes the server's reset ask the client for its wrapped key
 	// again (the early negotiation TLV), when the client sent a V3 reset.
 	AskForWKc bool
+	// TLS, when set, makes the server run a TLS server over the control
+	// channel with this configuration, and send what it writes as control
+	// packets. When nil, the payloads are kept (Payload) and nothing is sent.
+	TLS *tls.Config
 	// Fault is how the server misbehaves.
 	Fault Fault
 	// RetransmitTimeout is the first wait before it sends a packet again;
@@ -68,6 +75,16 @@ type Server struct {
 	done chan struct{}
 	once sync.Once
 	wg   sync.WaitGroup
+
+	// The TLS side: crypto/tls runs on tlsEnd, and bridge is the other end of
+	// that pipe, which the server's two goroutines carry to and from the packets.
+	tlsEnd, bridge net.Conn
+	tlsOut         chan []byte // what TLS wrote, to be sent
+	tlsIn          chan []byte // what arrived, to be given to TLS
+	tlsDone        chan struct{}
+	tlsErr         error
+	tlsState       tls.ConnectionState
+	largest        int // the largest packet that came from the client, as it was on the link
 
 	// Owned by the loop goroutine.
 	sender     *reliable.Sender
@@ -96,6 +113,16 @@ func NewServer(tb testing.TB, link net.Conn, opts ServerOptions) *Server {
 	s.wg.Add(2)
 	go s.read(in)
 	go s.loop(in)
+	s.tlsDone = make(chan struct{})
+	if opts.TLS != nil {
+		s.tlsEnd, s.bridge = net.Pipe()
+		s.tlsOut = make(chan []byte)
+		s.tlsIn = make(chan []byte, 1024)
+		s.wg.Add(3)
+		go s.runTLS()
+		go s.bridgeRead()
+		go s.bridgeWrite()
+	}
 	tb.Cleanup(s.Close)
 	return s
 }
@@ -106,6 +133,15 @@ func (s *Server) Close() {
 		close(s.done)
 		if err := s.link.Close(); err != nil {
 			s.tb.Errorf("vpntest server: closing the link: %v", err)
+		}
+		if s.tlsEnd != nil {
+			// The pipe has no state worth reporting; closing it ends the TLS goroutines.
+			if err := s.tlsEnd.Close(); err != nil {
+				s.tb.Errorf("vpntest server: closing the TLS side: %v", err)
+			}
+			if err := s.bridge.Close(); err != nil {
+				s.tb.Errorf("vpntest server: closing the bridge: %v", err)
+			}
 		}
 	})
 	s.wg.Wait()
@@ -173,6 +209,15 @@ func (s *Server) loop(in <-chan []byte) {
 	timer.Stop()
 	defer timer.Stop()
 	for {
+		var tlsOut <-chan []byte
+		if s.opts.TLS != nil && s.haveRemote && s.sender.CanSend() {
+			tlsOut = s.tlsOut
+		}
+		select {
+		case chunk := <-tlsOut:
+			s.queueTLS(chunk)
+		default:
+		}
 		s.flush()
 		if at, ok := s.sender.NextDeadline(); ok {
 			timer.Reset(max(0, time.Until(at)))
@@ -184,8 +229,17 @@ func (s *Server) loop(in <-chan []byte) {
 			return
 		case raw := <-in:
 			s.handle(raw)
+		case chunk := <-tlsOut:
+			s.queueTLS(chunk)
 		case <-timer.C:
 		}
+	}
+}
+
+// queueTLS sends a chunk of what TLS wrote as a control packet.
+func (s *Server) queueTLS(chunk []byte) {
+	if _, err := s.sender.Queue(wire.ControlV1, chunk); err != nil {
+		s.tb.Errorf("vpntest server: %v", err)
 	}
 }
 
@@ -243,6 +297,7 @@ func (s *Server) handle(raw []byte) {
 	}
 	s.mu.Lock()
 	s.received = append(s.received, c)
+	s.largest = max(s.largest, len(raw))
 	s.mu.Unlock()
 	if s.opts.Fault == Silent {
 		return
@@ -260,9 +315,22 @@ func (s *Server) handle(raw []byte) {
 	if op == wire.AckV1 {
 		return
 	}
-	if _, ack := s.receiver.Receive(c.PacketID, c.Payload); !ack {
+	payloads, ack := s.receiver.Receive(c.PacketID, c.Payload)
+	if !ack {
 		s.drop()
 		return
+	}
+	if first && len(payloads) > 0 {
+		payloads = payloads[1:] // the reset has no TLS bytes
+	}
+	if s.opts.TLS != nil {
+		for _, p := range payloads {
+			select {
+			case s.tlsIn <- p:
+			default:
+				s.tb.Errorf("vpntest server: more than %d payloads wait for TLS", cap(s.tlsIn))
+			}
+		}
 	}
 	if first {
 		var payload []byte
@@ -288,15 +356,17 @@ func (s *Server) flush() {
 	}
 }
 
-// writeOrReport writes a packet. A failure while the server is closing is
-// expected; any other fails the test.
+// writeOrReport writes a packet. A failure because the link is closed, by the
+// client or by the server's own Close, is expected; any other fails the test.
 func (s *Server) writeOrReport(c *wire.Control) {
-	if err := s.write(c); err != nil {
-		select {
-		case <-s.done:
-		default:
-			s.tb.Errorf("vpntest server: write: %v", err)
-		}
+	err := s.write(c)
+	if err == nil || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+	select {
+	case <-s.done:
+	default:
+		s.tb.Errorf("vpntest server: write: %v", err)
 	}
 }
 
@@ -333,4 +403,88 @@ func (s *Server) write(c *wire.Control) error {
 	}
 	_, err = s.link.Write(packet)
 	return err
+}
+
+// TLSDone is closed when the TLS handshake of the server has ended, in success
+// or in failure. It is never closed when the server has no TLS configuration.
+func (s *Server) TLSDone() <-chan struct{} { return s.tlsDone }
+
+// TLSResult is the result of the TLS handshake, after TLSDone is closed: the
+// state of the connection and the error (nil when it completed).
+func (s *Server) TLSResult() (tls.ConnectionState, error) {
+	return s.tlsState, s.tlsErr
+}
+
+// LargestPacket is the size of the largest packet that came from the client, as
+// it was on the link (a datagram, or the packet without its TCP frame).
+func (s *Server) LargestPacket() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.largest
+}
+
+// runTLS runs crypto/tls as the server over the control channel.
+func (s *Server) runTLS() {
+	defer s.wg.Done()
+	conn := tls.Server(s.tlsEnd, s.opts.TLS)
+	err := conn.Handshake()
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	s.tlsErr = err
+	if err == nil {
+		s.tlsState = conn.ConnectionState()
+	}
+	close(s.tlsDone)
+}
+
+// serverChunk is how many bytes of TLS the server puts in a packet: far below
+// what a packet can hold, so the server needs no figures of the client's.
+const serverChunk = 900
+
+// bridgeRead takes what TLS writes and hands it to the loop, a chunk at a time.
+func (s *Server) bridgeRead() {
+	defer s.wg.Done()
+	buf := make([]byte, serverChunk)
+	for {
+		n, err := s.bridge.Read(buf)
+		if err != nil {
+			return
+		}
+		select {
+		case s.tlsOut <- append([]byte(nil), buf[:n]...):
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// bridgeWrite gives what arrived in order to TLS.
+func (s *Server) bridgeWrite() {
+	defer s.wg.Done()
+	for {
+		select {
+		case p := <-s.tlsIn:
+			if _, err := s.bridge.Write(p); err != nil {
+				return
+			}
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// CloseTLS ends the TLS server inside the server at once, so that the server
+// goes on reading and acknowledging packets and says nothing more. It is for the
+// tests of a server that stops in the middle of a handshake.
+func (s *Server) CloseTLS() error {
+	if s.tlsEnd == nil {
+		return nil
+	}
+	if err := s.tlsEnd.Close(); err != nil {
+		return err
+	}
+	return s.bridge.Close()
 }

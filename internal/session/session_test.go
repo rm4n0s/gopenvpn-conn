@@ -151,7 +151,7 @@ func newRig(t *testing.T, o rigOptions) *rig {
 	}
 	server := vpntest.NewServer(t, peer, o.server)
 	s := New(Options{
-		Link: client, Stream: o.transport.stream, Wrapper: o.wrap.client(t),
+		Link: client, Stream: o.transport.stream, Wrapper: o.wrap.client(t), ResetOnly: true,
 		HandshakeTimeout: o.timeout,
 	})
 	t.Cleanup(func() {
@@ -447,7 +447,7 @@ func TestCloseStopsEveryGoroutine(t *testing.T) {
 					client, peer = vpntest.NewDatagramPair(vpntest.LinkOptions{})
 				}
 				server := vpntest.NewServer(t, peer, vpntest.ServerOptions{Stream: tr.stream})
-				s := New(Options{Link: client, Stream: tr.stream, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute})
+				s := New(Options{Link: client, Stream: tr.stream, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute, ResetOnly: true})
 				if err := s.Handshake(t.Context()); err != nil {
 					t.Fatal(err)
 				}
@@ -478,7 +478,7 @@ func TestCloseStopsEveryGoroutine(t *testing.T) {
 func TestCloseBeforeTheHandshakeClosesTheLink(t *testing.T) {
 	client, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
 	closeAtEnd(t, peer)
-	s := New(Options{Link: client, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute})
+	s := New(Options{Link: client, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute, ResetOnly: true})
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestLinkFailures(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			client, peer := vpntest.NewStreamPair()
 			closeAtEnd(t, peer)
-			s := New(Options{Link: &brokenConn{Conn: client, writeErr: os.ErrPermission}, Stream: true, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute})
+			s := New(Options{Link: &brokenConn{Conn: client, writeErr: os.ErrPermission}, Stream: true, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute, ResetOnly: true})
 			closeAtEnd(t, s)
 			err := s.Handshake(t.Context())
 			appErr, ok := errors.FromError(err)
@@ -549,7 +549,7 @@ func TestLinkFailures(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			client, peer := vpntest.NewStreamPair()
 			go drain(peer) // a pipe has no buffer: someone reads what the session writes
-			s := New(Options{Link: client, Stream: true, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute})
+			s := New(Options{Link: client, Stream: true, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute, ResetOnly: true})
 			closeAtEnd(t, s)
 			result := make(chan error, 1)
 			go func() { result <- s.Handshake(t.Context()) }()
@@ -568,7 +568,7 @@ func TestLinkFailures(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			client, peer := vpntest.NewStreamPair()
 			go drain(peer) // a pipe has no buffer: someone reads what the session writes
-			s := New(Options{Link: client, Stream: true, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute})
+			s := New(Options{Link: client, Stream: true, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute, ResetOnly: true})
 			closeAtEnd(t, s)
 			result := make(chan error, 1)
 			go func() { result <- s.Handshake(t.Context()) }()
@@ -588,7 +588,7 @@ func TestLinkFailures(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			client, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
 			closeAtEnd(t, peer)
-			s := New(Options{Link: &brokenConn{Conn: client, closeErr: boom}, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Second})
+			s := New(Options{Link: &brokenConn{Conn: client, closeErr: boom}, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Second, ResetOnly: true})
 			_ = s.Handshake(t.Context()) // times out: the loop closes the link
 			err := s.Close()
 			appErr, ok := errors.FromError(err)
@@ -600,7 +600,7 @@ func TestLinkFailures(t *testing.T) {
 	t.Run("close before the start", func(t *testing.T) {
 		client, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
 		closeAtEnd(t, peer)
-		s := New(Options{Link: &brokenConn{Conn: client, closeErr: boom}, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Second})
+		s := New(Options{Link: &brokenConn{Conn: client, closeErr: boom}, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Second, ResetOnly: true})
 		err := s.Close()
 		if appErr, ok := errors.FromError(err); !ok || !appErr.HasRoute("Close.LinkCloseFailed") {
 			t.Fatalf("Close = %v, want a failed close of the link", err)

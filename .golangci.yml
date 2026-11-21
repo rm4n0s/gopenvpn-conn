@@ -49,6 +49,23 @@ linters:
           - gosec
         text: "G404"
 
+      # G402 flags InsecureSkipVerify. NewTLSConfig turns off the name check of
+      # crypto/tls and nothing else: an OpenVPN server's certificate is not for
+      # the address it is dialed at, and the chain is verified in
+      # VerifyConnection (tlsconfig.go, with tests for every case). This is
+      # the one place the plan allows it (docs/IMPLEMENTATION.md, step 1.11);
+      # it is not a path for any other file.
+      - path: ^tlsconfig\.go$
+        linters:
+          - gosec
+        text: "G402: TLS InsecureSkipVerify"
+      # G402 also flags a MinVersion below TLS 1.2. Two tests set TLS 1.0 on
+      # purpose, to show that the library raises it to TLS 1.2.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G402: TLS MinVersion too low"
+
 formatters:
   enable:
     - gofmt

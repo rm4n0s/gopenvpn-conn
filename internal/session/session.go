@@ -5,6 +5,7 @@ package session
 
 import (
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"sync"
@@ -48,6 +49,13 @@ type Options struct {
 	RetransmitTimeout time.Duration
 	// Logger gets the events of the session; nil means no logs.
 	Logger *slog.Logger
+	// TLS is the configuration of the TLS client that runs over the control
+	// channel. It is cloned, and a MinVersion below TLS 1.2 is raised to it.
+	// It is required unless ResetOnly is set.
+	TLS *tls.Config
+	// ResetOnly makes the handshake end with the exchange of resets, with no
+	// TLS: for the tests of that exchange.
+	ResetOnly bool
 	// Err, when set, is the error of a session that cannot start (the caller
 	// could not make its options). Only Link is needed then: Handshake returns
 	// Err, and Close closes the link.
@@ -71,8 +79,15 @@ type Session struct {
 	ready    chan struct{} // closed when the handshake is complete
 	wg       sync.WaitGroup
 
-	in      chan []byte // from the reader to the loop
-	readErr chan error
+	in       chan []byte // from the reader to the loop
+	readErr  chan error
+	out      chan []byte   // from the TLS side to the loop: what crypto/tls wrote
+	adapter  *controlConn  // the net.Conn that crypto/tls runs over
+	tlsReady chan struct{} // closed when the TLS handshake is complete
+	tlsConn  *tls.Conn     // set before tlsReady is closed
+	tlsCfg   *tls.Config
+	budget   int // bytes of TLS in a control packet
+	wkcLen   int // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
 	// Owned by the loop goroutine.
 	sender          *reliable.Sender
@@ -80,17 +95,19 @@ type Session struct {
 	remote          wire.SessionID // the server's
 	haveRemote      bool
 	serverResetSeen bool
-	wkcAsked        bool // the server's reset asked for the wrapped key again
-	wkcQueued       bool
-	thirdSent       bool // an acknowledgement of the server's reset went out
+	wkcAsked        bool   // the server's reset asked for the wrapped key again
+	wkcSent         bool   // the first packet after the reset went out as CONTROL_WKC_V1
+	wkcQueued       bool   // ResetOnly: the empty CONTROL_WKC_V1 is queued
+	pending         []byte // what crypto/tls wrote, not yet in packets
+	thirdSent       bool   // an acknowledgement of the server's reset went out
 	body, packet    []byte
 }
 
 // New makes a Session. It starts nothing: the first Handshake does. It panics
 // when a required option is missing, as that is a mistake in the caller.
 func New(opts Options) *Session {
-	if opts.Link == nil || (opts.Err == nil && (opts.Wrapper == nil || opts.HandshakeTimeout <= 0)) {
-		panic("session: Link, Wrapper and HandshakeTimeout are required")
+	if opts.Link == nil || (opts.Err == nil && (opts.Wrapper == nil || opts.HandshakeTimeout <= 0 || (opts.TLS == nil && !opts.ResetOnly))) {
+		panic("session: Link, Wrapper, HandshakeTimeout and TLS (unless ResetOnly) are required")
 	}
 	if opts.RetransmitTimeout <= 0 {
 		opts.RetransmitTimeout = DefaultRetransmitTimeout
@@ -112,9 +129,22 @@ func New(opts Options) *Session {
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
-	if _, ok := opts.Wrapper.(ctrlwrap.WKCWrapper); ok {
+	if w, ok := opts.Wrapper.(ctrlwrap.WKCWrapper); ok {
 		s.resetOp = wire.HardResetClientV3
+		s.wkcLen = w.WKcLen()
 	}
+	if opts.Wrapper != nil {
+		s.budget = payloadBudget(opts.Wrapper)
+	}
+	if opts.TLS != nil {
+		s.tlsCfg = opts.TLS.Clone()
+		if s.tlsCfg.MinVersion < tls.VersionTLS12 {
+			s.tlsCfg.MinVersion = tls.VersionTLS12
+		}
+	}
+	s.out = make(chan []byte)
+	s.tlsReady = make(chan struct{})
+	s.adapter = newControlConn(s)
 	if opts.Err != nil {
 		s.err = opts.Err
 		close(s.done)
@@ -173,6 +203,21 @@ func (s *Session) start() {
 	s.wg.Add(2)
 	go s.readLoop()
 	go s.loop()
+	if !s.opts.ResetOnly {
+		s.wg.Add(1)
+		go s.tlsMain()
+	}
+}
+
+// TLS is the TLS connection of the control channel once the handshake is
+// complete, and nil before.
+func (s *Session) TLS() *tls.Conn {
+	select {
+	case <-s.tlsReady:
+		return s.tlsConn
+	default:
+		return nil
+	}
 }
 
 // fail ends the session with err, unless it has ended already. It does not wait
@@ -228,6 +273,12 @@ const (
 	TagHandshakeTimeout = "HandshakeTimeout"
 	// TagLinkFailed: reading or writing the link failed.
 	TagLinkFailed = "LinkFailed"
+
+	// TagTLSHandshakeFailed: the TLS handshake with the server failed (a
+	// certificate that does not verify, a client certificate that the server
+	// refuses, a version that is not shared). The cause, a crypto/tls or
+	// x509 error, can be found with errors.Is and errors.As.
+	TagTLSHandshakeFailed = "TLSHandshakeFailed"
 
 	tagHandshakeCanceled = "HandshakeCanceled"
 	tagLinkCloseFailed   = "LinkCloseFailed"
