@@ -58,6 +58,10 @@ const (
 	// TagPacketTooLarge: Write got a packet larger than the MTU of the tunnel.
 	// Metadata: "len" and "mtu".
 	TagPacketTooLarge = session.TagPacketTooLarge
+	// TagPingTimeout: nothing authentic arrived from the server for PingTimeout (the
+	// pushed ping-restart, else Config.PingTimeout): the server or the path to it is
+	// gone. Metadata: "timeout".
+	TagPingTimeout = session.TagPingTimeout
 	// TagPacketIDExhausted: every packet id of the data key was used (4 billion
 	// packets), and the session ended rather than repeat a nonce: the last resort
 	// of the rule of SPEC §10.
@@ -94,6 +98,7 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 		Link: link, Stream: stream, Logger: config.Logger,
 		HandshakeTimeout: config.HandshakeTimeout,
 		TLS:              config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config), EpochUsageLimit: config.epochUsageLimit,
+		PingInterval: config.PingInterval, PingTimeout: config.PingTimeout,
 	}
 	if err := config.validate(); err != nil {
 		opts.Err = err

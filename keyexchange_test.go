@@ -199,6 +199,8 @@ func TestInvalidConfigFields(t *testing.T) {
 		field string
 	}{
 		{"negative handshake timeout", Config{HandshakeTimeout: -1}, "HandshakeTimeout"},
+		{"negative ping interval", Config{resetOnly: true, PingInterval: -time.Second}, "PingInterval"},
+		{"negative ping timeout", Config{resetOnly: true, PingTimeout: -time.Second}, "PingTimeout"},
 		{"no TLS", Config{}, "TLS"},
 		{"MTU too small", Config{resetOnly: true, MTU: 575}, "MTU"},
 		{"MTU too large", Config{resetOnly: true, MTU: 9001}, "MTU"},

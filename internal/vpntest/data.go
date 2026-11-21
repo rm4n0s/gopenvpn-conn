@@ -89,6 +89,12 @@ func (s *Server) handleData(raw []byte) {
 		return
 	}
 	d.rbuf = plain[:0]
+	if bytes.Equal(plain, pingString) {
+		s.mu.Lock()
+		s.pings++
+		s.mu.Unlock()
+		return
+	}
 	packet := bytes.Clone(plain)
 	s.mu.Lock()
 	s.dataIn = append(s.dataIn, packet)
@@ -140,6 +146,26 @@ func (s *Server) DataReceived() [][]byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([][]byte(nil), s.dataIn...)
+}
+
+// pingString is the payload of OpenVPN's keepalive ping (ping.c ping_string).
+var pingString = []byte{
+	0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb,
+	0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
+}
+
+// Pings is how many keepalive pings the server has received from the client; they
+// are not in DataReceived.
+func (s *Server) Pings() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pings
+}
+
+// SendPing sends the client a keepalive ping.
+func (s *Server) SendPing() error {
+	_, err := s.SendData(pingString)
+	return err
 }
 
 // DataDropped is how many data packets of the client the server could not open.

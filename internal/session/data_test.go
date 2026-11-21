@@ -5,6 +5,7 @@ package session
 import (
 	"bytes"
 	"crypto/tls"
+	"io"
 	"math"
 	"net"
 	"strings"
@@ -498,7 +499,7 @@ func TestWriteEndsTheSessionWhenThePacketIDsEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := r.session.Write([]byte{0x45, 2})
-		wantRoute(t, err, datachan.TagPacketIDExhausted, "Session.Write->Sender.Seal.DataPacketIDExhausted")
+		wantRoute(t, err, datachan.TagPacketIDExhausted, "Session.Write->Session.writeLocked->Sender.Seal.DataPacketIDExhausted")
 		if _, again := r.session.Read(make([]byte, 10)); again != err {
 			t.Errorf("Read = %v, want the same error", again)
 		}
@@ -598,4 +599,156 @@ func TestEpochsMoveDuringASession(t *testing.T) {
 			})
 		})
 	}
+}
+
+// errConn is a link whose next reads fail: the ICMP errors of a UDP socket, as a
+// test makes them. A Read that is already waiting is not touched.
+type errConn struct {
+	net.Conn
+	mu      sync.Mutex
+	pending int
+	err     error
+}
+
+func (c *errConn) Inject(n int, err error) {
+	c.mu.Lock()
+	c.pending, c.err = n, err
+	c.mu.Unlock()
+}
+
+func (c *errConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	if c.pending > 0 {
+		c.pending--
+		err := c.err
+		c.mu.Unlock()
+		return 0, err
+	}
+	c.mu.Unlock()
+	return c.Conn.Read(b)
+}
+
+// errFakeICMP is the error that a test gives a read, for the ICMP error of a UDP socket.
+var errFakeICMP = &errors.Error{Tag: tagFakeICMP, Message: "read: connection refused"}
+
+const tagFakeICMP = "FakeICMP"
+
+func errRig(t *testing.T, tr transport) (*tlsRig, *errConn) {
+	t.Helper()
+	var link *errConn
+	r := newTLSRig(t, tlsOptions{
+		rigOptions: rigOptions{transport: tr, wrap: wrapKinds[0]},
+		wrapLink: func(c net.Conn) net.Conn {
+			link = &errConn{Conn: c}
+			return link
+		},
+	})
+	return r, link
+}
+
+// A datagram link gives an error for an earlier packet (an ICMP port unreachable):
+// the session goes on, and the packets after it arrive.
+func TestReadErrorsOfADatagramLinkAreIgnored(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r, link := errRig(t, transports[0])
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		link.Inject(maxReadFailures, errFakeICMP) // as many as the session ignores in a row
+		if _, err := r.server.SendData([]byte{0x45, 1}); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 10)
+		if n, err := r.session.Read(buf); err != nil || n != 2 {
+			t.Fatalf("Read = %d, %v", n, err)
+		}
+		synctest.Wait()
+		if _, err := r.server.SendData([]byte{0x45, 2}); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := r.session.Read(buf); err != nil || n != 2 || buf[1] != 2 {
+			t.Fatalf("Read after the errors = %x, %v", buf[:n], err)
+		}
+		if _, err := r.session.Write([]byte{0x45}); err != nil {
+			t.Errorf("Write: %v", err)
+		}
+	})
+}
+
+// A link that fails again and again with no packet between is broken, and the
+// session ends with an error whose cause is the last one.
+func TestReadErrorsThatNeverStopEndTheSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r, link := errRig(t, transports[0])
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		link.Inject(1<<20, errFakeICMP)
+		if _, err := r.server.SendData([]byte{0x45, 1}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := r.session.Read(make([]byte, 10))
+		if n, rerr := r.session.Read(make([]byte, 10)); rerr == nil {
+			t.Fatalf("a second Read returned %d bytes", n)
+		}
+		_ = err
+		err = r.session.Err()
+		appErr, ok := errors.FromError(err)
+		if !ok || appErr.Tag != TagLinkFailed || appErr.Metadata["op"] != "read" || !errors.Is(err, errFakeICMP) || !appErr.HasRoute("Session.readLoop.LinkFailed") {
+			t.Fatalf("the session ended with %v (route %v), want %s with the fake error as cause", err, appErr, TagLinkFailed)
+		}
+		link.mu.Lock()
+		left := link.pending
+		link.mu.Unlock()
+		if used := (1 << 20) - left; used != maxReadFailures+1 {
+			t.Errorf("the session read %d times before it gave up, want %d", used, maxReadFailures+1)
+		}
+	})
+}
+
+// sendIgnoringTheEnd sends a data packet from the server. The injected error may be
+// taken by a read that comes before the packet, and the session is then gone when the
+// server writes: that is no failure of the test.
+func sendIgnoringTheEnd(t *testing.T, r *tlsRig) {
+	t.Helper()
+	if _, err := r.server.SendData([]byte{0x45, 1}); err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
+	}
+}
+
+// The end of the link is the end of the session, at once, on a datagram link
+// and on a stream.
+func TestClosedLinkEndsTheSession(t *testing.T) {
+	for _, tr := range transports {
+		for _, cause := range []error{net.ErrClosed, io.EOF, io.ErrClosedPipe} {
+			t.Run(tr.name+"/"+cause.Error(), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					r, link := errRig(t, tr)
+					if err := r.session.Handshake(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					link.Inject(1, cause)
+					sendIgnoringTheEnd(t, r)
+					synctest.Wait()
+					err := r.session.Err()
+					if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagLinkFailed || !errors.Is(err, cause) {
+						t.Fatalf("the session ended with %v, want %s caused by %v", err, TagLinkFailed, cause)
+					}
+				})
+			})
+		}
+	}
+	// A stream has no ICMP errors: any error of its link is the end.
+	synctest.Test(t, func(t *testing.T) {
+		r, link := errRig(t, transports[1])
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		link.Inject(1, errFakeICMP)
+		sendIgnoringTheEnd(t, r)
+		synctest.Wait()
+		if err := r.session.Err(); !errors.Is(err, errFakeICMP) {
+			t.Errorf("the session of a stream ended with %v, want the error of its link", err)
+		}
+	})
 }

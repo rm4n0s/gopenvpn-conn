@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"io"
+	"net"
 	"time"
 
 	"github.com/rm4n0s/errors"
@@ -22,6 +23,7 @@ import (
 func (s *Session) readLoop() {
 	defer s.wg.Done()
 	buf := make([]byte, maxPacket)
+	failures := 0 // read errors of a datagram link in a row, none of which was a packet
 	var br *bufio.Reader
 	if s.opts.Stream {
 		br = bufio.NewReader(s.opts.Link)
@@ -42,6 +44,9 @@ func (s *Session) readLoop() {
 			n, err = s.opts.Link.Read(buf)
 		}
 		if err != nil {
+			if !s.opts.Stream && s.transientRead(err, &failures) {
+				continue
+			}
 			select {
 			case <-s.done: // the link was closed by the session: not a failure
 			default:
@@ -49,12 +54,44 @@ func (s *Session) readLoop() {
 			}
 			return
 		}
+		failures = 0
 		select {
 		case s.in <- append([]byte(nil), buf[:n]...):
 		case <-s.done:
 			return
 		}
 	}
+}
+
+// maxReadFailures is how many read errors in a row a datagram link may give, with
+// no packet between them, before the session ends.
+const maxReadFailures = 64
+
+// transientRead reports whether a read error of a datagram link is one to go on
+// after: a connected UDP socket returns the ICMP "port unreachable" of an earlier
+// packet as an error of the next read (ECONNREFUSED on Linux and macOS, a reset on
+// Windows), which says nothing of the packets that follow, and OpenVPN ignores it
+// and lets the keepalive decide. So any error does not end the session, except
+// that the link is closed or ended, or that it fails over and over with no packet
+// in between (a socket that is broken for good).
+//
+// OpenVPN: socket.c link_socket_read_udp_posix (a failed read is logged and the
+// loop goes on).
+func (s *Session) transientRead(err error, failures *int) bool {
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+		return false
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	*failures++
+	if *failures > maxReadFailures {
+		return false
+	}
+	s.log.Debug("ignored a read error of the datagram link", "err", err)
+	return true
 }
 
 // loop owns the state: it handles the packets that the reader gives it, sends
@@ -69,6 +106,9 @@ func (s *Session) loop() {
 	retransmit := time.NewTimer(time.Hour)
 	retransmit.Stop()
 	defer retransmit.Stop()
+	keepalive := time.NewTimer(time.Hour)
+	keepalive.Stop()
+	defer keepalive.Stop()
 
 	if _, err := s.sender.Queue(s.resetOp, nil); err != nil {
 		s.fail(err)
@@ -107,6 +147,9 @@ func (s *Session) loop() {
 			}
 			if complete {
 				handshake.Stop()
+				if !s.opts.ResetOnly {
+					s.startKeepalive()
+				}
 				close(s.ready)
 			}
 		}
@@ -114,6 +157,11 @@ func (s *Session) loop() {
 			retransmit.Reset(max(0, time.Until(at)))
 		} else {
 			retransmit.Stop()
+		}
+		if wait, ok := s.keepaliveWait(); ok {
+			keepalive.Reset(wait)
+		} else {
+			keepalive.Stop()
 		}
 		select {
 		case <-s.done:
@@ -140,6 +188,10 @@ func (s *Session) loop() {
 				"timeout", s.opts.HandshakeTimeout.String()))
 			return
 		case <-retransmit.C:
+		case <-keepalive.C:
+			if !s.keepaliveTick() {
+				return
+			}
 		}
 	}
 }
@@ -226,6 +278,7 @@ func (s *Session) send(c *wire.Control) error {
 	if _, err := s.opts.Link.Write(out); err != nil {
 		return errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
 	}
+	s.touchSent()
 	if s.serverResetSeen && len(c.Acks) > 0 {
 		s.thirdSent = true
 	}
@@ -297,7 +350,8 @@ func (s *Session) handle(raw []byte) {
 		}
 	}
 
-	// From here the packet is the server's.
+	// From here the packet is the server's, and counts as something received.
+	s.lastRecv = time.Now()
 	if !s.haveRemote {
 		s.remote, s.haveRemote = c.SessionID, true
 	}

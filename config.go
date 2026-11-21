@@ -94,6 +94,17 @@ type Config struct {
 	// DefaultHandshakeTimeout. It is OpenVPN's --hand-window.
 	HandshakeTimeout time.Duration
 
+	// PingInterval is how long the connection may be idle before the client sends
+	// a keepalive ping (OpenVPN's --ping). A value that the server pushes (ping)
+	// wins. Zero means no ping unless the server pushes one; negative is invalid.
+	PingInterval time.Duration
+
+	// PingTimeout is how long the client waits for anything from the server before
+	// it ends the session with TagPingTimeout (--ping-restart). A value that the
+	// server pushes (ping-restart) wins. Zero means no timeout unless the server
+	// pushes one; negative is invalid.
+	PingTimeout time.Duration
+
 	// Logger gets the events of the connection, with the error of a failure
 	// as the attribute "err". It never gets a key, a password or a packet's
 	// bytes. Nil means no logs.
@@ -119,6 +130,10 @@ func (c *Config) validate() error {
 	switch {
 	case c.HandshakeTimeout < 0:
 		return errors.New(tagInvalidConfig, "the handshake timeout is negative", "field", "HandshakeTimeout")
+	case c.PingInterval < 0:
+		return errors.New(tagInvalidConfig, "the ping interval is negative", "field", "PingInterval")
+	case c.PingTimeout < 0:
+		return errors.New(tagInvalidConfig, "the ping timeout is negative", "field", "PingTimeout")
 	case c.TLS == nil && !c.resetOnly:
 		return errors.New(tagInvalidConfig, "Config.TLS is required: the server must be verified", "field", "TLS")
 	case c.MTU != 0 && (c.MTU < minMTU || c.MTU > maxMTU):

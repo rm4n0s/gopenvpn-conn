@@ -37,6 +37,8 @@ type tlsOptions struct {
 	noClientCert bool
 	ciphers      []string
 	mtu          int
+	ping         [2]time.Duration // PingInterval and PingTimeout
+	wrapLink     func(net.Conn) net.Conn
 }
 
 func newTLSRig(t *testing.T, o tlsOptions) *tlsRig {
@@ -83,9 +85,13 @@ func newTLSRig(t *testing.T, o tlsOptions) *tlsRig {
 		timeout = handshakeTimeout
 	}
 	srv := vpntest.NewServer(t, peer, o.server)
+	if o.wrapLink != nil {
+		link = o.wrapLink(link)
+	}
 	s := New(Options{
 		Link: link, Stream: o.transport.stream, Wrapper: o.wrap.client(t),
 		HandshakeTimeout: timeout, TLS: client, Ciphers: o.ciphers, MTU: o.mtu,
+		PingInterval: o.ping[0], PingTimeout: o.ping[1],
 	})
 	closeAtEnd(t, s)
 	return &tlsRig{rig: &rig{session: s, server: srv, client: link, peer: peer}, pki: pki}

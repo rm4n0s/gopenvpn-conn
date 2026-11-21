@@ -128,6 +128,7 @@ type Server struct {
 	data           *serverData
 	dataIn         [][]byte // the IP packets the server opened, in order
 	dataDropped    int      // the data packets it could not open
+	pings          int      // the keepalive pings it received
 	tlsErr         error
 	tlsState       tls.ConnectionState
 	largest        int // the largest packet that came from the client, as it was on the link

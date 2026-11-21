@@ -80,6 +80,10 @@ type Options struct {
 	Ciphers []string
 	// MTU is the tunnel MTU when the server pushes none; 1500 when zero.
 	MTU int
+	// PingInterval and PingTimeout are the keepalive when the server pushes none:
+	// the idle time after which a ping is sent, and the silence after which the
+	// session ends. Zero is off.
+	PingInterval, PingTimeout time.Duration
 	// EpochUsageLimit replaces the usage limit of the keys of the epoch data
 	// format. Only the tests set it.
 	EpochUsageLimit uint64
@@ -125,6 +129,8 @@ type Session struct {
 	extendAt time.Time                  // the latest end that AUTH_PENDING asked for; guarded by mu
 	began    time.Time                  // when the handshake began
 	data     atomic.Pointer[dataPath]   // the data channel, set before tlsReady is closed
+	base     time.Time                  // the zero of sentAt
+	sentAt   atomic.Int64               // when a packet last went to the link, as time since base
 	recv     chan []byte                // decrypted IP packets for Read
 	budget   int                        // bytes of TLS in a control packet
 	wkcLen   int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
@@ -135,9 +141,13 @@ type Session struct {
 	remote          wire.SessionID // the server's
 	haveRemote      bool
 	serverResetSeen bool
-	wkcAsked        bool   // the server's reset asked for the wrapped key again
-	wkcSent         bool   // the first packet after the reset went out as CONTROL_WKC_V1
-	wkcQueued       bool   // ResetOnly: the empty CONTROL_WKC_V1 is queued
+	wkcAsked        bool      // the server's reset asked for the wrapped key again
+	wkcSent         bool      // the first packet after the reset went out as CONTROL_WKC_V1
+	wkcQueued       bool      // ResetOnly: the empty CONTROL_WKC_V1 is queued
+	lastRecv        time.Time // when something authentic last came from the server
+	kaInterval      time.Duration
+	kaTimeout       time.Duration
+	kaOn            bool   // the keepalive runs: the handshake is complete
 	pending         []byte // what crypto/tls wrote, not yet in packets
 	thirdSent       bool   // an acknowledgement of the server's reset went out
 	body, packet    []byte
@@ -169,6 +179,7 @@ func New(opts Options) *Session {
 		readErr: make(chan error, 1),
 		recv:    make(chan []byte, recvQueue),
 		sender:  reliable.NewSender(opts.RetransmitTimeout),
+		base:    time.Now(),
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -334,6 +345,20 @@ func (s *Session) Close() error {
 	return s.closeErr
 }
 
+// Done is closed when the session has ended, by a failure or by Close.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
+// Err is the error that ended the session, or nil while it lives. After Close it
+// is net.ErrClosed.
+func (s *Session) Err() error {
+	select {
+	case <-s.done:
+		return s.result()
+	default:
+		return nil
+	}
+}
+
 // Link is the connection to the server.
 func (s *Session) Link() net.Conn { return s.opts.Link }
 
@@ -368,6 +393,9 @@ const (
 	TagServerHalt = "ServerHalt"
 	// TagServerRestart: the server sent RESTART. Metadata: "reason", "flags".
 	TagServerRestart = "ServerRestart"
+	// TagPingTimeout: nothing authentic arrived from the server for the keepalive
+	// timeout. Metadata: "timeout" (the duration).
+	TagPingTimeout = "PingTimeout"
 	// TagControlChannelFailed: reading or writing the control channel failed
 	// after the key exchange (the server ended the TLS session, or the
 	// connection broke). Metadata: "op" ("read" or "write").

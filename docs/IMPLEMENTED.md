@@ -263,3 +263,19 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - With the epoch bit announced the real server uses epochs for every test, so the 32-bit format would no longer be exercised by the real-server tests: the `noEpoch` knob keeps it.
   - Epochs are as strict as the receive window says: a sender that moves ahead faster than the peer's receiver can follow (a one-way flow with a tiny limit) is not opened. The real limit, 2^36, makes this unreachable in practice.
 
+## Step 2.7: keepalive (2026-11-22, tag `step-2.7`)
+
+- **Built:**
+  - `internal/session/keepalive.go`: `touchSent` and `sinceSent` (the time of the last packet to the link, kept atomically from any goroutine), `startKeepalive` (the values: pushed, else the options), `keepaliveWait` and `keepaliveTick` (end with `TagPingTimeout`, or send the ping); a third timer in the loop. `Session.Done` and `Session.Err`.
+  - `internal/session/data.go`: `Write` and the ping go through `writeLocked`; the loop stamps the time of the last authentic packet.
+  - `internal/session/loop.go`: **a read error of a datagram link no longer ends the session** (`transientRead`, see "Learned").
+  - Package `openvpn`: `Config.PingInterval`, `Config.PingTimeout` (negative is an invalid config), `TagPingTimeout`.
+  - `internal/vpntest`: the server counts the pings it receives (`Pings`) and sends one (`SendPing`).
+- **OpenVPN files used as reference:** `ping.c` (`ping_string`, `check_ping_send_dowork`, `trigger_ping_timeout_signal`), `ping.h` (`check_ping_restart`, `check_ping_send`), `forward.c` (where the two timers are reset); `link-options.rst` for `--ping`, `--ping-restart` and `--keepalive`.
+- **Checks that ran:** `scripts/check.sh`.
+- **Tests (unit, under `testing/synctest`):** an idle session pings at 10, 20 and 30 seconds and not before (both links); a write every 6 seconds puts the ping off for 2 minutes and then it comes 10 seconds after the last write; pings from the server keep the session up for 10 minutes and are not given to `Read`; silence ends the session after 60 seconds, with `TagPingTimeout` (route and `timeout` metadata) from `Read` and `Write` as the same value, and the client pinged meanwhile; forged and replayed packets every 10 seconds do not keep it up; the options apply when nothing is pushed, what is pushed wins, zero is off for an hour; no goroutine left after `Close`; in the public package a `Conn` with `PingInterval` and `PingTimeout` ends with the exported tag; the config rows for negative values. For the read errors of a datagram link: 64 in a row are ignored and the packets after them arrive; an unbroken series of 65 ends the session with `TagLinkFailed` (op `read`, the cause kept); `net.ErrClosed`, `io.EOF` and `io.ErrClosedPipe` end it at once, on both links; a stream ends at its first error.
+- **Proof (the real server 2.7.9, `--keepalive 1 3`):** `TestKeepaliveWithRealServer`, UDP and TCP: the server pushes ping 1 and ping-restart 3; the `Conn` is idle for 10 seconds, and 5 echo requests are then answered; the server is stopped and the session ends 3.0 seconds later with `TagPingTimeout` over UDP and 12 ms later with `TagLinkFailed` (`EOF`) over TCP.
+- **Learned:**
+  - The plan wanted `TagPingTimeout` within 5 seconds of the death of the server; the first run gave `TagLinkFailed` ("connection refused") after 1 second over UDP: the ICMP error of a connected UDP socket was read as the end of the link. OpenVPN lets the keepalive decide, and so does this library now (SPEC §11.1, §21 O22). The platform-neutral rule (any error except a closed or ended link, and not 64 in a row) avoids a build tag for the Windows error.
+  - A deterministic alternative to injecting the error with `ECONNREFUSED` itself: the tests use their own error, since the rule does not look at its type.
+

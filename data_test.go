@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/rm4n0s/errors"
 
@@ -105,6 +106,32 @@ func TestConnWithAServerThatDoesNotExportKeys(t *testing.T) {
 		err := conn.HandshakeContext(t.Context())
 		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagKeyDerivationUnsupported {
 			t.Fatalf("HandshakeContext = %v, want %s", err, TagKeyDerivationUnsupported)
+		}
+	})
+}
+
+// With nothing from the server, Read gives up after the keepalive timeout of the
+// Config (the server pushes none here), with the exported tag.
+func TestConnPingTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pki := servertest.NewPKI(t)
+		link, srv := tlsPairWith(t, kinds[0], protections()[0], serverTLS(pki, pki.ServerCert), func(o *vpntest.ServerOptions) {
+			o.PushMessages = []string{"PUSH_REPLY,topology subnet,ifconfig 10.8.0.2 255.255.255.0,cipher AES-256-GCM,peer-id 0,key-derivation tls-ekm"}
+		})
+		conn := PacketClient(link, &Config{
+			TLS:          NewTLSConfig(TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}}),
+			PingInterval: 3 * time.Second, PingTimeout: 10 * time.Second,
+		})
+		closeAtEnd(t, conn)
+		_, err := conn.Read(make([]byte, 10))
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagPingTimeout || appErr.Metadata["timeout"] != "10s" {
+			t.Fatalf("Read = %v, want %s", err, TagPingTimeout)
+		}
+		if got := srv.Pings(); got != 3 { // at 3, 6 and 9 seconds
+			t.Errorf("%d pings, want 3", got)
+		}
+		if _, werr := conn.Write([]byte{0x45}); werr != err {
+			t.Errorf("Write = %v, want the same error", werr)
 		}
 	})
 }

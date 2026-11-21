@@ -125,6 +125,7 @@ func (s *Session) handleData(raw []byte) {
 		return
 	}
 	d.rbuf = plain[:0]
+	s.lastRecv = time.Now() // authentic: a ping counts, though Read does not get it
 	if bytes.Equal(plain, pingString) {
 		s.log.Debug("a keepalive ping arrived")
 		return
@@ -194,6 +195,17 @@ func (s *Session) Write(b []byte) (int, error) {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := s.writeLocked(d, b); err != nil {
+		return 0, s.result()
+	}
+	return len(b), nil
+}
+
+// writeLocked seals one IP packet (or the ping) and writes it to the link. The
+// caller holds d.mu. A failure of the link, or the end of the packet ids, ends the
+// session: it is made here and stored, and the returned error is that one or, if the
+// session had ended already, no matter.
+func (s *Session) writeLocked(d *dataPath, b []byte) error {
 	d.wbuf = d.wbuf[:0]
 	if s.opts.Stream {
 		d.wbuf = append(d.wbuf, 0, 0) // the length of the frame goes here
@@ -201,17 +213,19 @@ func (s *Session) Write(b []byte) (int, error) {
 	packet, err := d.ch.Seal(d.wbuf, b)
 	if err != nil {
 		s.fail(err)
-		return 0, s.result()
+		return err
 	}
 	d.wbuf = packet
 	if s.opts.Stream {
 		binary.BigEndian.PutUint16(packet, uint16(min(len(packet)-2, 1<<16-1)))
 	}
 	if _, err := s.opts.Link.Write(packet); err != nil {
-		s.fail(errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write"))
-		return 0, s.result()
+		e := errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
+		s.fail(e)
+		return e
 	}
-	return len(b), nil
+	s.touchSent()
+	return nil
 }
 
 const (
