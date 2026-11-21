@@ -35,6 +35,8 @@ type tlsOptions struct {
 	pkiOptions   servertest.PKIOptions
 	askForWKc    bool
 	noClientCert bool
+	ciphers      []string
+	mtu          int
 }
 
 func newTLSRig(t *testing.T, o tlsOptions) *tlsRig {
@@ -83,7 +85,7 @@ func newTLSRig(t *testing.T, o tlsOptions) *tlsRig {
 	srv := vpntest.NewServer(t, peer, o.server)
 	s := New(Options{
 		Link: link, Stream: o.transport.stream, Wrapper: o.wrap.client(t),
-		HandshakeTimeout: timeout, TLS: client,
+		HandshakeTimeout: timeout, TLS: client, Ciphers: o.ciphers, MTU: o.mtu,
 	})
 	closeAtEnd(t, s)
 	return &tlsRig{rig: &rig{session: s, server: srv, client: link, peer: peer}, pki: pki}
@@ -668,7 +670,7 @@ func TestPushReplyInParts(t *testing.T) {
 		r := pushRig(t, vpntest.ServerOptions{PushMessages: []string{
 			"PUSH_REPLY,route 10.1.0.0 255.255.0.0,topology subnet,push-continuation 2",
 			"PUSH_REPLY,route 10.2.0.0 255.255.0.0,cipher AES-128-GCM,push-continuation 2",
-			"PUSH_REPLY,ifconfig 10.8.0.9 255.255.255.0,dhcp-option DNS 10.8.0.1,push-continuation 1",
+			"PUSH_REPLY,ifconfig 10.8.0.9 255.255.255.0,dhcp-option DNS 10.8.0.1,key-derivation tls-ekm,push-continuation 1",
 		}})
 		if err := r.session.Handshake(t.Context()); err != nil {
 			t.Fatal(err)

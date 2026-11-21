@@ -78,6 +78,8 @@ type Options struct {
 	// Ciphers are the data ciphers the client offered, in capitals; a cipher
 	// that the server pushes must be one of them. The default is the usual three.
 	Ciphers []string
+	// MTU is the tunnel MTU when the server pushes none; 1500 when zero.
+	MTU int
 	// ResetOnly makes the handshake end with the exchange of resets, with no
 	// TLS: for the tests of that exchange.
 	ResetOnly bool
@@ -118,6 +120,8 @@ type Session struct {
 	pushDone chan struct{}              // closed when the push reply is complete
 	extend   chan time.Time             // from the control reader to the loop: a later end for the handshake
 	began    time.Time                  // when the handshake began
+	data     atomic.Pointer[dataPath]   // the data channel, set before tlsReady is closed
+	recv     chan []byte                // decrypted IP packets for Read
 	budget   int                        // bytes of TLS in a control packet
 	wkcLen   int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
@@ -159,6 +163,7 @@ func New(opts Options) *Session {
 		ready:   make(chan struct{}),
 		in:      make(chan []byte, inQueue),
 		readErr: make(chan error, 1),
+		recv:    make(chan []byte, recvQueue),
 		sender:  reliable.NewSender(opts.RetransmitTimeout),
 	}
 	if s.log == nil {

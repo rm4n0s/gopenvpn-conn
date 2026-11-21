@@ -126,6 +126,10 @@ func NewSender(c Cipher, k *keys.DirectionKey, h Header) (*Sender, error) {
 // is due (RenegotiateAt). The sender goes on until the ids end.
 func (s *Sender) NeedsRenegotiation() bool { return s.done || s.next >= RenegotiateAt }
 
+// SetNextID makes id the id of the next packet. It is for the tests of the end of
+// the ids, which no real session reaches in a test's time; nothing else calls it.
+func (s *Sender) SetNextID(id uint32) { s.next, s.done = id, false }
+
 // Seal appends the packet that carries payload to dst and returns the result:
 // the first byte, the peer id (DATA_V2), the packet id, the tag and the
 // encrypted payload. With room in dst it allocates nothing. It never reuses a

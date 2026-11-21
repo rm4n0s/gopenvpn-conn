@@ -11,6 +11,7 @@ import (
 
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
+	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
 	"github.com/rm4n0s/gopenvpn-conn/internal/session"
 )
 
@@ -46,13 +47,26 @@ const (
 	// refuses, no TLS version in common. The cause, a crypto/tls or x509
 	// error, can be found with errors.Is and errors.As.
 	TagTLSHandshakeFailed = session.TagTLSHandshakeFailed
+	// TagKeyDerivationUnsupported: the server did not ask for the keys of the TLS
+	// exporter (key-derivation tls-ekm), the only derivation this library has.
+	// Metadata: "key_derivation".
+	TagKeyDerivationUnsupported = session.TagKeyDerivationUnsupported
+	// TagKeyExportFailed: the TLS session could not export the key material of the
+	// data channel (a TLS 1.2 session without the extended master secret); the
+	// cause is the crypto/tls error.
+	TagKeyExportFailed = session.TagKeyExportFailed
+	// TagPacketTooLarge: Write got a packet larger than the MTU of the tunnel.
+	// Metadata: "len" and "mtu".
+	TagPacketTooLarge = session.TagPacketTooLarge
+	// TagPacketIDExhausted: every packet id of the data key was used (4 billion
+	// packets), and the session ended rather than repeat a nonce: the last resort
+	// of the rule of SPEC §10.
+	TagPacketIDExhausted = datachan.TagPacketIDExhausted
 )
 
-// Conn is one session with a server.
-//
-// The data channel (Read and Write of IP packets) and the rest of net.Conn come
-// with the later steps of the library; so far a Conn completes the TLS
-// handshake with the server.
+// Conn is one session with a server: Read returns one IP packet that the server
+// sent, and Write sends one. The rest of net.Conn (the deadlines) comes with a
+// later step of the library.
 type Conn struct {
 	s   *session.Session
 	mtu int // the tunnel MTU of the Config, for ConnectionState before the server pushes one
@@ -79,7 +93,7 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 	opts := session.Options{
 		Link: link, Stream: stream, Logger: config.Logger,
 		HandshakeTimeout: config.HandshakeTimeout,
-		TLS:              config.TLS, ResetOnly: config.resetOnly,
+		TLS:              config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config),
 	}
 	if err := config.validate(); err != nil {
 		opts.Err = err
@@ -169,6 +183,19 @@ const libraryVersion = "0.2.0"
 // Each step that adds a feature adds its bit (SPEC §8.2).
 const implementedProto = ctrlmsg.IVProtoDataV2 | ctrlmsg.IVProtoRequestPush | ctrlmsg.IVProtoTLSKeyExport |
 	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp
+
+// Read returns the next IP packet that the server sent, waiting for it, as one
+// Read of a connected UDP socket does: a buffer that is too small gets the start
+// of the packet and the rest is dropped (ConnectionState().MTU is always enough).
+// It runs the handshake first when that has not run. When the session ends, Read
+// returns the error that ended it.
+func (c *Conn) Read(b []byte) (int, error) { return c.s.Read(b) }
+
+// Write sends one IP packet to the server. It runs the handshake first when that
+// has not run. A packet larger than ConnectionState().MTU is an error
+// (TagPacketTooLarge). A nil error does not mean that the packet arrived: the
+// data channel does not guarantee it.
+func (c *Conn) Write(b []byte) (int, error) { return c.s.Write(b) }
 
 // HandshakeContext runs the handshake if it has not run, and returns when it is
 // complete, when it fails, or when ctx is done. A done ctx ends the session: the

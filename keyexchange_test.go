@@ -281,7 +281,7 @@ func TestConnectionState(t *testing.T) {
 				"PUSH_REPLY,topology subnet,ifconfig 10.8.0.5 255.255.255.0,ifconfig-ipv6 fd00::1000/64 fd00::1,route-gateway 10.8.0.1," +
 					"route 192.168.50.0 255.255.255.0,route-ipv6 2001:db8::/32,redirect-gateway def1,dhcp-option DNS 10.8.0.1," +
 					"dhcp-option DOMAIN corp.example,tun-mtu 1400,ping 10,ping-restart 60,peer-id 3,cipher AES-128-GCM," +
-					"auth-token SECRETTOKEN,frobnicate,push-continuation 1",
+					"auth-token SECRETTOKEN,frobnicate,key-derivation tls-ekm,push-continuation 1",
 			}
 		})
 		conn := PacketClient(link, &Config{
@@ -318,7 +318,7 @@ func TestConnectionState(t *testing.T) {
 		if st.PingInterval != 10*time.Second || st.PingTimeout != time.Minute {
 			t.Errorf("ping %v, timeout %v", st.PingInterval, st.PingTimeout)
 		}
-		if len(st.PushedOptions) != 16 {
+		if len(st.PushedOptions) != 17 {
 			t.Errorf("%d pushed options: %q", len(st.PushedOptions), st.PushedOptions)
 		}
 		if !slices.Contains(st.PushedOptions, "frobnicate") || !slices.Contains(st.PushedOptions, "auth-token") {

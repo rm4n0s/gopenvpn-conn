@@ -75,6 +75,15 @@ type ServerOptions struct {
 	// CloseAfterKeyExchange makes the server end the TLS session (with its
 	// close alert) once it has answered the key exchange message.
 	CloseAfterKeyExchange bool
+	// DataCipher is the data cipher the server uses on the data channel; the
+	// usual push reply names AES-256-GCM, which is the default. A test that pushes
+	// another cipher says so here.
+	DataCipher string
+	// DataV1 makes the server's data packets DATA_V1 (no peer id), for a test whose
+	// push reply has no peer-id; the default is DATA_V2 with peer id 0.
+	DataV1 bool
+	// EchoData makes the server send every IP packet that it receives back.
+	EchoData bool
 	// Fault is how the server misbehaves.
 	Fault Fault
 	// RetransmitTimeout is the first wait before it sends a packet again;
@@ -110,6 +119,9 @@ type Server struct {
 	kx             *ClientKeyExchange
 	pushRequests   int
 	control        *tls.Conn // the TLS session, once the key exchange is done
+	data           *serverData
+	dataIn         [][]byte // the IP packets the server opened, in order
+	dataDropped    int      // the data packets it could not open
 	tlsErr         error
 	tlsState       tls.ConnectionState
 	largest        int // the largest packet that came from the client, as it was on the link
@@ -287,6 +299,10 @@ func (s *Server) handle(raw []byte) {
 		return
 	}
 	op, keyID := wire.SplitFirstByte(raw[0])
+	if op.IsData() {
+		s.handleData(raw)
+		return
+	}
 	switch op {
 	case wire.HardResetClientV2, wire.HardResetClientV3, wire.ControlV1, wire.ControlWKCV1, wire.AckV1:
 	default:
@@ -523,7 +539,7 @@ func (s *Server) keyExchange(conn *tls.Conn) {
 
 // DefaultPushReply is what the server pushes when the test does not say.
 const DefaultPushReply = "PUSH_REPLY,topology subnet,ifconfig 10.8.0.2 255.255.255.0,route-gateway 10.8.0.1," +
-	"cipher AES-256-GCM,ping 10,ping-restart 60,peer-id 0,tun-mtu 1500"
+	"cipher AES-256-GCM,ping 10,ping-restart 60,peer-id 0,tun-mtu 1500,key-derivation tls-ekm"
 
 // PushRequests is how many PUSH_REQUEST messages the server has read.
 func (s *Server) PushRequests() int {
@@ -535,6 +551,7 @@ func (s *Server) PushRequests() int {
 // serveControl sends the push messages when it is time, and counts the requests
 // that come, until the TLS session ends.
 func (s *Server) serveControl(conn *tls.Conn, buf []byte) {
+	s.setupData(conn)
 	s.mu.Lock()
 	s.control = conn
 	s.mu.Unlock()

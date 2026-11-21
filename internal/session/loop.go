@@ -233,6 +233,12 @@ func (s *Session) send(c *wire.Control) error {
 // does not belong is dropped, and nothing in it is used before it is shown to
 // be from the server: the protection first, then the session ids.
 func (s *Session) handle(raw []byte) {
+	if len(raw) > 0 {
+		if op, _ := wire.SplitFirstByte(raw[0]); op.IsData() {
+			s.handleData(raw)
+			return
+		}
+	}
 	if len(raw) < 1+wire.SessionIDSize {
 		s.drop("too short", nil)
 		return
@@ -446,6 +452,11 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 	}
 	for _, name := range pushed.Unknown {
 		s.log.Warn("the server pushed an option that is not known", "option", name)
+	}
+	state := s.tlsConn.ConnectionState()
+	if err := s.setupData(pushed, &state); err != nil {
+		s.fail(err)
+		return true
 	}
 	s.pushed, *ready = pushed, true
 	close(s.pushDone)
