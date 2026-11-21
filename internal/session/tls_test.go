@@ -609,3 +609,175 @@ func TestKeyExchangeCredentialsFailure(t *testing.T) {
 		}
 	})
 }
+
+// pushRig is a TLS session whose server pushes what the test says.
+func pushRig(t *testing.T, server vpntest.ServerOptions) *tlsRig {
+	t.Helper()
+	return newTLSRig(t, tlsOptions{rigOptions: rigOptions{transport: transports[0], wrap: wrapKinds[0], server: server}})
+}
+
+func TestPushReplyBeforeTheRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := pushRig(t, vpntest.ServerOptions{})
+		if r.session.Pushed() != nil {
+			t.Error("Pushed() is not nil before the handshake")
+		}
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		p := r.session.Pushed()
+		if p == nil || p.Cipher != "AES-256-GCM" || p.MTU != 1500 || len(p.Addrs) != 1 || p.Addrs[0].String() != "10.8.0.2/24" ||
+			p.PingInterval != 10*time.Second || p.PingRestart != time.Minute || !p.HasPeerID {
+			t.Errorf("pushed = %+v", p)
+		}
+		// No more requests once the reply is in.
+		synctest.Wait()
+		n := r.server.PushRequests()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if r.server.PushRequests() != n {
+			t.Errorf("PUSH_REQUEST went on after the reply: %d then %d", n, r.server.PushRequests())
+		}
+	})
+}
+
+func TestPushRequestIsRepeatedEveryFiveSeconds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := pushRig(t, vpntest.ServerOptions{ReplyAfterRequests: 3})
+		start := time.Now()
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		// Requests at 0, 5 and 10 seconds; the third brings the reply.
+		if elapsed := time.Since(start); elapsed < 10*time.Second || elapsed > 11*time.Second {
+			t.Errorf("the handshake took %v, want about 10s", elapsed)
+		}
+		if got := r.server.PushRequests(); got != 3 {
+			t.Errorf("%d requests, want 3", got)
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if got := r.server.PushRequests(); got != 3 {
+			t.Errorf("%d requests after the reply, want 3", got)
+		}
+	})
+}
+
+func TestPushReplyInParts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := pushRig(t, vpntest.ServerOptions{PushMessages: []string{
+			"PUSH_REPLY,route 10.1.0.0 255.255.0.0,topology subnet,push-continuation 2",
+			"PUSH_REPLY,route 10.2.0.0 255.255.0.0,cipher AES-128-GCM,push-continuation 2",
+			"PUSH_REPLY,ifconfig 10.8.0.9 255.255.255.0,dhcp-option DNS 10.8.0.1,push-continuation 1",
+		}})
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		p := r.session.Pushed()
+		if len(p.Routes) != 2 || p.Cipher != "AES-128-GCM" || p.Addrs[0].String() != "10.8.0.9/24" || len(p.DNSServers) != 1 {
+			t.Errorf("pushed = %+v", p)
+		}
+	})
+}
+
+func TestMessagesThatAreNotUnderstoodAreIgnored(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := pushRig(t, vpntest.ServerOptions{PushMessages: []string{
+			"INFO_PRE,hello", "two\x00messages", "PUSH_UPDATE,ping 5", vpntest.DefaultPushReply,
+		}})
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if r.session.Pushed().Cipher != "AES-256-GCM" {
+			t.Errorf("the reply was not taken: %+v", r.session.Pushed())
+		}
+	})
+}
+
+func TestNoPushReplyTimesOut(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := pushRig(t, vpntest.ServerOptions{PushMessages: []string{}})
+		err := r.session.Handshake(t.Context())
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagHandshakeTimeout {
+			t.Fatalf("Handshake = %v, want %s", err, TagHandshakeTimeout)
+		}
+		if got := r.server.PushRequests(); got < 5 {
+			t.Errorf("%d requests in %v, want one every 5 seconds", got, handshakeTimeout)
+		}
+		synctest.Wait()
+	})
+}
+
+func TestPushedOptionsThatEndTheSession(t *testing.T) {
+	tests := []struct {
+		reply string
+		tag   string
+		route string
+	}{
+		{"PUSH_REPLY,compress lz4", "UnsupportedPushedOption", "control->Pushed.Add->Pushed.apply.UnsupportedPushedOption"},
+		{"PUSH_REPLY,cipher AES-256-CBC", "UnsupportedPushedOption", "Pushed.apply.UnsupportedPushedOption"},
+		{"PUSH_REPLY,cipher AES-192-GCM", "CipherNegotiationFailed", "Pushed.apply.CipherNegotiationFailed"},
+		{"PUSH_REPLY,tun-mtu 5", "BadPushedOption", "Pushed.apply.BadPushedOption"},
+		{"PUSH_REPLY,topology subnet,ifconfig 10.8.0.2 255.0.255.0", "BadPushedOption", "control->Pushed.Finish.BadPushedOption"},
+		{"PUSH_REPLY,push-continuation 7", "BadPushedOption", "control->ParsePushReply.BadPushedOption"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reply, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := pushRig(t, vpntest.ServerOptions{PushMessages: []string{tt.reply}})
+				err := r.session.Handshake(t.Context())
+				appErr, ok := errors.FromError(err)
+				if !ok || appErr.Tag != tt.tag || !appErr.HasRoute(tt.route) {
+					t.Fatalf("Handshake = %v (route %v), want %s with route %s", err, appErr, tt.tag, tt.route)
+				}
+				if r.session.Pushed() != nil {
+					t.Error("Pushed() is not nil after a failure")
+				}
+				if again := r.session.Handshake(t.Context()); again != err {
+					t.Errorf("a second Handshake returned %v, want the same error", again)
+				}
+				synctest.Wait()
+			})
+		})
+	}
+}
+
+func TestTooManyPushedOptionsEndTheSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		part := "PUSH_REPLY" + strings.Repeat(",persist-tun", 800) + ",push-continuation 2"
+		parts := []string{part, part, part, part, part, part}
+		r := pushRig(t, vpntest.ServerOptions{PushMessages: parts})
+		err := r.session.Handshake(t.Context())
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != "TooManyPushedOptions" {
+			t.Fatalf("Handshake = %v, want TooManyPushedOptions (dropped %d, server got %d packets)", err, r.session.Dropped(), len(r.server.Received()))
+		}
+	})
+}
+
+func TestControlChannelEndsAfterTheHandshake(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := pushRig(t, vpntest.ServerOptions{CloseAfterPush: true})
+		err := r.session.Handshake(t.Context())
+		synctest.Wait()
+		if err != nil {
+			// The reply and the end can arrive together; either way the session has ended.
+			t.Logf("Handshake = %v", err)
+		}
+		again := r.session.Handshake(t.Context())
+		appErr, ok := errors.FromError(again)
+		if !ok || appErr.Tag != TagControlChannelFailed || !appErr.HasRoute("controlLoop.ControlChannelFailed") || appErr.Metadata["op"] != "read" {
+			t.Fatalf("Handshake after the server ended the session = %v, want %s", again, TagControlChannelFailed)
+		}
+	})
+}
+
+func TestControlMessageThatNeverEndsIsRefused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := pushRig(t, vpntest.ServerOptions{PushMessages: []string{strings.Repeat("a", 3*maxControlMessage)}})
+		err := r.session.Handshake(t.Context())
+		appErr, ok := errors.FromError(err)
+		if !ok || appErr.Tag != tagControlMessageTooLong || !appErr.HasRoute("controlLoop.ControlMessageTooLong") {
+			t.Fatalf("Handshake = %v, want %s", err, tagControlMessageTooLong)
+		}
+	})
+}

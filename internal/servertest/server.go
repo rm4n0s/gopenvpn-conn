@@ -33,16 +33,19 @@ const startAttempts = 3
 var devCounter atomic.Uint32
 
 // Options say how to start a server. The zero value is a UDP server with
-// DCO enabled where the kernel has it, on 10.8.0.0/24, that requires a client
+// the data channel in the server process (no DCO), on 10.8.0.0/24, that requires a client
 // certificate from the PKI (OpenVPN's default). A test that wants clients with
 // no certificate adds --verify-client-cert none and an authentication method
 // to Extra: the server refuses the first without the second.
 type Options struct {
 	// Proto is "udp" (the default) or "tcp".
 	Proto string
-	// DisableDCO adds --disable-dco: the data channel then runs in the
-	// openvpn process and not in the kernel.
-	DisableDCO bool
+	// EnableDCO lets the server use the kernel data channel (DCO) when the
+	// kernel has it. By default the server runs the data channel in its own
+	// process (--disable-dco): the private namespace of scripts/vpn-ns.sh has no
+	// right to create the kernel peers, and a server that tries answers every
+	// client with AUTH_FAILED ("dco_new_peer: Operation not permitted").
+	EnableDCO bool
 	// Subnet is the network of the tunnel; the server is its first host.
 	// The default is 10.8.0.0/24. A test that runs two servers at once gives
 	// each its own, and `go test -p 1` keeps the test programs apart.
@@ -68,14 +71,14 @@ type Server struct {
 
 // config is what buildArgs turns into a command line.
 type config struct {
-	pki        *PKI
-	proto      string
-	port       int
-	dev        string
-	subnet     netip.Prefix
-	logPath    string
-	disableDCO bool
-	extra      []string
+	pki       *PKI
+	proto     string
+	port      int
+	dev       string
+	subnet    netip.Prefix
+	logPath   string
+	enableDCO bool
+	extra     []string
 }
 
 // Start starts a server and returns when it is ready. It stops the server, and
@@ -120,14 +123,14 @@ func Start(t testing.TB, opts Options) *Server {
 			done:    make(chan struct{}),
 		}
 		args := buildArgs(config{
-			pki:        pki,
-			proto:      proto,
-			port:       port,
-			dev:        fmt.Sprintf("tungo%d_%d", os.Getpid(), devCounter.Add(1)%100),
-			subnet:     subnet,
-			logPath:    s.logPath,
-			disableDCO: opts.DisableDCO,
-			extra:      opts.Extra,
+			pki:       pki,
+			proto:     proto,
+			port:      port,
+			dev:       fmt.Sprintf("tungo%d_%d", os.Getpid(), devCounter.Add(1)%100),
+			subnet:    subnet,
+			logPath:   s.logPath,
+			enableDCO: opts.EnableDCO,
+			extra:     opts.Extra,
 		})
 		if failure := s.launch(t, args); failure != "" {
 			if strings.Contains(failure, "Address already in use") && attempt < startAttempts {
@@ -162,7 +165,7 @@ func buildArgs(c config) []string {
 		"--verb", "4",
 		"--log", c.logPath,
 	}
-	if c.disableDCO {
+	if !c.enableDCO {
 		args = append(args, "--disable-dco")
 	}
 	return append(args, c.extra...)

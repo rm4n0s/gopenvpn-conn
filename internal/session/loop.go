@@ -5,6 +5,7 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"io"
@@ -92,6 +93,9 @@ func (s *Session) loop() {
 		if err := s.flush(); err != nil {
 			s.fail(err)
 			return
+		}
+		if len(s.pending) > 0 {
+			outbound = nil // the bytes that are waiting go first: take no more
 		}
 		if !complete {
 			switch {
@@ -340,7 +344,115 @@ func (s *Session) tlsMain() {
 		return
 	}
 	s.tlsConn, s.serverKX = conn, kx
+	s.controlLoop(conn)
+}
+
+// controlLoop reads the control messages that the server sends in TLS, for as
+// long as the session lives. The handshake is complete when the PUSH_REPLY is:
+// until then PUSH_REQUEST is sent every 5 seconds. Messages that are not yet
+// understood are ignored and logged by name only.
+//
+// OpenVPN: push.c send_push_request, incoming_push_message.
+func (s *Session) controlLoop(conn *tls.Conn) {
+	s.wg.Add(1)
+	go s.pushRequests(conn)
+	var pushed ctrlmsg.Pushed
+	ready := false
+	buf := make([]byte, 1<<15)
+	var stream []byte // bytes read that do not make a whole message yet
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			select {
+			case <-s.done: // the session ended: this is how the read stops
+			default:
+				s.fail(errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "read"))
+			}
+			return
+		}
+		stream = append(stream, buf[:n]...)
+		// A message ends with a NUL and has none inside. OpenVPN's servers send
+		// each in one TLS record, but a record may be cut by another sender, and
+		// two messages may share one, so the NUL is what ends a message.
+		for {
+			end := bytes.IndexByte(stream, 0)
+			if end < 0 {
+				break
+			}
+			record := stream[:end+1]
+			stream = stream[end+1:]
+			if failed := s.control(record, &pushed, &ready); failed {
+				return
+			}
+		}
+		if len(stream) > maxControlMessage {
+			s.fail(errors.New(tagControlMessageTooLong, "a control message is too long", "max", maxControlMessage))
+			return
+		}
+		if len(stream) == 0 {
+			stream = nil
+		}
+	}
+}
+
+// control handles one control message. It reports true when the session has
+// failed and the loop is to stop.
+func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (failed bool) {
+	text := string(record[:len(record)-1]) // the text, without its NUL
+	if !ctrlmsg.IsPushReply(text) || *ready {
+		s.log.Debug("ignored a control message", "name", ctrlmsg.Name(text))
+		return false
+	}
+	reply, err := ctrlmsg.ParsePushReply(text)
+	if err != nil {
+		s.fail(err)
+		return true
+	}
+	if err := pushed.Add(reply, s.opts.Ciphers); err != nil {
+		s.fail(err)
+		return true
+	}
+	if reply.More {
+		return false
+	}
+	if err := pushed.Finish(); err != nil {
+		s.fail(err)
+		return true
+	}
+	for _, name := range pushed.Unknown {
+		s.log.Warn("the server pushed an option that is not known", "option", name)
+	}
+	s.pushed, *ready = pushed, true
+	close(s.pushDone)
 	close(s.tlsReady)
+	return false
+}
+
+// pushRequests sends PUSH_REQUEST at once and then every 5 seconds, until the
+// reply is complete or the session ends.
+func (s *Session) pushRequests(conn *tls.Conn) {
+	defer s.wg.Done()
+	request := ctrlmsg.AppendMessage(nil, ctrlmsg.PushRequest)
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-s.pushDone:
+			return
+		case <-s.done:
+			return
+		case <-timer.C:
+		}
+		if _, err := conn.Write(request); err != nil {
+			select {
+			case <-s.done:
+			default:
+				s.fail(errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "write"))
+			}
+			return
+		}
+		timer.Reset(pushRequestInterval)
+	}
 }
 
 // keyExchange sends the client's key exchange message in one TLS record and

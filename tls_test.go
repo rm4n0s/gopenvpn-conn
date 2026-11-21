@@ -28,6 +28,12 @@ func serverTLS(pki *servertest.PKI, cert tls.Certificate) *tls.Config {
 // tlsPair is pair with a server that runs TLS.
 func tlsPair(t *testing.T, k kind, p protection, server *tls.Config) (net.Conn, *vpntest.Server) {
 	t.Helper()
+	return tlsPairWith(t, k, p, server, nil)
+}
+
+// tlsPairWith is tlsPair with a change to the options of the server.
+func tlsPairWith(t *testing.T, k kind, p protection, server *tls.Config, change func(*vpntest.ServerOptions)) (net.Conn, *vpntest.Server) {
+	t.Helper()
 	var client, peer net.Conn
 	if k.stream {
 		client, peer = vpntest.NewStreamPair()
@@ -38,9 +44,13 @@ func tlsPair(t *testing.T, k kind, p protection, server *tls.Config) (net.Conn, 
 	if p.v3 {
 		wkc = len(v2Key(t).WKc)
 	}
-	srv := vpntest.NewServer(t, peer, vpntest.ServerOptions{
+	opts := vpntest.ServerOptions{
 		Stream: k.stream, Wrapper: p.server(t), WKcLen: wkc, AskForWKc: p.v3, TLS: server,
-	})
+	}
+	if change != nil {
+		change(&opts)
+	}
+	srv := vpntest.NewServer(t, peer, opts)
 	return client, srv
 }
 

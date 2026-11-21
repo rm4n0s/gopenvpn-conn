@@ -6,10 +6,14 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"net/netip"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/rm4n0s/errors"
 
@@ -102,7 +106,7 @@ func TestKeyExchangeFollowsTheConfig(t *testing.T) {
 		calls := 0
 		var ctxErrAtCall error
 		_, kx := kxRig(t, kinds[0], &Config{
-			DataCiphers: []string{"chacha20-poly1305", "AES-128-GCM"},
+			DataCiphers: []string{"chacha20-poly1305", "AES-256-GCM"},
 			MTU:         1400,
 			PeerInfo:    map[string]string{"UV_REGION": "eu", "UV_APP": "tests"},
 			Credentials: func(ctx context.Context) (Credentials, error) {
@@ -122,7 +126,7 @@ func TestKeyExchangeFollowsTheConfig(t *testing.T) {
 			t.Errorf("options string = %q", kx.Options)
 		}
 		info := peerInfoLines(kx.PeerInfo)
-		if info["IV_CIPHERS"] != "CHACHA20-POLY1305:AES-128-GCM" || info["IV_NCP"] != "" || info["IV_MTU"] != "1600" {
+		if info["IV_CIPHERS"] != "CHACHA20-POLY1305:AES-256-GCM" || info["IV_NCP"] != "" || info["IV_MTU"] != "1600" {
 			t.Errorf("peer info = %v", info)
 		}
 		if info["UV_REGION"] != "eu" || info["UV_APP"] != "tests" {
@@ -267,4 +271,122 @@ func TestIsIPv6AndPlatform(t *testing.T) {
 	if want != "" && platform() != want {
 		t.Errorf("platform() = %q on %s, want %q", platform(), runtime.GOOS, want)
 	}
+}
+
+func TestConnectionState(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pki := servertest.NewPKI(t)
+		link, _ := tlsPairWith(t, kinds[0], protections()[0], serverTLS(pki, pki.ServerCert), func(o *vpntest.ServerOptions) {
+			o.PushMessages = []string{
+				"PUSH_REPLY,topology subnet,ifconfig 10.8.0.5 255.255.255.0,ifconfig-ipv6 fd00::1000/64 fd00::1,route-gateway 10.8.0.1," +
+					"route 192.168.50.0 255.255.255.0,route-ipv6 2001:db8::/32,redirect-gateway def1,dhcp-option DNS 10.8.0.1," +
+					"dhcp-option DOMAIN corp.example,tun-mtu 1400,ping 10,ping-restart 60,peer-id 3,cipher AES-128-GCM," +
+					"auth-token SECRETTOKEN,frobnicate,push-continuation 1",
+			}
+		})
+		conn := PacketClient(link, &Config{
+			TLS: NewTLSConfig(TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}}),
+			MTU: 1300,
+		})
+		closeAtEnd(t, conn)
+
+		before := conn.ConnectionState()
+		if before.HandshakeComplete || before.MTU != 1300 || before.PeerID != 0xffffff || before.Cipher != "" || before.Addrs != nil {
+			t.Errorf("state before the handshake = %+v", before)
+		}
+		if err := conn.HandshakeContext(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		st := conn.ConnectionState()
+		if !st.HandshakeComplete || st.TLS.Version == 0 || !st.TLS.HandshakeComplete {
+			t.Errorf("HandshakeComplete = %v, TLS = %+v", st.HandshakeComplete, st.TLS.Version)
+		}
+		if st.Cipher != "AES-128-GCM" || st.PeerID != 3 || st.MTU != 1400 || !st.RedirectGateway {
+			t.Errorf("cipher %q, peer id %d, MTU %d, redirect %v", st.Cipher, st.PeerID, st.MTU, st.RedirectGateway)
+		}
+		wantAddrs := []netip.Prefix{netip.MustParsePrefix("10.8.0.5/24"), netip.MustParsePrefix("fd00::1000/64")}
+		if !reflect.DeepEqual(st.Addrs, wantAddrs) || st.Gateway != netip.MustParseAddr("10.8.0.1") {
+			t.Errorf("addrs %v, gateway %v", st.Addrs, st.Gateway)
+		}
+		wantRoutes := []Route{{Prefix: netip.MustParsePrefix("192.168.50.0/24")}, {Prefix: netip.MustParsePrefix("2001:db8::/32")}}
+		if !reflect.DeepEqual(st.Routes, wantRoutes) {
+			t.Errorf("routes = %+v", st.Routes)
+		}
+		if !reflect.DeepEqual(st.DNSServers, []netip.Addr{netip.MustParseAddr("10.8.0.1")}) || !reflect.DeepEqual(st.SearchDomains, []string{"corp.example"}) {
+			t.Errorf("DNS %v, domains %v", st.DNSServers, st.SearchDomains)
+		}
+		if st.PingInterval != 10*time.Second || st.PingTimeout != time.Minute {
+			t.Errorf("ping %v, timeout %v", st.PingInterval, st.PingTimeout)
+		}
+		if len(st.PushedOptions) != 16 {
+			t.Errorf("%d pushed options: %q", len(st.PushedOptions), st.PushedOptions)
+		}
+		if !slices.Contains(st.PushedOptions, "frobnicate") || !slices.Contains(st.PushedOptions, "auth-token") {
+			t.Errorf("pushed options = %q", st.PushedOptions)
+		}
+		for _, o := range st.PushedOptions {
+			if strings.Contains(o, "SECRETTOKEN") {
+				t.Errorf("the token is in the pushed options: %q", o)
+			}
+		}
+		// A copy: changing it changes nothing.
+		st.Addrs[0] = netip.Prefix{}
+		st.PushedOptions[0] = "changed"
+		st.DNSServers[0] = netip.Addr{}
+		if again := conn.ConnectionState(); again.Addrs[0] != wantAddrs[0] || again.PushedOptions[0] == "changed" || !again.DNSServers[0].IsValid() {
+			t.Error("ConnectionState does not return a copy")
+		}
+	})
+}
+
+func TestPushedOptionThatEndsTheHandshake(t *testing.T) {
+	tests := []struct {
+		reply string
+		tag   string
+		meta  string
+		value string
+	}{
+		{"PUSH_REPLY,compress lz4", TagUnsupportedPushedOption, "option", "compress"},
+		{"PUSH_REPLY,fragment 1200", TagUnsupportedPushedOption, "option", "fragment"},
+		{"PUSH_REPLY,cipher AES-256-CBC", TagUnsupportedPushedOption, "option", "cipher"},
+		{"PUSH_REPLY,cipher AES-192-GCM", TagCipherNegotiationFailed, "cipher", "AES-192-GCM"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reply, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				pki := servertest.NewPKI(t)
+				link, _ := tlsPairWith(t, kinds[0], protections()[0], serverTLS(pki, pki.ServerCert), func(o *vpntest.ServerOptions) {
+					o.PushMessages = []string{tt.reply}
+				})
+				conn := PacketClient(link, &Config{TLS: NewTLSConfig(TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}})})
+				closeAtEnd(t, conn)
+				err := conn.HandshakeContext(t.Context())
+				appErr, ok := errors.FromError(err)
+				if !ok || appErr.Tag != tt.tag || appErr.Metadata[tt.meta] != tt.value {
+					t.Fatalf("HandshakeContext = %v, want %s with %s=%s", err, tt.tag, tt.meta, tt.value)
+				}
+				if conn.ConnectionState().HandshakeComplete {
+					t.Error("the state says the handshake is complete")
+				}
+			})
+		})
+	}
+}
+
+func TestOnlyTheOfferedCiphersAreAccepted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pki := servertest.NewPKI(t)
+		link, _ := tlsPairWith(t, kinds[0], protections()[0], serverTLS(pki, pki.ServerCert), func(o *vpntest.ServerOptions) {
+			o.PushMessages = []string{"PUSH_REPLY,cipher AES-128-GCM"}
+		})
+		conn := PacketClient(link, &Config{
+			TLS:         NewTLSConfig(TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}}),
+			DataCiphers: []string{"CHACHA20-POLY1305"},
+		})
+		closeAtEnd(t, conn)
+		err := conn.HandshakeContext(t.Context())
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagCipherNegotiationFailed {
+			t.Fatalf("HandshakeContext = %v, want %s", err, TagCipherNegotiationFailed)
+		}
+	})
 }

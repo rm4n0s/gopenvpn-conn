@@ -35,7 +35,7 @@ func TestBuildArgs(t *testing.T) {
 				{"--ca", "/p/ca.crt"}, {"--cert", "/p/s.crt"}, {"--key", "/p/s.key"},
 				{"--dh", "none"}, {"--log", "/l/server.log"},
 			},
-			not: []string{"--disable-dco", "--verify-client-cert"},
+			not: []string{"--verify-client-cert"},
 		},
 		{
 			name: "tcp",
@@ -43,9 +43,14 @@ func TestBuildArgs(t *testing.T) {
 			want: [][]string{{"--proto", "tcp"}, {"--port", "5000"}},
 		},
 		{
-			name: "disable dco",
-			edit: func(c *config) { c.disableDCO = true },
+			name: "no dco by default",
+			edit: func(c *config) {},
 			want: [][]string{{"--disable-dco"}},
+		},
+		{
+			name: "dco on request",
+			edit: func(c *config) { c.enableDCO = true },
+			not:  []string{"--disable-dco"},
 		},
 		{
 			name: "another subnet",

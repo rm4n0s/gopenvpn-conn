@@ -20,6 +20,15 @@ import (
 	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
 )
 
+// maxControlMessage is the longest control message, with its NUL, that is
+// waited for: a message is one TLS record of 16 KB at most in OpenVPN, and a
+// PUSH_REPLY that is longer comes in parts.
+const maxControlMessage = 1 << 16
+
+// pushRequestInterval is how often PUSH_REQUEST is sent until the server's
+// reply is complete: OpenVPN sends it every 5 seconds.
+const pushRequestInterval = 5 * time.Second
+
 // DefaultRetransmitTimeout is the first wait before a control packet that is not
 // acknowledged is sent again: OpenVPN's --tls-timeout.
 const DefaultRetransmitTimeout = 2 * time.Second
@@ -61,6 +70,9 @@ type Options struct {
 	Options     string
 	PeerInfo    string
 	Credentials func(ctx context.Context) (username, password string, err error)
+	// Ciphers are the data ciphers the client offered, in capitals; a cipher
+	// that the server pushes must be one of them. The default is the usual three.
+	Ciphers []string
 	// ResetOnly makes the handshake end with the exchange of resets, with no
 	// TLS: for the tests of that exchange.
 	ResetOnly bool
@@ -97,6 +109,8 @@ type Session struct {
 	ctx      context.Context // ends with the session
 	cancel   context.CancelFunc
 	serverKX *ctrlmsg.ServerKeyExchange // set before tlsReady is closed
+	pushed   *ctrlmsg.Pushed            // set before tlsReady is closed
+	pushDone chan struct{}              // closed when the push reply is complete
 	budget   int                        // bytes of TLS in a control packet
 	wkcLen   int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
@@ -119,6 +133,9 @@ type Session struct {
 func New(opts Options) *Session {
 	if opts.Link == nil || (opts.Err == nil && (opts.Wrapper == nil || opts.HandshakeTimeout <= 0 || (opts.TLS == nil && !opts.ResetOnly))) {
 		panic("session: Link, Wrapper, HandshakeTimeout and TLS (unless ResetOnly) are required")
+	}
+	if len(opts.Ciphers) == 0 {
+		opts.Ciphers = []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}
 	}
 	if opts.RetransmitTimeout <= 0 {
 		opts.RetransmitTimeout = DefaultRetransmitTimeout
@@ -156,6 +173,7 @@ func New(opts Options) *Session {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.out = make(chan []byte)
 	s.tlsReady = make(chan struct{})
+	s.pushDone = make(chan struct{})
 	s.adapter = newControlConn(s)
 	if opts.Err != nil {
 		s.err = opts.Err
@@ -219,6 +237,17 @@ func (s *Session) start() {
 	if !s.opts.ResetOnly {
 		s.wg.Add(1)
 		go s.tlsMain()
+	}
+}
+
+// Pushed is what the server pushed once the handshake is complete, and nil
+// before.
+func (s *Session) Pushed() *ctrlmsg.Pushed {
+	select {
+	case <-s.tlsReady:
+		return s.pushed
+	default:
+		return nil
 	}
 }
 
@@ -295,6 +324,8 @@ func (s *Session) Link() net.Conn { return s.opts.Link }
 func (s *Session) Dropped() uint64 { return s.dropped.Load() }
 
 const (
+	tagControlMessageTooLong = "ControlMessageTooLong"
+
 	// TagHandshakeTimeout: the handshake did not finish within HandshakeTimeout.
 	TagHandshakeTimeout = "HandshakeTimeout"
 	// TagLinkFailed: reading or writing the link failed.
@@ -310,6 +341,10 @@ const (
 	// (the connection ended in the middle of it). A message that was read and
 	// is not valid has its own tag. Metadata: "op" ("read" or "write").
 	TagKeyExchangeFailed = "KeyExchangeFailed"
+	// TagControlChannelFailed: reading or writing the control channel failed
+	// after the key exchange (the server ended the TLS session, or the
+	// connection broke). Metadata: "op" ("read" or "write").
+	TagControlChannelFailed = "ControlChannelFailed"
 	// TagCredentialsFailed: the function that gives the user name and password
 	// returned an error. The cause can be found with errors.Is.
 	TagCredentialsFailed = "CredentialsFailed"

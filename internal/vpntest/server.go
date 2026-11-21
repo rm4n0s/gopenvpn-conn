@@ -4,6 +4,7 @@ package vpntest
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/binary"
 	"io"
@@ -57,6 +58,17 @@ type ServerOptions struct {
 	// client's key exchange message, in place of a well-formed one. An empty
 	// non-nil slice sends nothing.
 	KeyExchangeReply []byte
+	// PushMessages are the control messages the server sends after the key
+	// exchange, once ReplyAfterRequests requests have come, each in one TLS
+	// record. Nil sends one PUSH_REPLY with the usual options of a server; an
+	// empty non-nil slice sends nothing.
+	PushMessages []string
+	// ReplyAfterRequests is how many PUSH_REQUEST messages the server waits for
+	// before it sends PushMessages: 0 sends them at once (push before request).
+	ReplyAfterRequests int
+	// CloseAfterPush makes the server end the TLS session (with its close alert)
+	// once it has sent PushMessages.
+	CloseAfterPush bool
 	// CloseAfterKeyExchange makes the server end the TLS session (with its
 	// close alert) once it has answered the key exchange message.
 	CloseAfterKeyExchange bool
@@ -93,6 +105,7 @@ type Server struct {
 	tlsDone        chan struct{}
 	kxDone         chan struct{}
 	kx             *ClientKeyExchange
+	pushRequests   int
 	tlsErr         error
 	tlsState       tls.ConnectionState
 	largest        int // the largest packet that came from the client, as it was on the link
@@ -231,6 +244,9 @@ func (s *Server) loop(in <-chan []byte) {
 		default:
 		}
 		s.flush()
+		if !s.sender.CanSend() {
+			tlsOut = nil // the window is full: take no more until it opens
+		}
 		if at, ok := s.sender.NextDeadline(); ok {
 			timer.Reset(max(0, time.Until(at)))
 		} else {
@@ -458,7 +474,14 @@ func (s *Server) runTLS() {
 // keyExchange reads the client's key exchange message, which is one TLS record,
 // keeps it, and answers.
 func (s *Server) keyExchange(conn *tls.Conn) {
-	defer close(s.kxDone)
+	kxDone := false
+	finish := func() {
+		if !kxDone {
+			kxDone = true
+			close(s.kxDone)
+		}
+	}
+	defer finish()
 	buf := make([]byte, 1<<15)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -481,9 +504,68 @@ func (s *Server) keyExchange(conn *tls.Conn) {
 			return
 		}
 	}
+	finish()
 	if s.opts.CloseAfterKeyExchange {
 		if err := conn.Close(); err != nil {
 			s.tb.Logf("vpntest server: closing the TLS session: %v", err)
+		}
+		return
+	}
+	if len(reply) == 0 {
+		return // a server that says nothing at all
+	}
+	s.serveControl(conn, make([]byte, 1<<15))
+}
+
+// DefaultPushReply is what the server pushes when the test does not say.
+const DefaultPushReply = "PUSH_REPLY,topology subnet,ifconfig 10.8.0.2 255.255.255.0,route-gateway 10.8.0.1," +
+	"cipher AES-256-GCM,ping 10,ping-restart 60,peer-id 0,tun-mtu 1500"
+
+// PushRequests is how many PUSH_REQUEST messages the server has read.
+func (s *Server) PushRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pushRequests
+}
+
+// serveControl sends the push messages when it is time, and counts the requests
+// that come, until the TLS session ends.
+func (s *Server) serveControl(conn *tls.Conn, buf []byte) {
+	messages := s.opts.PushMessages
+	if messages == nil {
+		messages = []string{DefaultPushReply}
+	}
+	send := func() {
+		for _, m := range messages {
+			if _, err := conn.Write(append([]byte(m), 0)); err != nil {
+				return
+			}
+		}
+		if s.opts.CloseAfterPush {
+			if err := conn.Close(); err != nil {
+				s.tb.Logf("vpntest server: closing the TLS session: %v", err)
+			}
+		}
+	}
+	sent := false
+	if s.opts.ReplyAfterRequests == 0 {
+		send()
+		sent = true
+	}
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if string(buf[:n]) == "PUSH_REQUEST\x00" {
+			s.mu.Lock()
+			s.pushRequests++
+			count := s.pushRequests
+			s.mu.Unlock()
+			if !sent && count >= s.opts.ReplyAfterRequests {
+				send()
+				sent = true
+			}
 		}
 	}
 }
@@ -519,7 +601,7 @@ func parseClientKX(b []byte) (*ClientKeyExchange, string) {
 	if b[4] != 2 {
 		return nil, "the key method is " + strconv.Itoa(int(b[4]))
 	}
-	m.PreMaster, m.Random1, m.Random2 = b[5:5+48], b[53:85], b[85:117]
+	m.PreMaster, m.Random1, m.Random2 = bytes.Clone(b[5:5+48]), bytes.Clone(b[53:85]), bytes.Clone(b[85:117])
 	rest := b[117:]
 	var strs [4]string
 	for i := range strs {

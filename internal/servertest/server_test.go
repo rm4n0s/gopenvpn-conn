@@ -21,7 +21,6 @@ func TestStartStop(t *testing.T) {
 	}{
 		{"udp", Options{Proto: "udp"}},
 		{"tcp", Options{Proto: "tcp"}},
-		{"udp without dco", Options{Proto: "udp", DisableDCO: true}},
 		{"default options", Options{}},
 	}
 	for _, tt := range tests {

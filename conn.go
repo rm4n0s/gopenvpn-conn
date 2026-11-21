@@ -43,7 +43,8 @@ const (
 // with the later steps of the library; so far a Conn completes the TLS
 // handshake with the server.
 type Conn struct {
-	s *session.Session
+	s   *session.Session
+	mtu int // the tunnel MTU of the Config, for ConnectionState before the server pushes one
 }
 
 // Client makes a Conn over conn, which is a stream (TCP framing). It returns at
@@ -71,7 +72,7 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 	}
 	if err := config.validate(); err != nil {
 		opts.Err = err
-		return &Conn{s: session.New(opts)}
+		return &Conn{s: session.New(opts), mtu: tunnelMTU(config)}
 	}
 	if config.HandshakeTimeout == 0 {
 		opts.HandshakeTimeout = DefaultHandshakeTimeout
@@ -82,11 +83,11 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 		w, err := config.ControlWrap.wrapper(time.Now)
 		if err != nil {
 			opts.Err = err
-			return &Conn{s: session.New(opts)}
+			return &Conn{s: session.New(opts), mtu: tunnelMTU(config)}
 		}
 		opts.Wrapper = w
 	}
-	opts.Options, opts.PeerInfo = keyExchangeStrings(config, link, stream)
+	opts.Options, opts.PeerInfo, opts.Ciphers = keyExchangeStrings(config, link, stream)
 	if config.Credentials != nil {
 		credentials := config.Credentials
 		opts.Credentials = func(ctx context.Context) (string, string, error) {
@@ -94,13 +95,13 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 			return c.Username, c.Password, err
 		}
 	}
-	return &Conn{s: session.New(opts)}
+	return &Conn{s: session.New(opts), mtu: tunnelMTU(config)}
 }
 
 // keyExchangeStrings are the options string and the peer info of the key exchange
-// message, made from the Config and the link.
-func keyExchangeStrings(config *Config, link net.Conn, stream bool) (options, peerInfo string) {
-	ciphers := defaultDataCiphers
+// message, made from the Config and the link, and the data ciphers that are offered.
+func keyExchangeStrings(config *Config, link net.Conn, stream bool) (options, peerInfo string, ciphers []string) {
+	ciphers = defaultDataCiphers
 	if len(config.DataCiphers) > 0 {
 		ciphers = make([]string, len(config.DataCiphers))
 		for i, name := range config.DataCiphers {
@@ -124,7 +125,7 @@ func keyExchangeStrings(config *Config, link net.Conn, stream bool) (options, pe
 		Proto:   implementedProto,
 		UV:      config.PeerInfo,
 	}
-	return options, info.String()
+	return options, info.String(), ciphers
 }
 
 // isIPv6 reports whether the link is to an IPv6 address.
@@ -180,3 +181,11 @@ func (c *Conn) RemoteAddr() net.Addr { return c.s.Link().RemoteAddr() }
 // NetConn returns the connection to the server that was given to Client or
 // PacketClient. Reading or writing it breaks the session.
 func (c *Conn) NetConn() net.Conn { return c.s.Link() }
+
+// tunnelMTU is the MTU of the Config, or the default.
+func tunnelMTU(config *Config) int {
+	if config.MTU == 0 {
+		return DefaultMTU
+	}
+	return config.MTU
+}
