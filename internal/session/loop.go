@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Based on OpenVPN 2.7.9, src/openvpn/ssl.c and ssl_pkt.c (Copyright (C) 2002-2026 OpenVPN Inc); rewritten in Go and changed for gopenvpn-conn, 2026-11-21.
+
+package session
+
+import (
+	"bufio"
+	"encoding/binary"
+	"io"
+	"time"
+
+	"github.com/rm4n0s/errors"
+
+	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
+)
+
+// readLoop reads packets from the link and gives them to the loop, each in a
+// slice of its own. It returns when the link fails or the session has ended.
+func (s *Session) readLoop() {
+	defer s.wg.Done()
+	buf := make([]byte, maxPacket)
+	var br *bufio.Reader
+	if s.opts.Stream {
+		br = bufio.NewReader(s.opts.Link)
+	}
+	for {
+		var n int
+		var err error
+		if s.opts.Stream {
+			var header [2]byte
+			if _, err = io.ReadFull(br, header[:]); err == nil {
+				n = int(binary.BigEndian.Uint16(header[:]))
+				_, err = io.ReadFull(br, buf[:n])
+				if err == io.EOF {
+					err = io.ErrUnexpectedEOF // the length was read: the frame is cut
+				}
+			}
+		} else {
+			n, err = s.opts.Link.Read(buf)
+		}
+		if err != nil {
+			select {
+			case <-s.done: // the link was closed by the session: not a failure
+			default:
+				s.readErr <- errors.NewErr(TagLinkFailed, err).SetMetadata("op", "read")
+			}
+			return
+		}
+		select {
+		case s.in <- append([]byte(nil), buf[:n]...):
+		case <-s.done:
+			return
+		}
+	}
+}
+
+// loop owns the state: it handles the packets that the reader gives it, sends
+// what is due, and runs the timers. It closes the link when it returns.
+func (s *Session) loop() {
+	defer s.wg.Done()
+	defer s.closeLink()
+
+	handshake := time.NewTimer(s.opts.HandshakeTimeout)
+	defer handshake.Stop()
+	retransmit := time.NewTimer(time.Hour)
+	retransmit.Stop()
+	defer retransmit.Stop()
+
+	if _, err := s.sender.Queue(s.resetOp, nil); err != nil {
+		s.fail(err)
+		return
+	}
+	complete := false
+	for {
+		if err := s.flush(); err != nil {
+			s.fail(err)
+			return
+		}
+		if !complete && s.serverResetSeen && s.thirdSent && s.sender.Len() == 0 {
+			complete = true
+			handshake.Stop()
+			close(s.ready)
+		}
+		if at, ok := s.sender.NextDeadline(); ok {
+			retransmit.Reset(max(0, time.Until(at)))
+		} else {
+			retransmit.Stop()
+		}
+		select {
+		case <-s.done:
+			return
+		case pkt := <-s.in:
+			s.handle(pkt)
+		case err := <-s.readErr:
+			s.fail(err)
+			return
+		case <-handshake.C:
+			s.fail(errors.New(TagHandshakeTimeout, "the handshake did not finish in time",
+				"timeout", s.opts.HandshakeTimeout.String()))
+			return
+		case <-retransmit.C:
+		}
+	}
+}
+
+// closeLink closes the link, once the loop is done with it.
+func (s *Session) closeLink() {
+	if err := s.opts.Link.Close(); err != nil {
+		s.mu.Lock()
+		s.closeErr = errors.NewErr(tagLinkCloseFailed, err)
+		s.mu.Unlock()
+	}
+}
+
+// flush sends the packets that are due, with the acknowledgements that wait
+// on them, and an ACK_V1 when acknowledgements still wait.
+func (s *Session) flush() error {
+	for _, o := range s.sender.Due(time.Now()) {
+		c := wire.Control{Opcode: o.Opcode, SessionID: s.sid, PacketID: o.ID, Payload: o.Payload}
+		s.addAcks(&c)
+		if err := s.send(&c); err != nil {
+			return err
+		}
+	}
+	if s.receiver.HasPendingAcks() {
+		c := wire.Control{Opcode: wire.AckV1, SessionID: s.sid}
+		s.addAcks(&c)
+		if err := s.send(&c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addAcks puts the acknowledgements that fit into a packet on it.
+func (s *Session) addAcks(c *wire.Control) {
+	if !s.haveRemote {
+		return
+	}
+	if acks := s.receiver.Acks(wire.MaxAcks); len(acks) > 0 {
+		c.Acks = acks
+		c.RemoteSessionID = s.remote
+	}
+}
+
+// send protects a control packet and writes it to the link.
+func (s *Session) send(c *wire.Control) error {
+	var err error
+	if s.body, err = wire.AppendControlBody(s.body[:0], c); err != nil {
+		return err
+	}
+	if s.packet, err = s.opts.Wrapper.Wrap(s.packet[:0], wire.FirstByte(c.Opcode, c.KeyID), c.SessionID, s.body); err != nil {
+		return err
+	}
+	out := s.packet
+	if s.opts.Stream {
+		if out, err = wire.AppendFrame(nil, s.packet); err != nil {
+			return err
+		}
+	}
+	if _, err := s.opts.Link.Write(out); err != nil {
+		return errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
+	}
+	if s.serverResetSeen && len(c.Acks) > 0 {
+		s.thirdSent = true
+	}
+	return nil
+}
+
+// handle takes one packet from the link. Anyone can send a packet, so one that
+// does not belong is dropped, and nothing in it is used before it is shown to
+// be from the server: the protection first, then the session ids.
+func (s *Session) handle(raw []byte) {
+	if len(raw) < 1+wire.SessionIDSize {
+		s.drop("too short", nil)
+		return
+	}
+	op, keyID := wire.SplitFirstByte(raw[0])
+	if !op.IsControl() || keyID != 0 {
+		s.drop("not a control packet of key 0", nil)
+		return
+	}
+	switch op {
+	case wire.HardResetServerV2, wire.ControlV1, wire.AckV1:
+	default:
+		s.drop("an opcode that only a client sends", nil)
+		return
+	}
+	body, err := s.opts.Wrapper.Unwrap(raw)
+	if err != nil {
+		s.drop("the protection does not check", err)
+		return
+	}
+	c, err := wire.ParseControlBody(op, body)
+	if err != nil {
+		s.drop("does not parse", err)
+		return
+	}
+	copy(c.SessionID[:], raw[1:1+wire.SessionIDSize])
+	c.KeyID = keyID
+
+	if s.haveRemote {
+		if c.SessionID != s.remote {
+			s.drop("from another session", nil)
+			return
+		}
+	} else if op != wire.HardResetServerV2 {
+		s.drop("not a reset, and no session yet", nil)
+		return
+	}
+	if len(c.Acks) > 0 && c.RemoteSessionID != s.sid {
+		s.drop("acknowledges another session", nil)
+		return
+	}
+	resend := false
+	if op == wire.HardResetServerV2 {
+		if c.PacketID != 0 {
+			s.drop("a reset with an id that is not 0", nil)
+			return
+		}
+		if !s.serverResetSeen && s.resetOp == wire.HardResetClientV3 {
+			if resend, err = wire.ParseEarlyNegotiation(c.Payload); err != nil {
+				s.drop("the payload of the reset does not parse", err)
+				return
+			}
+		}
+	}
+
+	// From here the packet is the server's.
+	if !s.haveRemote {
+		s.remote, s.haveRemote = c.SessionID, true
+	}
+	for _, id := range c.Acks {
+		s.sender.Ack(id)
+	}
+	if op == wire.AckV1 {
+		return
+	}
+	payloads, ack := s.receiver.Receive(c.PacketID, c.Payload)
+	if !ack {
+		s.drop("not accepted by the reliability layer", nil)
+		return
+	}
+	if op == wire.HardResetServerV2 && !s.serverResetSeen {
+		s.serverResetSeen = true
+		s.wkcAsked = resend
+		if resend && !s.wkcQueued {
+			// The server asks for the wrapped key again. Until TLS has bytes to
+			// send, an empty packet carries it, and the acknowledgement.
+			s.wkcQueued = true
+			if _, err := s.sender.Queue(wire.ControlWKCV1, nil); err != nil {
+				s.fail(err)
+				return
+			}
+		}
+	}
+	for range payloads {
+		// The bytes of TLS, until step 1.11.
+		s.drop("TLS bytes, and no TLS yet", nil)
+	}
+}
+
+// drop counts a packet that is not used, and says why at the debug level.
+func (s *Session) drop(reason string, err error) {
+	s.dropped.Add(1)
+	if err != nil {
+		s.log.Debug("dropped a packet", "reason", reason, "err", err)
+		return
+	}
+	s.log.Debug("dropped a packet", "reason", reason)
+}

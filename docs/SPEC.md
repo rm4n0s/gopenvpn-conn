@@ -61,7 +61,7 @@ The reference server is OpenVPN 2.7.9, and a server from 2.6 on is expected to w
 | `internal/reliable` | The reliability layer | `wire` |
 | `internal/ctrlmsg` | What goes inside TLS: the key exchange message, peer info, `PUSH_REPLY`, `AUTH_FAILED` and the other text messages | |
 | `internal/datachan` | Data channel encryption and decryption, key slots | `wire`, `keys`, `replay` |
-| `internal/session` | The state machine of one connection: handshake, negotiation, keepalive, renegotiation | all of the above |
+| `internal/session` | The state machine of one connection: the link, the reader and the loop goroutines, handshake, negotiation, keepalive, renegotiation | all of the above |
 | `internal/vpntest` | The in-process peer of the unit tests (a small server made of the same packet code, with faults: loss, reordering, duplicates, wrong messages) | tests only |
 | `internal/servertest` | Starts the real `openvpn` for the tests of the `gopenvpn_server` tag | tests only |
 | `internal/tools/errcheck` | The checker of §14 | |
@@ -80,7 +80,7 @@ The shapes follow `crypto/tls` and `net`. The names below are the plan; a step m
 // by the library and may be shared by connections.
 type Config struct {
 	TLS              *tls.Config   // the control channel: RootCAs, Certificates, ServerName, VerifyPeerCertificate, MinVersion
-	ControlWrap      ControlWrap   // nil, or NewTLSAuth, NewTLSCrypt, NewTLSCryptV2
+	ControlWrap      ControlWrap   // nil, or NewTLSAuth, NewTLSCrypt, NewTLSCryptV2 (an interface: only these make one)
 	Credentials      func(ctx context.Context) (Credentials, error) // auth-user-pass; nil means none
 	DataCiphers      []string      // default AES-256-GCM, AES-128-GCM, CHACHA20-POLY1305
 	HandshakeTimeout time.Duration // default 60s (--hand-window)
@@ -138,6 +138,7 @@ type ConnectionState struct {
 }
 ```
 
+- The constructors of `ControlWrap` take the contents of the key file (what a profile has inline): `NewTLSAuth(key []byte, direction KeyDirection, digest crypto.Hash) (ControlWrap, error)` with `KeyDirectionNone`, `KeyDirection0`, `KeyDirection1` and the digests SHA-1, SHA-256, SHA-384 and SHA-512; `NewTLSCrypt(key []byte) (ControlWrap, error)`; `NewTLSCryptV2(clientKey []byte) (ControlWrap, error)`. A `ControlWrap` holds a key and no connection state: every `Client` makes the protection of its own connection from it, so a `Config` is shared safely. `DefaultHandshakeTimeout` is 60 seconds. `Client` and `PacketClient` cannot return an error, so a `Config` that cannot be used (a negative timeout) makes the `Conn` fail at birth: `HandshakeContext` returns the error and `Close` closes the link.
 - `network` is `"udp"`, `"udp4"`, `"udp6"`, `"tcp"`, `"tcp4"` or `"tcp6"`.
 - `Dial` returns after the handshake: the tunnel is up and `ConnectionState` is complete. `Client` and `PacketClient` return at once; the handshake runs at `HandshakeContext` or at the first `Read` or `Write`, as with `tls.Conn`.
 - One `Conn` is one session. Renegotiations happen inside it and the caller does not see them. When the session ends (the server says so, the keepalive times out, the link fails), `Read` and `Write` return the error and the caller dials again. A client that reconnects by itself is after 1.0 (§22).
@@ -221,6 +222,9 @@ The connections, listeners and resolver of `vpnnet` return what gVisor's `gonet`
 3. The client acks, and TLS starts in `CONTROL_V1` packets.
 
 The handshake has `HandshakeTimeout` to finish, pushed options included.
+
+Until TLS runs (step 1.11) the handshake is complete when the server's reset has arrived and been acknowledged and the client's reset has been acknowledged. With `tls-crypt-v2`, when the server's reset asks for the wrapped key, the acknowledgement travels in an empty `CONTROL_WKC_V1` (packet id 1); step 1.11 replaces that empty packet with the first bytes of TLS. The real server answers the first reset without keeping state (§21 O7), so the third packet is what makes it start a session: in the finished client that packet is the TLS ClientHello, which is a reliable packet and is sent again until it is acknowledged.
+- The reader goroutine passes each packet to the loop in a slice of its own (the packets of the control channel are small and rare; the data channel has its own path, §10). A packet of the wrong protection, from another session, of an opcode that a server does not send, with a key id other than 0, or of no use yet, is dropped and counted, never answered (§15 rule 7).
 
 ## 8. TLS, key exchange and negotiation
 

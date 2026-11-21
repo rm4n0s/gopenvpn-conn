@@ -42,7 +42,9 @@ linters:
         text: "G505|G401"
       # G404 flags math/rand. The tests use seeded sequences on purpose, so
       # that a failure can be reproduced; nothing here needs unpredictability.
-      - path: _test\.go
+      # The same holds for the faults of internal/vpntest (loss, duplicates,
+      # delays from a seed), which is a package for tests only.
+      - path: _test\.go|internal/vpntest/
         linters:
           - gosec
         text: "G404"
