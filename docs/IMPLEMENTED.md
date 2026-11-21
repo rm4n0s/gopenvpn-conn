@@ -217,3 +217,19 @@ Not a step of the plan: the setup that the plan starts from. No library code.
 - **Tests (unit):** the parsers (each form, odd keywords, a reason of 5000 bytes); in the session, six messages in two places each (early and instead of the reply), with tag, route, metadata and the same error at every call; a `HALT` after the handshake; `AUTH_PENDING`: a reply after the usual timeout succeeds, the extended time is the end (120 s), a shorter one does not shorten it, a huge one is cut to 30 minutes, none keeps 30 s, 200 of them are harmless.
 - **Proof (the real server 2.7.9):** `TestKeyExchangeWithRealServer`, a wrong password over UDP and TCP: `Dial` returns `TagAuthFailed`; the server sent a plain `AUTH_FAILED` (SPEC §21 O19).
 - **Learned:** the real server's refusal carries no reason, so `reason` is empty there; the keyword forms are known only from the source and the in-process peer.
+
+## Step 2.4: data keys and the data channel, in memory (2026-11-22, tag `step-2.4`)
+
+- **Built:**
+  - `internal/keys/datakeys.go`: `SplitDataKeys` (the 256 bytes of exporter material into `DataKeys{ClientToServer, ServerToClient}`, each a cipher key and a second key of 64 bytes), `Clear`, the label `ExportLabel`.
+  - `internal/datachan`: `Cipher` and `LookupCipher` (AES-128/192/256-GCM, CHACHA20-POLY1305), `Sender.Seal`, `Receiver.Open`, `Header` (DATA_V1 or DATA_V2 with the key id and the peer id), `ReceiverOptions` (window of 64 and 15 s by default, or strict order for stream links), `Receiver.Dropped` (counts by reason), `Sender.NeedsRenegotiation`, `TagPacketIDExhausted`.
+  - `go.mod`: `golang.org/x/crypto` v0.59.0 (from the module cache, offline) for `chacha20poly1305`, and its own dependency `golang.org/x/sys` v0.50.0 (BSD-3-Clause, not imported by this module).
+- **OpenVPN files used as reference:** `crypto.c` (`openvpn_encrypt_aead`, `openvpn_decrypt_aead`, `crypto_check_replay`, `key_ctx_update_implicit_iv`), `packet_id.c` (the strict mode "used with TCP"), `ssl.c` (`generate_key_expansion_tls_export`), `crypto.h` (`cipher_decrypt_verify_fail_exceeded`). The code is not theirs in shape: the tag is moved by sealing the ciphertext in its final place, the replay window is `internal/replay`.
+- **Checks that ran:** `scripts/check.sh`. Fuzz, 60 seconds: `FuzzOpen` 8.5 million executions, no finding (every error tagged, `dst` kept, the packet never changed, an accepted packet is a replay the second time).
+- **Tests:** a round trip for four ciphers × DATA_V1/V2 × nine payload sizes; the bytes of each packet built by hand with the standard library (nonce, additional data, tag first) and one pinned packet per format; every bit of every byte of a packet changed, one at a time, never opens, every flip is counted, and none uses up the id; a packet cut at every length, one with an extra byte; a wrong key, a wrong second key, another cipher; the window (8 and 64 packets, 15 s), strict order, forged ids that leave no trace; ids never repeat (5000 ids, 5000 nonces) and the sender ends at the last id with `TagPacketIDExhausted`; a route test for each of the nine tags; zero allocations per packet for `Seal` and `Open` for all eight combinations (`testing.AllocsPerRun`). Benchmarks (1400 bytes, this machine): `Seal` and `Open` 0.6 to 0.85 µs, 0 allocations (`BenchmarkSeal`, `BenchmarkOpen`).
+- **Known-answer vectors:** OpenVPN's `test_crypto.c` has no fixed AEAD vectors (it tests the limits and round trips), so the vectors here come from the by-hand construction of the draft's format; the real server proves the format in step 2.5.
+- **Learned:**
+  - The failed-verification limit of OpenVPN (2^36) is not copied: SPEC §20 V10.
+  - OpenVPN's strict mode (a window of 0) accepts the first id of any value above 0 and then only the next one, with no gaps.
+  - `SPEC §19` named `x/crypto` only; its dependency `x/sys` is now listed.
+

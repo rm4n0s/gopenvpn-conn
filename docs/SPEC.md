@@ -271,6 +271,12 @@ Until TLS runs (step 1.11) the handshake is complete when the server's reset has
 - **Never a repeated nonce:** before a packet id can wrap, the session renegotiates (32-bit format) or moves to the next epoch (epoch format); if neither is possible in time, the connection ends with a tag rather than send.
 - **Key slots** (`ssl.c`, `ssl_common.h`): the active key, the retiring key (decryption only) and the next key during a renegotiation, selected by the key id of the packet.
 - The payload is an IP packet with no extra framing (compression is refused, §9).
+- **Decided in step 2.4** (`internal/datachan`, `internal/keys/datakeys.go`):
+  - The 256 bytes of exporter material are cut in four parts of 64: cipher key and second key client to server, then server to client. The library is always the TLS client: it seals with the first pair and opens with the second. Only the first 16, 24 or 32 bytes of the cipher key are used, and the first 8 bytes of the second key are the implicit IV.
+  - `Seal` and `Open` allocate nothing when the caller's buffers have room (the receiver keeps one scratch buffer for the ciphertext and tag in the order Go's AEAD wants, because the packet has the tag first). The sender's ids start at 1; `NeedsRenegotiation` is true from `0xFF000000` (OpenVPN's `PACKET_ID_WRAP_TRIGGER`), and when the last id has been used `Seal` returns `TagPacketIDExhausted` and never repeats one.
+  - The receiver checks the replay window before it decrypts (a cheap refusal that changes nothing) and records the id after the packet authenticated; with strict order (stream links) the first id may be any above 0 and each later one must be the last plus one, as in OpenVPN's mode without a window. The peer id of a received `DATA_V2` packet is authenticated (it is in the additional data) but not compared: the server writes the id that it uses for the client and OpenVPN's client does not compare it either.
+  - Every refusal is an error with its own tag, none of them ends a session; the receiver also counts them by reason (`Dropped`).
+  - The AEAD cipher names are the four of §9, compared without regard to case (OpenVPN does the same).
 
 ## 11. Keepalive, exit, renegotiation
 
@@ -377,7 +383,8 @@ The list grows with the steps. The ones a caller will branch on: `TagHandshakeTi
 | Module | License | Used by | Why |
 |---|---|---|---|
 | `github.com/rm4n0s/errors` v0.2.0 | MIT | everything | The owner's error package |
-| `golang.org/x/crypto` | BSD-3-Clause | `internal/datachan` | `chacha20poly1305` |
+| `golang.org/x/crypto` v0.59.0 | BSD-3-Clause | `internal/datachan` | `chacha20poly1305` |
+| `golang.org/x/sys` v0.50.0 | BSD-3-Clause | through `x/crypto` | CPU feature detection of `chacha20poly1305`; not imported by this module (an indirect dependency, same license and authors) |
 | `gvisor.dev/gvisor` | Apache-2.0 | `vpnnet` only | The userspace TCP/IP stack (D4) |
 
 HKDF, AES-GCM, HMAC, SHA-2, TLS and X.509 come from the standard library. Any other dependency is asked for first and needs a license that combines with GPL-2.0-only.
@@ -402,6 +409,7 @@ HKDF, AES-GCM, HMAC, SHA-2, TLS and X.509 come from the standard library. Any ot
 - **V7** `ConnectionState.PushedOptions` and the `Pushed` record keep the word `auth-token` and not its value, where OpenVPN keeps the option as received: a caller that logs the state must not log the token (§15 rule 8). The token itself is kept in memory for the reconnect that §22 has for later.
 - **V8** Control messages are cut at the NUL, not at the TLS record (§9). OpenVPN reads one message for each record, so a record that holds half a message breaks it; here it does not. The server sees no difference.
 - **V9** A pushed `compress` or `comp-lzo` is refused whatever its argument, `stub` and `no` included: they all add a byte of framing to every data packet, which the data channel of 1.0 does not parse (§22).
+- **V10** No limit on failed verifications: OpenVPN stops decrypting with a key after more than 2^36 failed authentications (`cipher_decrypt_verify_fail_exceeded`, the bound of DTLS 1.3). Here a forged packet is counted and dropped and never turns a key off, so that whoever can send packets to the client cannot end its session (§15 rule 7); a key lives for an hour, and 2^36 forgeries in that time (about 19 million a second) are beyond what a link carries.
 
 ## 21. Observations
 
