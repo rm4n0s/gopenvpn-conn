@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"slices"
 	"testing"
 	"testing/synctest"
@@ -439,7 +438,7 @@ func TestCloseStopsEveryGoroutine(t *testing.T) {
 	for _, tr := range transports {
 		t.Run(tr.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				before := runtime.NumGoroutine()
+				before := vpntest.BubbleGoroutines()
 				var client, peer net.Conn
 				if tr.stream {
 					client, peer = vpntest.NewStreamPair()
@@ -451,7 +450,7 @@ func TestCloseStopsEveryGoroutine(t *testing.T) {
 				if err := s.Handshake(t.Context()); err != nil {
 					t.Fatal(err)
 				}
-				if runtime.NumGoroutine() <= before {
+				if vpntest.BubbleGoroutines() <= before {
 					t.Fatal("the session runs no goroutine after the handshake?")
 				}
 				if err := s.Close(); err != nil {
@@ -461,7 +460,7 @@ func TestCloseStopsEveryGoroutine(t *testing.T) {
 				// server's are not part of the session; stop them to count.
 				server.Close()
 				synctest.Wait()
-				if after := runtime.NumGoroutine(); after != before {
+				if after := vpntest.BubbleGoroutines(); after != before {
 					t.Errorf("%d goroutines before, %d after Close", before, after)
 				}
 				if err := s.Handshake(t.Context()); err != net.ErrClosed {

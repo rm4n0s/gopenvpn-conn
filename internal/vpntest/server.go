@@ -7,7 +7,9 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"io"
+	"math"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -51,6 +53,13 @@ type ServerOptions struct {
 	// channel with this configuration, and send what it writes as control
 	// packets. When nil, the payloads are kept (Payload) and nothing is sent.
 	TLS *tls.Config
+	// KeyExchangeReply, when set, is what the server sends in answer to the
+	// client's key exchange message, in place of a well-formed one. An empty
+	// non-nil slice sends nothing.
+	KeyExchangeReply []byte
+	// CloseAfterKeyExchange makes the server end the TLS session (with its
+	// close alert) once it has answered the key exchange message.
+	CloseAfterKeyExchange bool
 	// Fault is how the server misbehaves.
 	Fault Fault
 	// RetransmitTimeout is the first wait before it sends a packet again;
@@ -82,6 +91,8 @@ type Server struct {
 	tlsOut         chan []byte // what TLS wrote, to be sent
 	tlsIn          chan []byte // what arrived, to be given to TLS
 	tlsDone        chan struct{}
+	kxDone         chan struct{}
+	kx             *ClientKeyExchange
 	tlsErr         error
 	tlsState       tls.ConnectionState
 	largest        int // the largest packet that came from the client, as it was on the link
@@ -114,6 +125,7 @@ func NewServer(tb testing.TB, link net.Conn, opts ServerOptions) *Server {
 	go s.read(in)
 	go s.loop(in)
 	s.tlsDone = make(chan struct{})
+	s.kxDone = make(chan struct{})
 	if opts.TLS != nil {
 		s.tlsEnd, s.bridge = net.Pipe()
 		s.tlsOut = make(chan []byte)
@@ -438,6 +450,106 @@ func (s *Server) runTLS() {
 		s.tlsState = conn.ConnectionState()
 	}
 	close(s.tlsDone)
+	if err == nil {
+		s.keyExchange(conn)
+	}
+}
+
+// keyExchange reads the client's key exchange message, which is one TLS record,
+// keeps it, and answers.
+func (s *Server) keyExchange(conn *tls.Conn) {
+	defer close(s.kxDone)
+	buf := make([]byte, 1<<15)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+	kx, problem := parseClientKX(buf[:n])
+	if problem != "" {
+		s.tb.Errorf("vpntest server: the client's key exchange message: %s", problem)
+		return
+	}
+	s.mu.Lock()
+	s.kx = kx
+	s.mu.Unlock()
+	reply := s.opts.KeyExchangeReply
+	if reply == nil {
+		reply = serverKX("V4,dev-type tun,link-mtu 1541,tun-mtu 1500,proto UDPv4,auth SHA1,keysize 128,key-method 2,tls-server", "IV_VER=vpntest\n")
+	}
+	if len(reply) > 0 {
+		if _, err := conn.Write(reply); err != nil {
+			return
+		}
+	}
+	if s.opts.CloseAfterKeyExchange {
+		if err := conn.Close(); err != nil {
+			s.tb.Logf("vpntest server: closing the TLS session: %v", err)
+		}
+	}
+}
+
+// KeyExchangeDone is closed when the server has read the client's key exchange
+// message and answered it, or could not.
+func (s *Server) KeyExchangeDone() <-chan struct{} { return s.kxDone }
+
+// ClientKeyExchange is the key exchange message of the client, as the server
+// read it. It is read apart from package ctrlmsg: by hand.
+type ClientKeyExchange struct {
+	PreMaster, Random1, Random2           []byte
+	Options, Username, Password, PeerInfo string
+	LeadingZeros                          bool
+}
+
+// KeyExchange is the client's key exchange message, or nil before it arrived.
+func (s *Server) KeyExchange() *ClientKeyExchange {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.kx
+}
+
+// parseClientKX reads the client's message the way the plan describes it: 4 zero
+// bytes, 1 byte 2, 48 + 32 + 32 random bytes, then four strings, each with a
+// 16-bit length that counts its NUL. It returns what is wrong with the message,
+// in words, or "" when nothing is.
+func parseClientKX(b []byte) (*ClientKeyExchange, string) {
+	if len(b) < 5+48+32+32 {
+		return nil, "the message is too short: " + strconv.Itoa(len(b)) + " bytes"
+	}
+	m := &ClientKeyExchange{LeadingZeros: binary.BigEndian.Uint32(b) == 0}
+	if b[4] != 2 {
+		return nil, "the key method is " + strconv.Itoa(int(b[4]))
+	}
+	m.PreMaster, m.Random1, m.Random2 = b[5:5+48], b[53:85], b[85:117]
+	rest := b[117:]
+	var strs [4]string
+	for i := range strs {
+		if len(rest) < 2 {
+			return nil, "string " + strconv.Itoa(i) + " has no length"
+		}
+		n := int(binary.BigEndian.Uint16(rest))
+		rest = rest[2:]
+		if n < 1 || len(rest) < n || rest[n-1] != 0 {
+			return nil, "string " + strconv.Itoa(i) + " is not " + strconv.Itoa(n) + " bytes that end in a NUL"
+		}
+		strs[i], rest = string(rest[:n-1]), rest[n:]
+	}
+	if len(rest) != 0 {
+		return nil, strconv.Itoa(len(rest)) + " bytes follow the strings"
+	}
+	m.Options, m.Username, m.Password, m.PeerInfo = strs[0], strs[1], strs[2], strs[3]
+	return m, ""
+}
+
+// serverKX writes a well-formed server key exchange message by hand.
+func serverKX(options, peerInfo string) []byte {
+	b := []byte{0, 0, 0, 0, 2}
+	b = append(b, make([]byte, 64)...)
+	for _, s := range []string{options, "", "", peerInfo} {
+		b = binary.BigEndian.AppendUint16(b, uint16(min(len(s)+1, math.MaxUint16)))
+		b = append(b, s...)
+		b = append(b, 0)
+	}
+	return b
 }
 
 // serverChunk is how many bytes of TLS the server puts in a packet: far below

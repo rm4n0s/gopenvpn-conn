@@ -3,10 +3,11 @@
 package session
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"net"
-	"runtime"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -409,7 +410,7 @@ func TestTLSHandshakeTimesOutWhenTheServerStopsTalking(t *testing.T) {
 
 func TestCloseDuringTheTLSHandshakeStopsEveryGoroutine(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		before := runtime.NumGoroutine()
+		before := vpntest.BubbleGoroutines()
 		r := newTLSRig(t, tlsOptions{rigOptions: rigOptions{
 			transport: transports[0], wrap: wrapKinds[0], server: vpntest.ServerOptions{Fault: vpntest.Silent},
 		}})
@@ -424,7 +425,7 @@ func TestCloseDuringTheTLSHandshakeStopsEveryGoroutine(t *testing.T) {
 		}
 		r.server.Close()
 		synctest.Wait()
-		if after := runtime.NumGoroutine(); after != before {
+		if after := vpntest.BubbleGoroutines(); after != before {
 			t.Errorf("%d goroutines before, %d after Close", before, after)
 		}
 	})
@@ -434,7 +435,7 @@ func TestCloseAfterTheTLSHandshakeStopsEveryGoroutine(t *testing.T) {
 	for _, tr := range transports {
 		t.Run(tr.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				before := runtime.NumGoroutine()
+				before := vpntest.BubbleGoroutines()
 				r := newTLSRig(t, tlsOptions{rigOptions: rigOptions{transport: tr, wrap: wrapKinds[2]}})
 				if err := r.session.Handshake(t.Context()); err != nil {
 					t.Fatal(err)
@@ -444,7 +445,7 @@ func TestCloseAfterTheTLSHandshakeStopsEveryGoroutine(t *testing.T) {
 				}
 				r.server.Close()
 				synctest.Wait()
-				if after := runtime.NumGoroutine(); after != before {
+				if after := vpntest.BubbleGoroutines(); after != before {
 					t.Errorf("%d goroutines before, %d after Close", before, after)
 				}
 			})
@@ -486,4 +487,125 @@ func TestInboundTLSBytesAreBounded(t *testing.T) {
 	if !s.receiver.HasPendingAcks() || s.adapter.queued() != len("tls bytes") {
 		t.Errorf("the packet was not taken: acks %v, queued %d", s.receiver.HasPendingAcks(), s.adapter.queued())
 	}
+}
+
+func TestKeyExchangeFailures(t *testing.T) {
+	good := func() []byte {
+		b := []byte{0, 0, 0, 0, 2}
+		b = append(b, make([]byte, 64)...)
+		return append(b, 0, 2, 'o', 0, 0, 1, 0, 0, 1, 0, 0, 1, 0)
+	}
+	badMethod := good()
+	badMethod[4] = 1
+	tests := []struct {
+		name   string
+		reply  []byte
+		closes bool
+		tag    string
+		route  string
+	}{
+		{"a message that is too short", []byte{0, 0, 0, 0, 2, 1, 2, 3}, false, "KeyExchangeTruncated", "keyExchange->ParseServerKeyExchange.KeyExchangeTruncated"},
+		{"another key method", badMethod, false, "BadKeyMethod", "keyExchange->ParseServerKeyExchange.BadKeyMethod"},
+		{"bytes after the message", append(good(), 7), false, "KeyExchangeTrailing", "keyExchange->ParseServerKeyExchange.KeyExchangeTrailing"},
+		{"the session ends before the answer", []byte{}, true, TagKeyExchangeFailed, "keyExchange.KeyExchangeFailed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newTLSRig(t, tlsOptions{rigOptions: rigOptions{
+					transport: transports[0], wrap: wrapKinds[0],
+					server: vpntest.ServerOptions{KeyExchangeReply: tt.reply, CloseAfterKeyExchange: tt.closes},
+				}})
+				err := r.session.Handshake(t.Context())
+				appErr, ok := errors.FromError(err)
+				if !ok || appErr.Tag != tt.tag || !appErr.HasRoute(tt.route) {
+					t.Fatalf("Handshake = %v (route %v), want %s with route %s", err, appErr, tt.tag, tt.route)
+				}
+				if tt.closes && appErr.Metadata["op"] != "read" {
+					t.Errorf("metadata = %v, want op read", appErr.Metadata)
+				}
+				if again := r.session.Handshake(t.Context()); again != err {
+					t.Errorf("a second Handshake returned %v, want the same error", again)
+				}
+				synctest.Wait()
+			})
+		})
+	}
+}
+
+func TestKeyExchangeWaitsForTheServer(t *testing.T) {
+	// A server that reads the message and never answers: the handshake times out.
+	synctest.Test(t, func(t *testing.T) {
+		r := newTLSRig(t, tlsOptions{rigOptions: rigOptions{
+			transport: transports[0], wrap: wrapKinds[0], server: vpntest.ServerOptions{KeyExchangeReply: []byte{}},
+		}})
+		err := r.session.Handshake(t.Context())
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagHandshakeTimeout {
+			t.Fatalf("Handshake = %v, want %s", err, TagHandshakeTimeout)
+		}
+		<-r.server.KeyExchangeDone()
+		if r.server.KeyExchange() == nil {
+			t.Error("the server never got the client's message")
+		}
+	})
+}
+
+func TestKeyExchangeRefusesCredentialsThatAreTooLong(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pki := servertest.NewPKI(t)
+		link, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
+		vpntest.NewServer(t, peer, vpntest.ServerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{pki.ServerCert}}})
+		s := New(Options{
+			Link: link, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute,
+			TLS:         &tls.Config{RootCAs: pki.CAPool, ServerName: "server"},
+			Options:     "o",
+			Credentials: func(context.Context) (string, string, error) { return "alice", strings.Repeat("p", 128), nil },
+		})
+		closeAtEnd(t, s)
+		err := s.Handshake(t.Context())
+		appErr, ok := errors.FromError(err)
+		if !ok || appErr.Tag != "StringTooLong" || !appErr.HasRoute("keyExchange->AppendClientKeyExchange.StringTooLong") {
+			t.Fatalf("Handshake = %v, want StringTooLong", err)
+		}
+		if strings.Contains(appErr.Error(), "ppp") {
+			t.Error("the password is in the error")
+		}
+	})
+}
+
+func TestServerKeyExchangeIsKept(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newTLSRig(t, tlsOptions{rigOptions: rigOptions{transport: transports[0], wrap: wrapKinds[0]}})
+		if r.session.ServerKeyExchange() != nil {
+			t.Error("a message before the handshake")
+		}
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		kx := r.session.ServerKeyExchange()
+		if kx == nil || !strings.HasPrefix(kx.Options, "V4,dev-type tun,") || kx.PeerInfo != "IV_VER=vpntest\n" {
+			t.Errorf("server key exchange = %+v", kx)
+		}
+	})
+}
+
+func TestKeyExchangeCredentialsFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pki := servertest.NewPKI(t)
+		link, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
+		vpntest.NewServer(t, peer, vpntest.ServerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{pki.ServerCert}}})
+		cause := net.ErrClosed // any error will do: it must survive
+		s := New(Options{
+			Link: link, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute,
+			TLS:         &tls.Config{RootCAs: pki.CAPool, ServerName: "server"},
+			Options:     "o",
+			Credentials: func(context.Context) (string, string, error) { return "", "", cause },
+		})
+		closeAtEnd(t, s)
+		err := s.Handshake(t.Context())
+		appErr, ok := errors.FromError(err)
+		if !ok || appErr.Tag != TagCredentialsFailed || !appErr.HasRoute("tlsMain->Session.keyExchange.CredentialsFailed") || !errors.Is(err, cause) {
+			t.Fatalf("Handshake = %v, want %s", err, TagCredentialsFailed)
+		}
+	})
 }

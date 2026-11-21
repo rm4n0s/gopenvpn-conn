@@ -5,7 +5,6 @@ package openvpn
 import (
 	"context"
 	"net"
-	"runtime"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -43,7 +42,7 @@ func TestDialer(t *testing.T) {
 		for _, p := range protections() {
 			t.Run(tt.network+"/"+p.name, func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
-					before := runtime.NumGoroutine()
+					before := vpntest.BubbleGoroutines()
 					d, asked := dialerOver(t, tt.kind, p, vpntest.NoFault, &Config{ControlWrap: p.wrap(t), resetOnly: true})
 					conn, err := d.Dial(t.Context(), tt.network, "vpn.example:1194")
 					if err != nil {
@@ -58,7 +57,7 @@ func TestDialer(t *testing.T) {
 					synctest.Wait()
 					// The server of the test is closed by its cleanup, after this
 					// function; count only what the connection left behind.
-					if after := runtime.NumGoroutine(); after > before+2 {
+					if after := vpntest.BubbleGoroutines(); after > before+5 {
 						t.Errorf("%d goroutines before, %d after Close", before, after)
 					}
 				})

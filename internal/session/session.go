@@ -14,6 +14,7 @@ import (
 
 	"github.com/rm4n0s/errors"
 
+	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/reliable"
 	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
@@ -53,6 +54,13 @@ type Options struct {
 	// channel. It is cloned, and a MinVersion below TLS 1.2 is raised to it.
 	// It is required unless ResetOnly is set.
 	TLS *tls.Config
+	// Options is the options string and PeerInfo the peer info of the key exchange
+	// message (package ctrlmsg makes both). Credentials, when set, gives the user
+	// name and password for it; it is called once, with a context that ends with
+	// the session. Not used with ResetOnly.
+	Options     string
+	PeerInfo    string
+	Credentials func(ctx context.Context) (username, password string, err error)
 	// ResetOnly makes the handshake end with the exchange of resets, with no
 	// TLS: for the tests of that exchange.
 	ResetOnly bool
@@ -86,8 +94,11 @@ type Session struct {
 	tlsReady chan struct{} // closed when the TLS handshake is complete
 	tlsConn  *tls.Conn     // set before tlsReady is closed
 	tlsCfg   *tls.Config
-	budget   int // bytes of TLS in a control packet
-	wkcLen   int // the wrapped key that CONTROL_WKC_V1 carries, or 0
+	ctx      context.Context // ends with the session
+	cancel   context.CancelFunc
+	serverKX *ctrlmsg.ServerKeyExchange // set before tlsReady is closed
+	budget   int                        // bytes of TLS in a control packet
+	wkcLen   int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
 	// Owned by the loop goroutine.
 	sender          *reliable.Sender
@@ -142,12 +153,14 @@ func New(opts Options) *Session {
 			s.tlsCfg.MinVersion = tls.VersionTLS12
 		}
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.out = make(chan []byte)
 	s.tlsReady = make(chan struct{})
 	s.adapter = newControlConn(s)
 	if opts.Err != nil {
 		s.err = opts.Err
 		close(s.done)
+		s.cancel()
 	}
 	return s
 }
@@ -209,6 +222,17 @@ func (s *Session) start() {
 	}
 }
 
+// ServerKeyExchange is the server's key exchange message once the handshake is
+// complete, and nil before.
+func (s *Session) ServerKeyExchange() *ctrlmsg.ServerKeyExchange {
+	select {
+	case <-s.tlsReady:
+		return s.serverKX
+	default:
+		return nil
+	}
+}
+
 // TLS is the TLS connection of the control channel once the handshake is
 // complete, and nil before.
 func (s *Session) TLS() *tls.Conn {
@@ -230,6 +254,7 @@ func (s *Session) fail(err error) {
 	}
 	s.err = err
 	close(s.done)
+	s.cancel()
 }
 
 // Close ends the session, closes the link and waits for the goroutines. It
@@ -245,6 +270,7 @@ func (s *Session) Close() error {
 	if s.err == nil {
 		s.err = net.ErrClosed
 		close(s.done)
+		s.cancel()
 	}
 	started := s.started
 	s.mu.Unlock()
@@ -279,6 +305,14 @@ const (
 	// refuses, a version that is not shared). The cause, a crypto/tls or
 	// x509 error, can be found with errors.Is and errors.As.
 	TagTLSHandshakeFailed = "TLSHandshakeFailed"
+
+	// TagKeyExchangeFailed: reading or writing the key exchange message failed
+	// (the connection ended in the middle of it). A message that was read and
+	// is not valid has its own tag. Metadata: "op" ("read" or "write").
+	TagKeyExchangeFailed = "KeyExchangeFailed"
+	// TagCredentialsFailed: the function that gives the user name and password
+	// returned an error. The cause can be found with errors.Is.
+	TagCredentialsFailed = "CredentialsFailed"
 
 	tagHandshakeCanceled = "HandshakeCanceled"
 	tagLinkCloseFailed   = "LinkCloseFailed"

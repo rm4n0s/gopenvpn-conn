@@ -5,10 +5,11 @@ package openvpn
 import (
 	"context"
 	"net"
+	"runtime"
+	"strings"
 	"time"
 
-	"github.com/rm4n0s/errors"
-
+	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/session"
 )
@@ -23,6 +24,12 @@ const (
 	// cause (an io.EOF, a closed connection) can be found with errors.Is.
 	// Metadata: "op" ("read" or "write").
 	TagLinkFailed = session.TagLinkFailed
+	// TagKeyExchangeFailed: the connection ended while the key exchange
+	// message was written or read. Metadata: "op" ("read" or "write").
+	TagKeyExchangeFailed = session.TagKeyExchangeFailed
+	// TagCredentialsFailed: Config.Credentials returned an error; the cause can
+	// be found with errors.Is.
+	TagCredentialsFailed = session.TagCredentialsFailed
 	// TagTLSHandshakeFailed: the TLS handshake with the server failed: a
 	// certificate that does not verify, a client certificate that the server
 	// refuses, no TLS version in common. The cause, a crypto/tls or x509
@@ -62,14 +69,11 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 		HandshakeTimeout: config.HandshakeTimeout,
 		TLS:              config.TLS, ResetOnly: config.resetOnly,
 	}
-	switch {
-	case config.HandshakeTimeout < 0:
-		opts.Err = errors.New(tagInvalidConfig, "the handshake timeout is negative", "field", "HandshakeTimeout")
+	if err := config.validate(); err != nil {
+		opts.Err = err
 		return &Conn{s: session.New(opts)}
-	case config.TLS == nil && !config.resetOnly:
-		opts.Err = errors.New(tagInvalidConfig, "Config.TLS is required: the server must be verified", "field", "TLS")
-		return &Conn{s: session.New(opts)}
-	case config.HandshakeTimeout == 0:
+	}
+	if config.HandshakeTimeout == 0 {
 		opts.HandshakeTimeout = DefaultHandshakeTimeout
 	}
 	if config.ControlWrap == nil {
@@ -82,8 +86,76 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 		}
 		opts.Wrapper = w
 	}
+	opts.Options, opts.PeerInfo = keyExchangeStrings(config, link, stream)
+	if config.Credentials != nil {
+		credentials := config.Credentials
+		opts.Credentials = func(ctx context.Context) (string, string, error) {
+			c, err := credentials(ctx)
+			return c.Username, c.Password, err
+		}
+	}
 	return &Conn{s: session.New(opts)}
 }
+
+// keyExchangeStrings are the options string and the peer info of the key exchange
+// message, made from the Config and the link.
+func keyExchangeStrings(config *Config, link net.Conn, stream bool) (options, peerInfo string) {
+	ciphers := defaultDataCiphers
+	if len(config.DataCiphers) > 0 {
+		ciphers = make([]string, len(config.DataCiphers))
+		for i, name := range config.DataCiphers {
+			ciphers[i] = strings.ToUpper(name)
+		}
+	}
+	mtu := config.MTU
+	if mtu == 0 {
+		mtu = DefaultMTU
+	}
+	options = ctrlmsg.OptionsString(ctrlmsg.OptionsParams{
+		Stream: stream, IPv6: isIPv6(link.RemoteAddr()), TunMTU: mtu,
+		Cipher: ciphers[0], KeySizeBits: cipherKeyBits[ciphers[0]],
+	})
+	info := ctrlmsg.PeerInfo{
+		Version:  "gopenvpn-conn " + libraryVersion,
+		Platform: platform(),
+		// The largest MTU the client can take; OpenVPN's own default is 1600.
+		MTU:     max(1600, mtu),
+		Ciphers: ciphers,
+		Proto:   implementedProto,
+		UV:      config.PeerInfo,
+	}
+	return options, info.String()
+}
+
+// isIPv6 reports whether the link is to an IPv6 address.
+func isIPv6(addr net.Addr) bool {
+	var ip net.IP
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		ip = a.IP
+	case *net.TCPAddr:
+		ip = a.IP
+	}
+	return ip != nil && ip.To4() == nil
+}
+
+// platform is IV_PLAT: the name OpenVPN gives the system.
+func platform() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win"
+	case "darwin":
+		return "mac"
+	}
+	return runtime.GOOS
+}
+
+// libraryVersion is what IV_VER says after the name of the library.
+const libraryVersion = "0.2.0"
+
+// implementedProto is IV_PROTO: the bits of the features that this client has.
+// Each step that adds a feature adds its bit (SPEC §8.2).
+const implementedProto = ctrlmsg.IVProtoDataV2 | ctrlmsg.IVProtoRequestPush | ctrlmsg.IVProtoTLSKeyExport
 
 // HandshakeContext runs the handshake if it has not run, and returns when it is
 // complete, when it fails, or when ctx is done. A done ctx ends the session: the
@@ -108,5 +180,3 @@ func (c *Conn) RemoteAddr() net.Addr { return c.s.Link().RemoteAddr() }
 // NetConn returns the connection to the server that was given to Client or
 // PacketClient. Reading or writing it breaks the session.
 func (c *Conn) NetConn() net.Conn { return c.s.Link() }
-
-const tagInvalidConfig = "InvalidConfig"

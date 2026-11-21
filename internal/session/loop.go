@@ -12,6 +12,7 @@ import (
 
 	"github.com/rm4n0s/errors"
 
+	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
 )
 
@@ -333,8 +334,43 @@ func (s *Session) tlsMain() {
 		s.fail(errors.NewErr(TagTLSHandshakeFailed, err))
 		return
 	}
-	s.tlsConn = conn
+	kx, err := s.keyExchange(conn)
+	if err != nil {
+		s.fail(err)
+		return
+	}
+	s.tlsConn, s.serverKX = conn, kx
 	close(s.tlsReady)
+}
+
+// keyExchange sends the client's key exchange message in one TLS record and
+// reads the server's, which is one record too. The data keys do not come from
+// it (SPEC §8.3), so what it gives the library is the server's strings.
+//
+// OpenVPN: ssl.c key_method_2_write, key_method_2_read.
+func (s *Session) keyExchange(conn *tls.Conn) (*ctrlmsg.ServerKeyExchange, error) {
+	var username, password string
+	if s.opts.Credentials != nil {
+		var err error
+		if username, password, err = s.opts.Credentials(s.ctx); err != nil {
+			return nil, errors.NewErr(TagCredentialsFailed, err)
+		}
+	}
+	msg, err := ctrlmsg.AppendClientKeyExchange(nil, ctrlmsg.NewClientKeyExchange(s.opts.Options, username, password, s.opts.PeerInfo))
+	if err != nil {
+		return nil, err
+	}
+	_, err = conn.Write(msg)
+	clear(msg) // the password is in it
+	if err != nil {
+		return nil, errors.NewErr(TagKeyExchangeFailed, err).SetMetadata("op", "write")
+	}
+	buf := make([]byte, 1<<15)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, errors.NewErr(TagKeyExchangeFailed, err).SetMetadata("op", "read")
+	}
+	return ctrlmsg.ParseServerKeyExchange(buf[:n])
 }
 
 // drop counts a packet that is not used, and says why at the debug level.

@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -142,7 +141,7 @@ func TestHandshake(t *testing.T) {
 		for _, p := range protections() {
 			t.Run(k.name+"/"+p.name, func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
-					before := runtime.NumGoroutine()
+					before := vpntest.BubbleGoroutines()
 					link, server := pair(t, k, p, vpntest.NoFault)
 					cfg := &Config{ControlWrap: p.wrap(t), resetOnly: true}
 					conn := newClient(k, link, cfg)
@@ -166,7 +165,7 @@ func TestHandshake(t *testing.T) {
 					}
 					server.Close()
 					synctest.Wait()
-					if after := runtime.NumGoroutine(); after != before {
+					if after := vpntest.BubbleGoroutines(); after != before {
 						t.Errorf("%d goroutines before, %d after Close", before, after)
 					}
 				})
@@ -182,7 +181,7 @@ func TestNilConfigIsRefusedForWantOfTLS(t *testing.T) {
 			conn := PacketClient(link, cfg)
 			err := conn.HandshakeContext(t.Context())
 			appErr, ok := errors.FromError(err)
-			if !ok || appErr.Tag != tagInvalidConfig || !appErr.HasRoute("PacketClient->newConn.InvalidConfig") || appErr.Metadata["field"] != "TLS" {
+			if !ok || appErr.Tag != tagInvalidConfig || !appErr.HasRoute("PacketClient->newConn->Config.validate.InvalidConfig") || appErr.Metadata["field"] != "TLS" {
 				t.Errorf("%s config: HandshakeContext = %v, want an invalid config for TLS", name, err)
 			}
 			if err := conn.Close(); err != nil {
@@ -265,7 +264,7 @@ func TestInvalidConfig(t *testing.T) {
 		conn := PacketClient(link, &Config{HandshakeTimeout: -time.Second})
 		err := conn.HandshakeContext(t.Context())
 		appErr, ok := errors.FromError(err)
-		if !ok || appErr.Tag != tagInvalidConfig || !appErr.HasRoute("PacketClient->newConn.InvalidConfig") {
+		if !ok || appErr.Tag != tagInvalidConfig || !appErr.HasRoute("PacketClient->newConn->Config.validate.InvalidConfig") {
 			t.Fatalf("HandshakeContext = %v, want an invalid config", err)
 		}
 		if appErr.Metadata["field"] != "HandshakeTimeout" {
