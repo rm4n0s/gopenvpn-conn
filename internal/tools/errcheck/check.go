@@ -51,19 +51,18 @@ type parsedFile struct {
 
 // tagConst is a constant that holds an error tag.
 type tagConst struct {
-	pf    *parsedFile
-	name  string
-	value string
-	pos   token.Pos
+	pf   *parsedFile
+	name string
+	pos  token.Pos
 }
 
 // state is what one run of Check collects.
 type state struct {
 	fset    *token.FileSet
 	files   []*parsedFile
-	consts  map[string]string // string constants by name, from every file
-	tags    []tagConst        // tag constants of the files that are not tests
-	routes  []string          // the arguments of HasRoute in the test files
+	consts  map[string]ast.Expr // the value of every constant, by name, from every file
+	tags    []tagConst          // tag constants of the files that are not tests
+	strs    []ast.Expr          // the string literals and concatenations of the test files
 	reports []Report
 }
 
@@ -75,7 +74,7 @@ func Check(root string) ([]Report, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &state{fset: token.NewFileSet(), consts: map[string]string{}}
+	s := &state{fset: token.NewFileSet(), consts: map[string]ast.Expr{}}
 	for _, rel := range paths {
 		full := filepath.Join(root, filepath.FromSlash(rel))
 		f, err := parser.ParseFile(s.fset, full, nil, parser.SkipObjectResolution)
@@ -181,8 +180,8 @@ func importName(alias, pkg string) string {
 	return alias
 }
 
-// collectConsts records the string constants of a file, for the tag rule and
-// for reading the strings that tests give to HasRoute.
+// collectConsts records the string constants of a file, and the strings of a
+// test file, for the tag rule (rule 8).
 func (s *state) collectConsts(pf *parsedFile) {
 	ast.Inspect(pf.file, func(n ast.Node) bool {
 		switch x := n.(type) {
@@ -199,36 +198,39 @@ func (s *state) collectConsts(pf *parsedFile) {
 					if i >= len(vs.Values) {
 						break
 					}
-					lit, ok := vs.Values[i].(*ast.BasicLit)
-					if !ok || lit.Kind != token.STRING {
-						continue
-					}
-					value, err := strconv.Unquote(lit.Value)
-					if err != nil {
-						continue
-					}
-					s.consts[name.Name] = value
+					s.consts[name.Name] = vs.Values[i]
 					if !pf.isTest && tagName.MatchString(name.Name) {
-						s.tags = append(s.tags, tagConst{pf: pf, name: name.Name, value: value, pos: name.Pos()})
+						s.tags = append(s.tags, tagConst{pf: pf, name: name.Name, pos: name.Pos()})
 					}
 				}
 			}
-		case *ast.CallExpr:
-			if !pf.isTest {
-				return true
+		case *ast.BasicLit:
+			if pf.isTest && x.Kind == token.STRING {
+				s.strs = append(s.strs, x)
 			}
-			sel, ok := x.Fun.(*ast.SelectorExpr)
-			if ok && sel.Sel.Name == "HasRoute" && len(x.Args) == 1 {
-				s.routes = append(s.routes, s.evalString(x.Args[0]))
+		case *ast.BinaryExpr:
+			if pf.isTest && x.Op == token.ADD {
+				s.strs = append(s.strs, x)
 			}
 		}
 		return true
 	})
 }
 
+// maxConstDepth bounds how far evalString follows a constant that is defined
+// by another constant, so that a cycle (which does not compile) ends.
+const maxConstDepth = 16
+
 // evalString reads a string expression made of literals, constants and +.
 // A part it cannot know is replaced by unresolved.
 func (s *state) evalString(e ast.Expr) string {
+	return s.eval(e, 0)
+}
+
+func (s *state) eval(e ast.Expr, depth int) string {
+	if depth > maxConstDepth {
+		return unresolved
+	}
 	switch x := e.(type) {
 	case *ast.BasicLit:
 		if x.Kind == token.STRING {
@@ -238,17 +240,17 @@ func (s *state) evalString(e ast.Expr) string {
 		}
 	case *ast.Ident:
 		if v, ok := s.consts[x.Name]; ok {
-			return v
+			return s.eval(v, depth+1)
 		}
 	case *ast.SelectorExpr:
 		if v, ok := s.consts[x.Sel.Name]; ok {
-			return v
+			return s.eval(v, depth+1)
 		}
 	case *ast.ParenExpr:
-		return s.evalString(x.X)
+		return s.eval(x.X, depth)
 	case *ast.BinaryExpr:
 		if x.Op == token.ADD {
-			return s.evalString(x.X) + s.evalString(x.Y)
+			return s.eval(x.X, depth) + s.eval(x.Y, depth)
 		}
 	}
 	return unresolved
@@ -460,19 +462,30 @@ func (s *state) checkPackageVar(pf *parsedFile, value ast.Expr) {
 }
 
 // checkTagRoutes applies rule 8: every tag constant is the end of a route
-// that some test gives to HasRoute.
+// that a test checks. A test checks a route with HasRoute, often with the route
+// in a field of a table, so the rule accepts any string of a test file that
+// ends with ".Tag", written out or made of constants. It runs after every file
+// is parsed, so that a constant of any file can be read.
 func (s *state) checkTagRoutes() {
+	strs := make([]string, 0, len(s.strs))
+	for _, e := range s.strs {
+		strs = append(strs, s.evalString(e))
+	}
 	for _, t := range s.tags {
-		want := "." + t.value
+		value := s.evalString(s.consts[t.name])
+		if strings.Contains(value, unresolved) {
+			continue // not a constant string: not a tag
+		}
+		want := "." + value
 		covered := false
-		for _, route := range s.routes {
-			if strings.HasSuffix(route, want) {
+		for _, str := range strs {
+			if strings.HasSuffix(str, want) {
 				covered = true
 				break
 			}
 		}
 		if !covered {
-			s.report(t.pf, t.pos, 8, fmt.Sprintf("tag %q (%s) has no route test: no HasRoute call in a test ends with %q", t.value, t.name, want))
+			s.report(t.pf, t.pos, 8, fmt.Sprintf("tag %q (%s) has no route test: no string in a test ends with %q", value, t.name, want))
 		}
 	}
 }

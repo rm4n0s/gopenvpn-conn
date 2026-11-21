@@ -3,7 +3,8 @@
 // Command errcheck checks the error rules of SPEC §14.1 on the Go files of the
 // module: the ones that a program can check. The others (a constructor is
 // called in the function that fails, an error from the module is returned
-// untouched) are checked by the reviewer.
+// untouched) are checked by the reviewer. Rule 8, a route test for every tag, is
+// met when a string of a test file ends with ".Tag".
 //
 // Usage:
 //

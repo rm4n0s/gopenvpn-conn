@@ -303,7 +303,7 @@ All errors use `github.com/rm4n0s/errors` v0.2.0 the way its `AI_GUIDE.md` says 
 5. A tag is a constant declared next to the code that produces it; exported (`TagX`, documented) when a user of the library may branch on it. Code branches on tags or `errors.Is`, never on messages.
 6. A sentinel is a struct literal `&errors.Error{Tag: TagX}`, never a package-level `errors.New`.
 7. Functions return `error`, never `*errors.Error`.
-8. Every tag has a route test with `HasRoute`.
+8. Every tag has a route test: a test checks with `HasRoute` a route that ends with the tag. `internal/tools/errcheck` accepts any string of a test file that ends with `.Tag`, written out or made of constants, so that a table of routes is a route test.
 9. **No secret in an error:** no key, password, token, or decrypted payload in a message or in metadata. Metadata values are JSON-serializable.
 10. Errors are logged with `slog` as the attribute `"err"`.
 11. The exception of §5.3 is the only place where an untagged error leaves the module.
@@ -381,13 +381,14 @@ HKDF, AES-GCM, HMAC, SHA-2, TLS and X.509 come from the standard library. Any ot
 - **V1** No options string check: the client sends OpenVPN's options string for compatibility and does not compare the server's (OpenVPN 2.7 removed `--opt-verify`).
 - **V2** No scripts, plugins, management interface or environment: a library gives its caller values and errors instead.
 - **V3** The profile parser refuses what it cannot honor instead of warning and going on (§12).
+- **V4** `internal/wire` parses strictly: an `ACK_V1` with bytes after its acknowledgements is refused (OpenVPN ignores them; no real server sends them), and the opcodes 1, 2 and 12 to 31 are refused (OpenVPN 2.7.9 accepts 3 to 11 only).
 
 ## 21. Observations
 
 What the documentation or the draft does not say or says differently from the code, and what was found by running the real server. Each entry names the test that shows it. (Empty until the steps fill it.)
 
 Known before any code, to be confirmed by their steps:
-- **O1** The draft shows the acked packet ids as 8 bytes each in one figure and 4 in another; the code uses 4 (`packet_id_type`).
+- **O1** The draft shows the acked packet ids as 8 bytes each in one figure and 4 in another; the code uses 4 (`packet_id_type`; read in `reliable_ack_parse`, step 1.4). The real server confirms it in step 1.10.
 - **O2** The draft's description of the old key derivation is incomplete; it does not matter for 1.0 (D3).
 - **O3** The draft has opcodes 12 to 14; OpenVPN 2.7.9 stops at 11.
 - **O4** A real OpenVPN 2.7.9 server starts with no root inside `unshare -Urn`, with a kernel DCO device, on this machine (tried 2026-11-21).

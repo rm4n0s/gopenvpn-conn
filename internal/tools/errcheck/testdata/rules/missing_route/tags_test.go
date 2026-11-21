@@ -6,6 +6,16 @@ import "testing"
 
 const wantRoute = "F.ByConst"
 
+func TestTable(t *testing.T) {
+	var appErr interface{ HasRoute(string) bool }
+	for _, tt := range []struct{ route string }{
+		{route: "Outer->F.InATable"},
+		{route: "G." + routeAcrossFiles},
+	} {
+		_ = appErr.HasRoute(tt.route)
+	}
+}
+
 func TestRoutes(t *testing.T) {
 	var appErr interface{ HasRoute(string) bool }
 	_ = appErr.HasRoute("Outer->F.Tested")

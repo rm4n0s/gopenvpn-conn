@@ -9,5 +9,7 @@ const (
 	tagAlsoUntested   = "AlsoUntested" // want 8
 	tagTestedByConst  = "ByConst"
 	tagPartial        = "Part" // want 8
+	tagInATable       = "InATable"
+	tagAcrossFiles    = "AcrossFiles"
 	taglineNotATagVar = "not a tag: no capital after tag"
 )
