@@ -189,6 +189,9 @@ func nonceOf(id uint32, iv [implicitIVSize]byte) (n [nonceSize]byte) {
 
 // Drops counts the packets that a Receiver refused, by the reason.
 type Drops struct {
+	// Epoch is packets of an epoch that is not known: 0, or too far from the
+	// current one (the epoch format only).
+	Epoch uint64
 	// Short is packets too short to hold a header, a tag and a byte of payload.
 	Short uint64
 	// Format is packets that are not of the format of the receiver (the opcode).
@@ -215,7 +218,19 @@ type Receiver struct {
 	nonce   [nonceSize]byte
 	scratch []byte // the ciphertext and the tag, in the order Go's AEAD wants them
 
-	short, format, keyID, replayDrops, auth atomic.Uint64
+	drops dropCounters
+}
+
+// dropCounters are the counters of Drops, safe to read from any goroutine.
+type dropCounters struct {
+	short, format, keyID, replay, auth, epoch atomic.Uint64
+}
+
+func (d *dropCounters) snapshot() Drops {
+	return Drops{
+		Short: d.short.Load(), Format: d.format.Load(), KeyID: d.keyID.Load(),
+		Replay: d.replay.Load(), Auth: d.auth.Load(), Epoch: d.epoch.Load(),
+	}
 }
 
 // ReceiverOptions tune the replay protection. The zero value is OpenVPN's
@@ -259,12 +274,7 @@ func NewReceiver(c Cipher, k *keys.DirectionKey, h Header, opts ReceiverOptions)
 
 // Dropped is how many packets were refused so far, by reason. It may be called
 // from any goroutine.
-func (r *Receiver) Dropped() Drops {
-	return Drops{
-		Short: r.short.Load(), Format: r.format.Load(), KeyID: r.keyID.Load(),
-		Replay: r.replayDrops.Load(), Auth: r.auth.Load(),
-	}
-}
+func (r *Receiver) Dropped() Drops { return r.drops.snapshot() }
 
 // Open authenticates and decrypts a packet, appends its payload to dst and
 // returns the result. now is the time of its arrival, for the age rule of the
@@ -276,21 +286,21 @@ func (r *Receiver) Dropped() Drops {
 func (r *Receiver) Open(dst, packet []byte, now time.Time) ([]byte, error) {
 	h := r.header
 	if len(packet) < h.minPacket() {
-		r.short.Add(1)
+		r.drops.short.Add(1)
 		return dst, errors.New(tagPacketTooShort, "the packet has no room for its header, its tag and a byte of payload", "len", len(packet), "min", h.minPacket())
 	}
 	if wire.Opcode(packet[0]>>3) != h.opcode() {
-		r.format.Add(1)
+		r.drops.format.Add(1)
 		return dst, errors.New(tagWrongFormat, "the packet is not of the format of this key", "opcode", packet[0]>>3, "want", int(h.opcode()))
 	}
 	if packet[0]&0x07 != h.KeyID {
-		r.keyID.Add(1)
+		r.drops.keyID.Add(1)
 		return dst, errors.New(tagWrongKeyID, "the packet is of another key id", "key_id", packet[0]&0x07, "want", h.KeyID)
 	}
 	headerEnd := h.headerSize()
 	id := binary.BigEndian.Uint32(packet[headerEnd-packetIDSize:])
 	if !r.fresh(id, now) {
-		r.replayDrops.Add(1)
+		r.drops.replay.Add(1)
 		return dst, errors.New(tagReplayed, "the packet id was seen, is too old or is out of order", "id", id)
 	}
 
@@ -303,7 +313,7 @@ func (r *Receiver) Open(dst, packet []byte, now time.Time) ([]byte, error) {
 	r.nonce = nonceOf(id, r.iv)
 	out, err := r.aead.Open(dst, r.nonce[:], r.scratch, packet[adStart:headerEnd])
 	if err != nil {
-		r.auth.Add(1)
+		r.drops.auth.Add(1)
 		return dst, errors.NewErr(tagAuthFailed, err)
 	}
 	r.accept(id, now)

@@ -124,7 +124,10 @@ func (s *Session) loop() {
 			s.pending = msg
 		case <-tlsReady:
 			tlsReady = nil
-		case at := <-s.extend:
+		case <-s.extend:
+			s.mu.Lock()
+			at := s.extendAt
+			s.mu.Unlock()
 			if !complete && at.After(deadline) {
 				deadline = at
 				handshake.Reset(time.Until(at))
@@ -476,11 +479,16 @@ func (s *Session) extendHandshake(asked time.Duration) {
 		asked = s.opts.HandshakeTimeout
 	}
 	asked = min(asked, max(s.opts.HandshakeTimeout, maxAuthPending))
-	select { // only this goroutine sends: dropping the old value leaves room for the new
-	case <-s.extend:
+	at := s.began.Add(asked)
+	s.mu.Lock()
+	if at.After(s.extendAt) { // the latest end wins, whatever the order of the messages
+		s.extendAt = at
+	}
+	s.mu.Unlock()
+	select { // one wake-up is enough: the loop reads extendAt when it runs
+	case s.extend <- struct{}{}:
 	default:
 	}
-	s.extend <- s.began.Add(asked)
 }
 
 // pushRequests sends PUSH_REQUEST at once and then every 5 seconds, until the

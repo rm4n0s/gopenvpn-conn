@@ -59,7 +59,7 @@ func TestKeyExchangeWithRealServer(t *testing.T) {
 			}
 			// What the server read, and what it decided.
 			srv.WaitLog(t, "peer info: IV_VER=gopenvpn-conn_0.2.0", 3*time.Second)
-			srv.WaitLog(t, "IV_PROTO=286", 3*time.Second)
+			srv.WaitLog(t, "IV_PROTO=1310", 3*time.Second)
 			srv.WaitLog(t, "IV_CIPHERS=AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", 3*time.Second)
 			srv.WaitLog(t, "UV_FROM=gopenvpn-conn_tests", 3*time.Second)
 			srv.WaitLog(t, "authentication succeeded for username 'alice'", 3*time.Second)

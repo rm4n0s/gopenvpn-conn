@@ -82,6 +82,12 @@ type ServerOptions struct {
 	// DataV1 makes the server's data packets DATA_V1 (no peer id), for a test whose
 	// push reply has no peer-id; the default is DATA_V2 with peer id 0.
 	DataV1 bool
+	// Epoch makes the server's data channel use the epoch format; the push reply
+	// must then have protocol-flags aead-epoch. EpochUsageLimit replaces the usage
+	// limit of the server's keys, so that its sender moves through epochs with a few
+	// packets.
+	Epoch           bool
+	EpochUsageLimit uint64
 	// EchoData makes the server send every IP packet that it receives back.
 	EchoData bool
 	// Fault is how the server misbehaves.

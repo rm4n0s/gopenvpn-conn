@@ -93,7 +93,7 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 	opts := session.Options{
 		Link: link, Stream: stream, Logger: config.Logger,
 		HandshakeTimeout: config.HandshakeTimeout,
-		TLS:              config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config),
+		TLS:              config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config), EpochUsageLimit: config.epochUsageLimit,
 	}
 	if err := config.validate(); err != nil {
 		opts.Err = err
@@ -141,13 +141,17 @@ func keyExchangeStrings(config *Config, link net.Conn, stream bool) (options, pe
 		Stream: stream, IPv6: isIPv6(link.RemoteAddr()), TunMTU: mtu,
 		Cipher: ciphers[0], KeySizeBits: cipherKeyBits[ciphers[0]],
 	})
+	proto := implementedProto
+	if config.noEpoch {
+		proto &^= ctrlmsg.IVProtoDataEpoch
+	}
 	info := ctrlmsg.PeerInfo{
 		Version:  "gopenvpn-conn " + libraryVersion,
 		Platform: platform(),
 		// The largest MTU the client can take; OpenVPN's own default is 1600.
 		MTU:     max(1600, mtu),
 		Ciphers: ciphers,
-		Proto:   implementedProto,
+		Proto:   proto,
 		UV:      config.PeerInfo,
 	}
 	return options, info.String(), ciphers
@@ -182,7 +186,7 @@ const libraryVersion = "0.2.0"
 // implementedProto is IV_PROTO: the bits of the features that this client has.
 // Each step that adds a feature adds its bit (SPEC §8.2).
 const implementedProto = ctrlmsg.IVProtoDataV2 | ctrlmsg.IVProtoRequestPush | ctrlmsg.IVProtoTLSKeyExport |
-	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp
+	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp | ctrlmsg.IVProtoDataEpoch
 
 // Read returns the next IP packet that the server sent, waiting for it, as one
 // Read of a connected UDP socket does: a buffer that is too small gets the start

@@ -419,7 +419,7 @@ func TestSetupDataRefusals(t *testing.T) {
 		{"too little material", base, fakeExporter{material: make([]byte, 255)},
 			"BadDataKeys", "Session.setupData->SplitDataKeys.BadDataKeys"},
 		{"a peer id that is too big", func() *ctrlmsg.Pushed { p := base(); p.PeerID = 1 << 24; return p }, good,
-			"DataHeaderInvalid", "Session.setupData->NewSender->Header.validate.DataHeaderInvalid"},
+			"DataHeaderInvalid", "Session.setupData->NewChannel->NewSender->Header.validate.DataHeaderInvalid"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -493,7 +493,7 @@ func TestWriteEndsTheSessionWhenThePacketIDsEnd(t *testing.T) {
 		if err := r.session.Handshake(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		r.session.data.Load().sender.SetNextID(math.MaxUint32)
+		r.session.data.Load().ch.(interface{ SetNextID(uint32) }).SetNextID(math.MaxUint32)
 		if _, err := r.session.Write([]byte{0x45, 1}); err != nil { // the last id
 			t.Fatal(err)
 		}
@@ -508,3 +508,94 @@ func TestWriteEndsTheSessionWhenThePacketIDsEnd(t *testing.T) {
 
 // tagNeverStarts is the tag of the error of the sessions that these tests make only to call a method of.
 const tagNeverStarts = "NeverStarts"
+
+// epochPush is the usual push reply, with the flags that a server 2.7 pushes to a
+// client that announced the epoch format.
+func epochPush(cipher string) string {
+	return strings.Replace(vpntest.DefaultPushReply, "cipher AES-256-GCM", "cipher "+cipher, 1) +
+		",protocol-flags cc-exit tls-ekm dyn-tls-crypt aead-epoch"
+}
+
+func epochRig(t *testing.T, tr transport, cipher string, server vpntest.ServerOptions) *tlsRig {
+	t.Helper()
+	server.DataCipher = cipher
+	server.Epoch = true
+	server.PushMessages = []string{epochPush(cipher)}
+	return newTLSRig(t, tlsOptions{
+		rigOptions: rigOptions{transport: tr, wrap: wrapKinds[0], server: server},
+		ciphers:    allCiphers,
+	})
+}
+
+func TestEpochDataGoesBothWays(t *testing.T) {
+	for _, tr := range transports {
+		for _, cipher := range dataCiphers {
+			t.Run(tr.name+"/"+cipher, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					r := epochRig(t, tr, cipher, vpntest.ServerOptions{EchoData: true})
+					payloads := [][]byte{{0x45, 1}, bytes.Repeat([]byte{0x45}, 1400), bytes.Repeat([]byte{0x60}, 1500)}
+					for _, p := range payloads {
+						if n, err := r.session.Write(p); err != nil || n != len(p) {
+							t.Fatalf("Write(%d bytes) = %d, %v", len(p), n, err)
+						}
+					}
+					got := serverGot(t, r, len(payloads))
+					buf := make([]byte, 2000)
+					for i, p := range payloads {
+						if !bytes.Equal(got[i], p) {
+							t.Errorf("the server got packet %d as %d different bytes", i, len(got[i]))
+						}
+						if n, err := r.session.Read(buf); err != nil || !bytes.Equal(buf[:n], p) {
+							t.Errorf("Read of echo %d = %d bytes, %v", i, n, err)
+						}
+					}
+					if r.session.Dropped() != 0 {
+						t.Errorf("%d packets dropped", r.session.Dropped())
+					}
+				})
+			})
+		}
+	}
+}
+
+// The server's keys reach their limit again and again, so its packets come in
+// ever newer epochs, and the client's receiver follows them; the client's sender
+// follows too, and the server takes what the client writes in those epochs.
+func TestEpochsMoveDuringASession(t *testing.T) {
+	for _, tr := range transports {
+		t.Run(tr.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := epochRig(t, tr, "AES-256-GCM", vpntest.ServerOptions{EpochUsageLimit: 20})
+				if err := r.session.Handshake(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				// Rounds of 10 packets from the server, which moves it through epochs, and one
+				// from the client, which the server takes: each side's receiver has to keep up
+				// with the other's sender, as it does when traffic goes both ways.
+				buf := make([]byte, 10)
+				for round := range 40 {
+					for i := range 10 {
+						if _, err := r.server.SendData([]byte{0x45, byte(round), byte(i)}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					synctest.Wait()
+					for i := range 10 {
+						n, err := r.session.Read(buf)
+						if err != nil || n != 3 || buf[1] != byte(round) || buf[2] != byte(i) {
+							t.Fatalf("round %d, Read %d = %x, %v", round, i, buf[:n], err)
+						}
+					}
+					if _, err := r.session.Write([]byte{0x45, byte(round), 7}); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+				}
+				serverGot(t, r, 40)
+				if r.session.Dropped() != 0 {
+					t.Errorf("the client dropped %d packets", r.session.Dropped())
+				}
+			})
+		})
+	}
+}

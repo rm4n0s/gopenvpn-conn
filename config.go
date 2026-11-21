@@ -102,6 +102,14 @@ type Config struct {
 	// resetOnly makes the handshake end with the exchange of resets, with no
 	// TLS: for the tests of that exchange, which need no certificates.
 	resetOnly bool
+
+	// noEpoch makes the client not announce the epoch data format (IV_PROTO bit
+	// 10), so that a server uses the format with 32-bit packet ids: for the tests
+	// that go through that format against a real server. epochUsageLimit replaces
+	// the usage limit of the epoch keys, so that a test goes through many epochs
+	// with a few packets.
+	noEpoch         bool
+	epochUsageLimit uint64
 }
 
 // validate checks the fields of a Config that can be wrong before there is a

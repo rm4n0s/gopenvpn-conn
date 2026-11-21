@@ -80,6 +80,9 @@ type Options struct {
 	Ciphers []string
 	// MTU is the tunnel MTU when the server pushes none; 1500 when zero.
 	MTU int
+	// EpochUsageLimit replaces the usage limit of the keys of the epoch data
+	// format. Only the tests set it.
+	EpochUsageLimit uint64
 	// ResetOnly makes the handshake end with the exchange of resets, with no
 	// TLS: for the tests of that exchange.
 	ResetOnly bool
@@ -118,7 +121,8 @@ type Session struct {
 	serverKX *ctrlmsg.ServerKeyExchange // set before tlsReady is closed
 	pushed   *ctrlmsg.Pushed            // set before tlsReady is closed
 	pushDone chan struct{}              // closed when the push reply is complete
-	extend   chan time.Time             // from the control reader to the loop: a later end for the handshake
+	extend   chan struct{}              // from the control reader to the loop: extendAt has a later end for the handshake
+	extendAt time.Time                  // the latest end that AUTH_PENDING asked for; guarded by mu
 	began    time.Time                  // when the handshake began
 	data     atomic.Pointer[dataPath]   // the data channel, set before tlsReady is closed
 	recv     chan []byte                // decrypted IP packets for Read
@@ -186,7 +190,7 @@ func New(opts Options) *Session {
 	s.out = make(chan []byte)
 	s.tlsReady = make(chan struct{})
 	s.pushDone = make(chan struct{})
-	s.extend = make(chan time.Time, 1)
+	s.extend = make(chan struct{}, 1)
 	s.adapter = newControlConn(s)
 	if opts.Err != nil {
 		s.err = opts.Err

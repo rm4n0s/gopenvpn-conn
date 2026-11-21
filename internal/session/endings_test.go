@@ -3,6 +3,7 @@
 package session
 
 import (
+	"net"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -165,4 +166,22 @@ func TestAuthPendingExtendsTheHandshake(t *testing.T) {
 			synctest.Wait()
 		})
 	})
+}
+
+// The latest end that AUTH_PENDING asked for wins, in whatever order its messages
+// are handled: two of them in a row, before the loop looks, must not leave the
+// shorter one (a race that the first version of extendHandshake had).
+func TestExtendHandshakeKeepsTheLatestEnd(t *testing.T) {
+	for _, order := range [][]time.Duration{{120 * time.Second, 10 * time.Second}, {10 * time.Second, 120 * time.Second}} {
+		s := New(Options{Link: &net.UDPConn{}, Err: errors.New(tagNeverStarts, "a session that never starts")})
+		for _, asked := range order {
+			s.extendHandshake(asked)
+		}
+		if want := s.began.Add(120 * time.Second); !s.extendAt.Equal(want) {
+			t.Errorf("order %v: the end is %v after the start, want 120s", order, s.extendAt.Sub(s.began))
+		}
+		if len(s.extend) != 1 {
+			t.Errorf("order %v: %d wake-ups waiting, want 1", order, len(s.extend))
+		}
+	}
 }

@@ -41,21 +41,21 @@ type exporter interface {
 	ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)
 }
 
-// dataPath is the data channel of one key: the sender that Write uses, the
-// receiver that the loop uses, and the size of the largest packet.
+// dataPath is the data channel of one key: the channel that Write seals with and
+// the loop opens with, and the size of the largest packet.
 type dataPath struct {
-	mtu      int
-	receiver *datachan.Receiver
-	rbuf     []byte // the loop's buffer for what it opens
+	mtu  int
+	ch   datachan.Channel
+	rbuf []byte // the loop's buffer for what it opens
 
-	mu     sync.Mutex // the sender and wbuf: Write may be called from many goroutines
-	sender *datachan.Sender
-	wbuf   []byte
+	mu   sync.Mutex // Seal and wbuf: Write may be called from many goroutines
+	wbuf []byte
 }
 
 // setupData makes the data channel from the TLS session that is complete and the
 // options that the server pushed: the keys from the TLS exporter, the cipher the
-// server chose, the header with the peer id. It is called when the push reply is
+// server chose, the header with the peer id, and the format (32-bit packet ids, or
+// epochs when protocol-flags has aead-epoch). It is called when the push reply is
 // complete, before the handshake is.
 //
 // OpenVPN: ssl.c generate_key_expansion_tls_export, init_key_contexts.
@@ -80,18 +80,20 @@ func (s *Session) setupData(p *ctrlmsg.Pushed, x exporter) error {
 	defer dk.Clear()
 
 	// This library is the TLS client: it sends with the client-to-server keys.
-	// The first key id of a session is 0.
+	// The first key id of a session is 0. The epoch format (protocol-flags
+	// aead-epoch) has a channel of its own; it exists only for DATA_V2.
 	header := datachan.Header{HasPeerID: p.HasPeerID, PeerID: p.PeerID}
-	sender, err := datachan.NewSender(cipher, &dk.ClientToServer, header)
-	if err != nil {
-		return err
+	var ch datachan.Channel
+	if slices.Contains(p.ProtocolFlags, "aead-epoch") {
+		ch, err = datachan.NewEpochChannel(cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.EpochOptions{Strict: s.opts.Stream, UsageLimit: s.opts.EpochUsageLimit})
+	} else {
+		ch, err = datachan.NewChannel(cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.ReceiverOptions{Strict: s.opts.Stream})
 	}
-	receiver, err := datachan.NewReceiver(cipher, &dk.ServerToClient, header, datachan.ReceiverOptions{Strict: s.opts.Stream})
 	if err != nil {
 		return err
 	}
 	mtu := cmpOr(p.MTU, s.opts.MTU, defaultMTU)
-	s.data.Store(&dataPath{mtu: mtu, sender: sender, receiver: receiver})
+	s.data.Store(&dataPath{mtu: mtu, ch: ch})
 	return nil
 }
 
@@ -117,7 +119,7 @@ func (s *Session) handleData(raw []byte) {
 		s.drop("a data packet before the keys are made", nil)
 		return
 	}
-	plain, err := d.receiver.Open(d.rbuf[:0], raw, time.Now())
+	plain, err := d.ch.Open(d.rbuf[:0], raw, time.Now())
 	if err != nil {
 		s.drop("a data packet that is refused", err)
 		return
@@ -196,7 +198,7 @@ func (s *Session) Write(b []byte) (int, error) {
 	if s.opts.Stream {
 		d.wbuf = append(d.wbuf, 0, 0) // the length of the frame goes here
 	}
-	packet, err := d.sender.Seal(d.wbuf, b)
+	packet, err := d.ch.Seal(d.wbuf, b)
 	if err != nil {
 		s.fail(err)
 		return 0, s.result()

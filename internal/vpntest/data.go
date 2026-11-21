@@ -21,10 +21,9 @@ import (
 // serverData is the data channel of the server: the keys of the TLS exporter,
 // used the other way round from the client.
 type serverData struct {
-	mu       sync.Mutex // the sender and the buffer: SendData and the echo run apart
-	sender   *datachan.Sender
-	receiver *datachan.Receiver // the loop goroutine only
-	rbuf     []byte
+	ch   datachan.Channel
+	rbuf []byte     // the loop goroutine only
+	mu   sync.Mutex // Seal: SendData and the echo run apart
 }
 
 // setupData makes the data channel from the TLS session, once the key exchange is
@@ -47,18 +46,19 @@ func (s *Server) setupData(conn *tls.Conn) {
 		return
 	}
 	header := datachan.Header{HasPeerID: !s.opts.DataV1}
-	sender, err := datachan.NewSender(cipher, &dk.ServerToClient, header)
-	if err != nil {
-		s.tb.Errorf("vpntest server: %v", err)
-		return
+	var ch datachan.Channel
+	if s.opts.Epoch {
+		ch, err = datachan.NewEpochChannel(cipher, &dk.ServerToClient, &dk.ClientToServer, header,
+			datachan.EpochOptions{Strict: s.opts.Stream, UsageLimit: s.opts.EpochUsageLimit})
+	} else {
+		ch, err = datachan.NewChannel(cipher, &dk.ServerToClient, &dk.ClientToServer, header, datachan.ReceiverOptions{Strict: s.opts.Stream})
 	}
-	receiver, err := datachan.NewReceiver(cipher, &dk.ClientToServer, header, datachan.ReceiverOptions{Strict: s.opts.Stream})
 	if err != nil {
 		s.tb.Errorf("vpntest server: %v", err)
 		return
 	}
 	s.mu.Lock()
-	s.data = &serverData{sender: sender, receiver: receiver}
+	s.data = &serverData{ch: ch}
 	s.mu.Unlock()
 }
 
@@ -81,7 +81,7 @@ func (s *Server) handleData(raw []byte) {
 		s.mu.Unlock()
 		return
 	}
-	plain, err := d.receiver.Open(d.rbuf[:0], raw, time.Now())
+	plain, err := d.ch.Open(d.rbuf[:0], raw, time.Now())
 	if err != nil {
 		s.mu.Lock()
 		s.dataDropped++
@@ -112,7 +112,7 @@ func (s *Server) SendData(payload []byte) ([]byte, error) {
 		return nil, nil
 	}
 	d.mu.Lock()
-	packet, err := d.sender.Seal(nil, payload)
+	packet, err := d.ch.Seal(nil, payload)
 	d.mu.Unlock()
 	if err != nil {
 		return nil, err
