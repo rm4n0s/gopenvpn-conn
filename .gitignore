@@ -35,3 +35,6 @@ go.work.sum
 
 # Pinned reference sources (scripts/fetch-reference.sh); never committed
 /reference/
+
+# The Wine prefix of the Windows tests (scripts/test-windows.sh)
+/.wine-test/

@@ -1,6 +1,6 @@
 # Implementation plan
 
-Status: **merged into `main` at the owner's request, 2026-11-21 (tag `step-0`). The steps have not been started.** They start when the owner asks for them; when they do, this line becomes "started at the owner's request, <date>" and the rule "Working through the steps" of `CLAUDE.md` applies.
+Status: **started at the owner's request, 2026-11-21** (the setup is tag `step-0`). The rule "Working through the steps" of `CLAUDE.md` applies: no stopping between steps.
 
 `docs/SPEC.md` says what is built. This file says in which order, in steps that are small and explicit enough for Claude Sonnet 5.5 at high effort to carry out one at a time (the owner's request, 2026-11-21). `docs/IMPLEMENTED.md` logs what is finished.
 
@@ -83,7 +83,7 @@ Result: the library completes a TLS handshake with the real server, over UDP and
 - **Goal:** an empty Go module that builds, with one script that runs every check.
 - **Read:** `CLAUDE.md` (all of it); SPEC §3, §18, §19.
 - **Build:**
-  - `go.mod`: `module github.com/rm4n0s/gopenvpn-conn`, `go 1.27`. `go get github.com/rm4n0s/errors@v0.2.0`.
+  - `go.mod`: `module github.com/rm4n0s/gopenvpn-conn`, `go 1.26.3` (the version `github.com/rm4n0s/errors` needs; SPEC §18). `go get github.com/rm4n0s/errors@v0.2.0`.
   - `doc.go`: `package openvpn` with the package comment (two or three sentences from SPEC §1).
   - `.golangci.yml`: the default linters plus `errcheck`, `govet`, `staticcheck`, `unused`, `ineffassign`, `gosec`, `misspell`, `gofmt`. Do not turn off a linter later to hide a finding; fix the finding.
   - `scripts/check.sh` (`set -euo pipefail`), running in this order and stopping at the first failure: `gofmt -l .` (fail if it prints a file), `go vet ./...`, `golangci-lint run`, `go test -race ./...`, `CGO_ENABLED=0 go build ./...`, `CGO_ENABLED=0 go test ./...`, then `go build ./...` and `go vet ./...` for `GOOS=windows GOARCH=amd64`, `windows/arm64`, `darwin/amd64`, `darwin/arm64`. Print one line per check with OK or FAILED.
