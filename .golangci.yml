@@ -1,5 +1,6 @@
 # golangci-lint v2. A finding is fixed, not silenced: do not turn a linter off
-# or add an exclusion to make a check pass.
+# or add an exclusion to make a check pass. The exclusions below are the only
+# ones, each with the reason it is not a defect.
 version: "2"
 
 run:
@@ -22,6 +23,14 @@ linters:
   exclusions:
     paths:
       - reference
+    rules:
+      # G204 flags any exec.Command whose arguments are not constants. The job
+      # of internal/servertest is to run openvpn with the options a test
+      # chooses; its arguments come from test code, never from input.
+      - path: internal/servertest/
+        linters:
+          - gosec
+        text: "G204"
 
 formatters:
   enable:

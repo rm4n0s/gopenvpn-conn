@@ -38,6 +38,17 @@ gofmt_clean() {
 	fi
 }
 
+# no_server_left fails when a test server (a tun device named tungo...) is
+# still running after the tests.
+no_server_left() {
+	local left
+	left="$(pgrep -af -- '--dev tungo' || true)"
+	if [ -n "$left" ]; then
+		printf 'openvpn processes left running:\n%s\n' "$left"
+		return 1
+	fi
+}
+
 # cross <goos> <goarch> builds and vets the module for another system.
 cross() {
 	GOOS="$1" GOARCH="$2" go build ./... && GOOS="$1" GOARCH="$2" go vet ./...
@@ -48,6 +59,8 @@ run "go vet" go vet ./...
 run "golangci-lint" golangci-lint run
 run "error rules (errcheck)" go run ./internal/tools/errcheck -allow internal/tools/errcheck/errcheck.allow
 run "go test -race" go test -race ./...
+run "tests against the real server" scripts/vpn-ns.sh -- go test -race -count=1 -p 1 -tags gopenvpn_server ./...
+run "no openvpn process left" no_server_left
 run "CGO_ENABLED=0 go build" env CGO_ENABLED=0 go build ./...
 run "CGO_ENABLED=0 go test" env CGO_ENABLED=0 go test ./...
 run "windows/amd64 build and vet" cross windows amd64

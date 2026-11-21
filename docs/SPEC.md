@@ -391,6 +391,8 @@ Known before any code, to be confirmed by their steps:
 - **O2** The draft's description of the old key derivation is incomplete; it does not matter for 1.0 (D3).
 - **O3** The draft has opcodes 12 to 14; OpenVPN 2.7.9 stops at 11.
 - **O4** A real OpenVPN 2.7.9 server starts with no root inside `unshare -Urn`, with a kernel DCO device, on this machine (tried 2026-11-21).
+- **O5** The server refuses `--verify-client-cert none` unless an authentication method is configured (`--auth-user-pass-verify`, a plugin or the management interface): `Options error: --verify-client-cert none|optional must be used with --management-client-auth, an --auth-user-pass-verify script, or plugin`. The test server therefore requires a client certificate by default (`internal/servertest`, step 1.3).
+- **O6** The server's log has the line `Initialization Sequence Completed` when it is ready, and `UDPv4 link local (bound): [AF_INET]127.0.0.1:<port>` (for TCP, `TCPv4_SERVER link local (bound): ...`) when it listens (step 1.3).
 
 ## 22. After 1.0
 
