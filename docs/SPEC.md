@@ -382,6 +382,7 @@ HKDF, AES-GCM, HMAC, SHA-2, TLS and X.509 come from the standard library. Any ot
 - **V2** No scripts, plugins, management interface or environment: a library gives its caller values and errors instead.
 - **V3** The profile parser refuses what it cannot honor instead of warning and going on (§12).
 - **V4** `internal/wire` parses strictly: an `ACK_V1` with bytes after its acknowledgements is refused (OpenVPN ignores them; no real server sends them), and the opcodes 1, 2 and 12 to 31 are refused (OpenVPN 2.7.9 accepts 3 to 11 only).
+- **V5** `internal/keys` refuses a static key file of 128 bytes (one key), which OpenVPN reads for `tls-auth` with no direction. `openvpn --genkey` writes 256 bytes, and a profile with an older key can be given a new one.
 
 ## 21. Observations
 
@@ -394,6 +395,8 @@ Known before any code, to be confirmed by their steps:
 - **O4** A real OpenVPN 2.7.9 server starts with no root inside `unshare -Urn`, with a kernel DCO device, on this machine (tried 2026-11-21).
 - **O5** The server refuses `--verify-client-cert none` unless an authentication method is configured (`--auth-user-pass-verify`, a plugin or the management interface): `Options error: --verify-client-cert none|optional must be used with --management-client-auth, an --auth-user-pass-verify script, or plugin`. The test server therefore requires a client certificate by default (`internal/servertest`, step 1.3).
 - **O6** The server's log has the line `Initialization Sequence Completed` when it is ready, and `UDPv4 link local (bound): [AF_INET]127.0.0.1:<port>` (for TCP, `TCPv4_SERVER link local (bound): ...`) when it listens (step 1.3).
+- **O7** The server answers a first reset (`CONTROL_HARD_RESET_CLIENT_V2`) **statelessly**: it sends an HMAC based reset challenge (a `CONTROL_HARD_RESET_SERVER_V2` whose session id is derived from the client's) and keeps no state. At `--verb 4` it logs nothing for that packet; at `--verb 7`: `Reset packet from client, sending HMAC based reset challenge`. `TLS: Initial packet from ...` is logged only after the client's third packet. A packet with a wrong `tls-auth` HMAC gets no answer, and at `--verb 7` the log says `Authenticate/Decrypt packet error: packet HMAC authentication failed` and `TLS Error: incoming packet authentication failed from ...` (step 1.5).
+- **O8** The format of `tls-auth` in the plan is exact: first byte, session id, HMAC, packet id (4 bytes), time (4 bytes), body, with the HMAC over packet id, time, first byte, session id and body, and the keys by direction. The real server 2.7.9 accepted and answered it with `--auth` SHA1 (the default), SHA256, SHA384 and SHA512, with `key-direction` 0 on the server and 1 on the client, and with no direction on both (step 1.5, `internal/ctrlwrap/realserver_test.go`).
 
 ## 22. After 1.0
 

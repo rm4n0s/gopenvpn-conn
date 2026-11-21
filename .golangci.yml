@@ -31,6 +31,21 @@ linters:
         linters:
           - gosec
         text: "G204"
+      # G505 and G401 flag SHA-1. OpenVPN's tls-auth uses HMAC-SHA1 by default
+      # (--auth), and the library must speak it to work with servers that
+      # keep the default. The security of an HMAC does not depend on the
+      # collision resistance of its hash. Widen the path only for code that
+      # builds that digest for tls-auth.
+      - path: internal/ctrlwrap/
+        linters:
+          - gosec
+        text: "G505|G401"
+      # G404 flags math/rand. The tests use seeded sequences on purpose, so
+      # that a failure can be reproduced; nothing here needs unpredictability.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G404"
 
 formatters:
   enable:
