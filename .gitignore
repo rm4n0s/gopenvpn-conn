@@ -32,3 +32,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Pinned reference sources (scripts/fetch-reference.sh); never committed
+/reference/

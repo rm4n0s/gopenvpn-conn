@@ -1,0 +1,57 @@
+gopenvpn-conn -- an OpenVPN client library for Go
+
+Copyright (C) 2026 Manos Ragiadakos
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2
+as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+The text of the license is in the file LICENSE (GPL-2.0-only).
+
+
+Apache2 linking exception
+-------------------------
+
+  In addition, as a special exception, Manos Ragiadakos and the
+  contributors give permission to link the code of this program to
+  libraries (the "Libraries") licensed under the Apache License
+  version 2.0 (this work and any linked library the "Combined Work")
+  and copy and distribute the Combined Work without an obligation to
+  license the Libraries under the GNU General Public License v2
+  (GPL-2.0) as required by Section 2 of the GPL-2.0, and without an
+  obligation to refrain from imposing any additional restrictions in
+  the Apache License version 2 that are not in the GPL-2.0, as
+  required by Section 6 of the GPL-2.0.  You must comply with the
+  GPL-2.0 in all other respects for the Combined Work, including
+  the obligation to provide source code.  If you modify this file, you
+  may extend this exception to your version of the file, but you are
+  not obligated to do so.  If you do not wish to do so, delete this
+  exception statement from your version.
+
+  This is the exception that OpenVPN grants in its COPYING file,
+  extended to this program as that file allows.
+
+
+OpenVPN
+-------
+
+  Parts of this program are derived from the code of OpenVPN 2
+  (https://github.com/OpenVPN/openvpn), a C program: they are written
+  in Go with that code as their reference.
+
+    Copyright (C) 2002-2026 OpenVPN Inc <sales@openvpn.net>
+    and the other copyright holders named in its source files
+
+  OpenVPN is distributed under the GPL license version 2, with the
+  exceptions written in its COPYING file.  A copy of that file is
+  third_party/openvpn/COPYING and a copy of its license text is
+  third_party/openvpn/COPYRIGHT.GPL.  Each Go file that is based on an
+  OpenVPN file names it and says that it is a changed work.
+
+  "OpenVPN" is a trademark of OpenVPN Inc.  This project is not
+  affiliated with, or endorsed by, OpenVPN Inc.
