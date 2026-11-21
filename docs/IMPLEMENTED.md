@@ -80,3 +80,17 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - OpenVPN's test file has no fixed output vectors for plain `tls-crypt` (all-zero keys, round trips and refusals), so the byte-exact proof is the real server and the by-hand reconstruction. The plan said to use vectors "where it has a fixed output": there is none here.
   - `aes.NewCipher` can fail only for a wrong key length, and the length is a constant: that is a mistake in the package if it ever happens, so `newAES256` panics. The alternative was an error branch that no test could reach.
   - The unwrap decrypts before it checks the tag, as the construction needs (the tag covers the plaintext), and returns nothing until the tag is right. The replay check comes first because it is cheap, and nothing is recorded until the tag has been checked.
+
+## Step 1.7: `tls-crypt-v2` (2026-11-21, tag `step-1.7`)
+
+- **Built:**
+  - `internal/wire/early.go`: `ParseEarlyNegotiation` and `AppendEarlyNegotiation` (the TLV of the server's reset: the flag that asks the client for `WKc` again), `EarlyNegotiationStart` (the replay id of the first packet of `tls-crypt-v2`, `0x0f000000`).
+  - `internal/keys/tlscryptv2.go`: `ParseTLSCryptV2ClientKey` (the PEM `OpenVPN tls-crypt-v2 client key`: the 256 bytes of `Kc`, then the opaque `WKc` with its length in its last two bytes, at most 1024), `TLSCryptV2ClientKey`, `MaxWKcSize`.
+  - `internal/ctrlwrap/tlscryptv2.go`: `NewTLSCryptV2` and the `WKCWrapper` interface (`Wrapper` plus `WKcLen`): `tls-crypt` with `Kc`, with `WKc` appended, not encrypted, to `CONTROL_HARD_RESET_CLIENT_V3` and `CONTROL_WKC_V1` only.
+  - `internal/ctrlwrap/realserver_test.go`: a `peer` helper that keeps one UDP connection, so that the packets of one handshake come from one address.
+- **OpenVPN files used as reference:** `tls_crypt.c` (`tls_crypt_v2_*`, the format of `WKc`), `ssl_pkt.c` (the opcodes and the early negotiation TLVs), `tests/unit_tests/openvpn/test_tls_crypt.c` (the test keys, which are copied to `internal/keys/testdata/` with their provenance).
+- **Checks that ran:** `scripts/check.sh`, all thirteen OK. Fuzz, 60 seconds each: `FuzzParseEarlyNegotiation` 4.1 million executions, `FuzzParseTLSCryptV2ClientKey` 0.3 million, `FuzzTLSCryptV2RoundTrip` 0.4 million, no finding.
+- **Proof (the real server 2.7.9):** `TestTLSCryptV2WithRealServer`: the reset V3 with `WKc` is answered; the answer acks packet 0, carries our session id and asks for `WKc` again; the third packet `CONTROL_WKC_V1` is accepted and acked. `TestTLSCryptV2ThirdPacketNeedsTheWrappedKey` and `TestTLSCryptV2RefusedByRealServer` show the refusals. A known-answer test unwraps `WKc` with OpenVPN's test server key and gets `Kc` back.
+- **Learned:**
+  - The plan's Facts for `tls-crypt-v2` were exact (SPEC §21 O10). The message `TLS: Initial packet from` is not logged for a `CONTROL_WKC_V1` (SPEC §21 O11): the first version of the test waited for it and failed, while the server had in fact accepted the packet.
+

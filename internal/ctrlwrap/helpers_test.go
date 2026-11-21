@@ -3,10 +3,13 @@
 package ctrlwrap
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
 	"hash"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -104,4 +107,18 @@ func newCryptPair(t testing.TB, clk *clock) (client, server Wrapper) {
 		t.Fatal(err)
 	}
 	return client, server
+}
+
+// readV2ClientKey reads a tls-crypt-v2 client key file.
+func readV2ClientKey(t testing.TB, path string) *keys.TLSCryptV2ClientKey {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := keys.ParseTLSCryptV2ClientKey(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("the client key file does not parse: %v", err)
+	}
+	return key
 }
