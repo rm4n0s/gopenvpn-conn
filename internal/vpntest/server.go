@@ -58,6 +58,9 @@ type ServerOptions struct {
 	// client's key exchange message, in place of a well-formed one. An empty
 	// non-nil slice sends nothing.
 	KeyExchangeReply []byte
+	// EarlyMessages are control messages that the server sends right after the
+	// key exchange, before it waits for any PUSH_REQUEST.
+	EarlyMessages []string
 	// PushMessages are the control messages the server sends after the key
 	// exchange, once ReplyAfterRequests requests have come, each in one TLS
 	// record. Nil sends one PUSH_REPLY with the usual options of a server; an
@@ -106,6 +109,7 @@ type Server struct {
 	kxDone         chan struct{}
 	kx             *ClientKeyExchange
 	pushRequests   int
+	control        *tls.Conn // the TLS session, once the key exchange is done
 	tlsErr         error
 	tlsState       tls.ConnectionState
 	largest        int // the largest packet that came from the client, as it was on the link
@@ -531,6 +535,14 @@ func (s *Server) PushRequests() int {
 // serveControl sends the push messages when it is time, and counts the requests
 // that come, until the TLS session ends.
 func (s *Server) serveControl(conn *tls.Conn, buf []byte) {
+	s.mu.Lock()
+	s.control = conn
+	s.mu.Unlock()
+	for _, m := range s.opts.EarlyMessages {
+		if _, err := conn.Write(append([]byte(m), 0)); err != nil {
+			return
+		}
+	}
 	messages := s.opts.PushMessages
 	if messages == nil {
 		messages = []string{DefaultPushReply}
@@ -567,6 +579,23 @@ func (s *Server) serveControl(conn *tls.Conn, buf []byte) {
 				sent = true
 			}
 		}
+	}
+}
+
+// SendControl sends one control message (with its closing NUL) to the client,
+// at any time after the key exchange. It fails the test when the key exchange is
+// not done or the TLS session is gone.
+func (s *Server) SendControl(message string) {
+	s.tb.Helper()
+	s.mu.Lock()
+	conn := s.control
+	s.mu.Unlock()
+	if conn == nil {
+		s.tb.Error("vpntest server: SendControl before the key exchange is done")
+		return
+	}
+	if _, err := conn.Write(append([]byte(message), 0)); err != nil {
+		s.tb.Errorf("vpntest server: SendControl: %v", err)
 	}
 }
 

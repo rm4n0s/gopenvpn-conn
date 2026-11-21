@@ -25,6 +25,11 @@ import (
 // PUSH_REPLY that is longer comes in parts.
 const maxControlMessage = 1 << 16
 
+// maxAuthPending is the longest that AUTH_PENDING may stretch the handshake, when
+// that is more than HandshakeTimeout: OpenVPN allows half of its renegotiation
+// time (an hour by default).
+const maxAuthPending = 30 * time.Minute
+
 // pushRequestInterval is how often PUSH_REQUEST is sent until the server's
 // reply is complete: OpenVPN sends it every 5 seconds.
 const pushRequestInterval = 5 * time.Second
@@ -111,6 +116,8 @@ type Session struct {
 	serverKX *ctrlmsg.ServerKeyExchange // set before tlsReady is closed
 	pushed   *ctrlmsg.Pushed            // set before tlsReady is closed
 	pushDone chan struct{}              // closed when the push reply is complete
+	extend   chan time.Time             // from the control reader to the loop: a later end for the handshake
+	began    time.Time                  // when the handshake began
 	budget   int                        // bytes of TLS in a control packet
 	wkcLen   int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
@@ -174,6 +181,7 @@ func New(opts Options) *Session {
 	s.out = make(chan []byte)
 	s.tlsReady = make(chan struct{})
 	s.pushDone = make(chan struct{})
+	s.extend = make(chan time.Time, 1)
 	s.adapter = newControlConn(s)
 	if opts.Err != nil {
 		s.err = opts.Err
@@ -231,6 +239,7 @@ func (s *Session) result() error {
 // start launches the goroutines. The caller holds s.mu.
 func (s *Session) start() {
 	s.started = true
+	s.began = time.Now()
 	s.wg.Add(2)
 	go s.readLoop()
 	go s.loop()
@@ -341,6 +350,15 @@ const (
 	// (the connection ended in the middle of it). A message that was read and
 	// is not valid has its own tag. Metadata: "op" ("read" or "write").
 	TagKeyExchangeFailed = "KeyExchangeFailed"
+	// TagAuthFailed: the server refused the credentials with AUTH_FAILED.
+	// Metadata: "reason" (the server's text), "session" (the form
+	// "SESSION:"), "temporary" (the form "TEMP"), "backoff" (seconds), "advance"
+	// ("no", "remote", "addr" or "").
+	TagAuthFailed = "AuthFailed"
+	// TagServerHalt: the server sent HALT. Metadata: "reason".
+	TagServerHalt = "ServerHalt"
+	// TagServerRestart: the server sent RESTART. Metadata: "reason", "flags".
+	TagServerRestart = "ServerRestart"
 	// TagControlChannelFailed: reading or writing the control channel failed
 	// after the key exchange (the server ended the TLS session, or the
 	// connection broke). Metadata: "op" ("read" or "write").

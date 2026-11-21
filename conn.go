@@ -24,6 +24,17 @@ const (
 	// cause (an io.EOF, a closed connection) can be found with errors.Is.
 	// Metadata: "op" ("read" or "write").
 	TagLinkFailed = session.TagLinkFailed
+	// TagAuthFailed: the server refused the credentials (AUTH_FAILED). Metadata:
+	// "reason" (the server's text), "session" (the form "SESSION:", a token
+	// that has expired), "temporary" (the form "TEMP": try again later),
+	// "backoff" (seconds the server asks to wait), "advance" ("no", "remote",
+	// "addr" or "": what it says about the next server).
+	TagAuthFailed = session.TagAuthFailed
+	// TagServerHalt: the server told the client to stop (HALT). Metadata: "reason".
+	TagServerHalt = session.TagServerHalt
+	// TagServerRestart: the server asked the client to connect again (RESTART).
+	// Metadata: "reason", "flags" (P keeps the credentials, N goes to the next server).
+	TagServerRestart = session.TagServerRestart
 	// TagKeyExchangeFailed: the connection ended while the key exchange
 	// message was written or read. Metadata: "op" ("read" or "write").
 	TagKeyExchangeFailed = session.TagKeyExchangeFailed
@@ -156,7 +167,8 @@ const libraryVersion = "0.2.0"
 
 // implementedProto is IV_PROTO: the bits of the features that this client has.
 // Each step that adds a feature adds its bit (SPEC §8.2).
-const implementedProto = ctrlmsg.IVProtoDataV2 | ctrlmsg.IVProtoRequestPush | ctrlmsg.IVProtoTLSKeyExport
+const implementedProto = ctrlmsg.IVProtoDataV2 | ctrlmsg.IVProtoRequestPush | ctrlmsg.IVProtoTLSKeyExport |
+	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp
 
 // HandshakeContext runs the handshake if it has not run, and returns when it is
 // complete, when it fails, or when ctx is done. A done ctx ends the session: the

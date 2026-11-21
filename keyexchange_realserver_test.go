@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rm4n0s/errors"
+
 	"github.com/rm4n0s/gopenvpn-conn/internal/servertest"
 )
 
@@ -57,7 +59,7 @@ func TestKeyExchangeWithRealServer(t *testing.T) {
 			}
 			// What the server read, and what it decided.
 			srv.WaitLog(t, "peer info: IV_VER=gopenvpn-conn_0.2.0", 3*time.Second)
-			srv.WaitLog(t, "IV_PROTO=14", 3*time.Second)
+			srv.WaitLog(t, "IV_PROTO=286", 3*time.Second)
 			srv.WaitLog(t, "IV_CIPHERS=AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", 3*time.Second)
 			srv.WaitLog(t, "UV_FROM=gopenvpn-conn_tests", 3*time.Second)
 			srv.WaitLog(t, "authentication succeeded for username 'alice'", 3*time.Second)
@@ -73,14 +75,19 @@ func TestKeyExchangeWithRealServer(t *testing.T) {
 				},
 			})
 			if err == nil {
-				// The server sends AUTH_FAILED after its key exchange message; the
-				// client reads it in a later step (2.3).
-				defer func() {
-					if err := conn.Close(); err != nil {
-						t.Errorf("Close: %v", err)
-					}
-				}()
+				if cerr := conn.Close(); cerr != nil {
+					t.Errorf("Close: %v", cerr)
+				}
+				t.Fatalf("Dial with a wrong password succeeded\nserver log:\n%s", srv.Log())
 			}
+			appErr, ok := errors.FromError(err)
+			if !ok || appErr.Tag != TagAuthFailed {
+				t.Fatalf("Dial = %v, want %s\nserver log:\n%s", err, TagAuthFailed, srv.Log())
+			}
+			if !strings.HasSuffix(appErr.Route(), "control.AuthFailed") {
+				t.Errorf("route = %s", appErr.Route())
+			}
+			t.Logf("the server's reason: %q", appErr.Metadata["reason"])
 			srv.WaitLog(t, "verification failed", 3*time.Second)
 			for _, line := range strings.Split(srv.Log(), "\n") {
 				if strings.Contains(line, "verification failed") {

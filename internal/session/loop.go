@@ -65,6 +65,7 @@ func (s *Session) loop() {
 
 	handshake := time.NewTimer(s.opts.HandshakeTimeout)
 	defer handshake.Stop()
+	deadline := s.began.Add(s.opts.HandshakeTimeout)
 	retransmit := time.NewTimer(time.Hour)
 	retransmit.Stop()
 	defer retransmit.Stop()
@@ -123,6 +124,11 @@ func (s *Session) loop() {
 			s.pending = msg
 		case <-tlsReady:
 			tlsReady = nil
+		case at := <-s.extend:
+			if !complete && at.After(deadline) {
+				deadline = at
+				handshake.Reset(time.Until(at))
+			}
 		case err := <-s.readErr:
 			s.fail(err)
 			return
@@ -399,6 +405,25 @@ func (s *Session) controlLoop(conn *tls.Conn) {
 // failed and the loop is to stop.
 func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (failed bool) {
 	text := string(record[:len(record)-1]) // the text, without its NUL
+	switch {
+	case ctrlmsg.IsAuthFailed(text):
+		f := ctrlmsg.ParseAuthFailed(text)
+		s.fail(errors.New(TagAuthFailed, "the server refused the credentials",
+			"reason", f.Reason, "session", f.Session, "temporary", f.Temporary,
+			"backoff", int(f.Backoff/time.Second), "advance", f.Advance))
+		return true
+	case ctrlmsg.IsAuthPending(text):
+		s.extendHandshake(ctrlmsg.ParseAuthPending(text))
+		return false
+	}
+	if sig, ok := ctrlmsg.ParseSignal(text); ok {
+		if sig.Restart {
+			s.fail(errors.New(TagServerRestart, "the server asked the client to connect again", "reason", sig.Reason, "flags", sig.Flags))
+		} else {
+			s.fail(errors.New(TagServerHalt, "the server told the client to stop", "reason", sig.Reason))
+		}
+		return true
+	}
 	if !ctrlmsg.IsPushReply(text) || *ready {
 		s.log.Debug("ignored a control message", "name", ctrlmsg.Name(text))
 		return false
@@ -426,6 +451,25 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 	close(s.pushDone)
 	close(s.tlsReady)
 	return false
+}
+
+// extendHandshake makes the end of the handshake later, as AUTH_PENDING asks: the
+// server needs more time (a second factor, a web login). The time counts from the
+// start of the handshake and is at most the longer of HandshakeTimeout and
+// maxAuthPending; a message with no time keeps HandshakeTimeout. The context of
+// the handshake, and Close, still end it at any time.
+//
+// OpenVPN: push.c receive_auth_pending.
+func (s *Session) extendHandshake(asked time.Duration) {
+	if asked <= 0 {
+		asked = s.opts.HandshakeTimeout
+	}
+	asked = min(asked, max(s.opts.HandshakeTimeout, maxAuthPending))
+	select { // only this goroutine sends: dropping the old value leaves room for the new
+	case <-s.extend:
+	default:
+	}
+	s.extend <- s.began.Add(asked)
 }
 
 // pushRequests sends PUSH_REQUEST at once and then every 5 seconds, until the

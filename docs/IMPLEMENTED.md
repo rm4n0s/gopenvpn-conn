@@ -205,3 +205,15 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - Deviations V7 (the `auth-token` value is not kept in the options), V8 (cut at the NUL) and V9 (every `compress` is refused) are in SPEC §20.
   - A race in the loop, found by `scripts/check.sh` through a flaky test: after the loop took what `crypto/tls` had written, the channel for the next write was still in the `select` that waits for events, so a second write could replace bytes that were not yet in packets. The channel is switched off while bytes wait (the same in the test server, for its send window). Fifteen runs of the session and public tests under `-race` found nothing after the change.
 
+## Step 2.3: the messages that end a session (2026-11-22, tag `step-2.3`)
+
+- **Built:**
+  - `internal/ctrlmsg/endmsg.go`: `ParseAuthFailed` (`AUTH_FAILED`, `SESSION:`, `TEMP`, `TEMP[backoff n,advance x]`; the reason is cut at 1024 bytes), `ParseSignal` (`HALT` and `RESTART` with the `[P]`, `[N]`, `[PN]` flags) and `ParseAuthPending` (`timeout n`); they never fail: what is not understood is a message without keywords.
+  - `internal/session`: `control` reads these messages before the push reply, during the handshake and after it. `AUTH_FAILED`, `HALT` and `RESTART` end the session with `TagAuthFailed`, `TagServerHalt` and `TagServerRestart` (made once in `control`, stored by `fail`, the same value at every later call). `AUTH_PENDING` sends a later end to the loop through a channel of one place (the newest wins), and the loop moves its timer; it never shortens the wait and is cut at the longer of `HandshakeTimeout` and 30 minutes.
+  - Package `openvpn`: the three tags are exported; `IV_PROTO` is 286 now (bits 4 and 8 added to 14).
+  - `internal/vpntest`: `ServerOptions.EarlyMessages` (sent before the reply) and `Server.SendControl` (at any time).
+- **OpenVPN files used as reference:** `push.c` (`receive_auth_failed`, `server_pushed_signal`, `receive_auth_pending`, `parse_auth_pending_keywords`), `options_util.c` (`parse_auth_failed_temp`). The parsers are Go: one cut of the text, no shared buffers.
+- **Checks that ran:** `scripts/check.sh`. Fuzz, 60 seconds: `FuzzParseEndMessages` 11.9 million executions, no finding.
+- **Tests (unit):** the parsers (each form, odd keywords, a reason of 5000 bytes); in the session, six messages in two places each (early and instead of the reply), with tag, route, metadata and the same error at every call; a `HALT` after the handshake; `AUTH_PENDING`: a reply after the usual timeout succeeds, the extended time is the end (120 s), a shorter one does not shorten it, a huge one is cut to 30 minutes, none keeps 30 s, 200 of them are harmless.
+- **Proof (the real server 2.7.9):** `TestKeyExchangeWithRealServer`, a wrong password over UDP and TCP: `Dial` returns `TagAuthFailed`; the server sent a plain `AUTH_FAILED` (SPEC §21 O19).
+- **Learned:** the real server's refusal carries no reason, so `reason` is empty there; the keyword forms are known only from the source and the in-process peer.
