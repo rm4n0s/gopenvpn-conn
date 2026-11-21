@@ -1,0 +1,8 @@
+# Violations of the error rules (SPEC §14.1) that are accepted, one per line:
+#
+#   path:rule:reason
+#
+# path is relative to the module root, with slashes; rule is a number from 1
+# to 8; the reason says why. An entry that silences nothing is reported, so
+# remove an entry when its violation is gone. A new violation is fixed, not
+# added here, unless there is a reason that is written down.
