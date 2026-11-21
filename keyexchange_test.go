@@ -74,7 +74,7 @@ func TestKeyExchangeMessage(t *testing.T) {
 				}
 				info := peerInfoLines(kx.PeerInfo)
 				for name, want := range map[string]string{
-					"IV_TCPNL": "1", "IV_NCP": "2", "IV_MTU": "1600", "IV_PROTO": "1310",
+					"IV_TCPNL": "1", "IV_NCP": "2", "IV_MTU": "1600", "IV_PROTO": "1438",
 					"IV_CIPHERS": "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
 				} {
 					if info[name] != want {
@@ -394,14 +394,19 @@ func TestOnlyTheOfferedCiphersAreAccepted(t *testing.T) {
 }
 
 // IV_PROTO has the bit of the epoch data format unless the test knob turns it off.
-func TestIVProtoAnnouncesTheEpochFormat(t *testing.T) {
+func TestIVProtoBitsOfTheTestKnobs(t *testing.T) {
 	for _, tt := range []struct {
-		noEpoch bool
-		want    string
-	}{{false, "IV_PROTO=1310\n"}, {true, "IV_PROTO=286\n"}} {
-		_, peerInfo, _ := keyExchangeStrings(&Config{noEpoch: tt.noEpoch}, &net.UDPConn{}, false)
+		name string
+		cfg  Config
+		want string
+	}{
+		{"all", Config{}, "IV_PROTO=1438\n"},
+		{"no epoch (bit 10)", Config{noEpoch: true}, "IV_PROTO=414\n"},
+		{"no cc-exit (bit 7)", Config{noCCExit: true}, "IV_PROTO=1310\n"},
+	} {
+		_, peerInfo, _ := keyExchangeStrings(&tt.cfg, &net.UDPConn{}, false)
 		if !strings.Contains(peerInfo, tt.want) {
-			t.Errorf("noEpoch = %v: peer info %q lacks %q", tt.noEpoch, peerInfo, tt.want)
+			t.Errorf("%s: peer info %q lacks %q", tt.name, peerInfo, tt.want)
 		}
 	}
 }

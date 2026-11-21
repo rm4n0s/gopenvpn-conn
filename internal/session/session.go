@@ -129,6 +129,13 @@ type Session struct {
 	extendAt time.Time                  // the latest end that AUTH_PENDING asked for; guarded by mu
 	began    time.Time                  // when the handshake began
 	data     atomic.Pointer[dataPath]   // the data channel, set before tlsReady is closed
+	closing  atomic.Bool                // Close was called
+	ccExit   bool                       // the server pushed cc-exit; set before tlsReady is closed
+	exitSent atomic.Bool                // the EXIT message is written: the loop watches for its acknowledgement
+	wake     chan struct{}              // wakes the loop to look at what Close changed
+	drained  chan struct{}              // closed by the loop when everything it sent is acknowledged, after EXIT
+	rdl, wdl *deadline                  // the read and write deadlines of the connection
+	linkMu   sync.Mutex                 // one writer of the link at a time
 	base     time.Time                  // the zero of sentAt
 	sentAt   atomic.Int64               // when a packet last went to the link, as time since base
 	recv     chan []byte                // decrypted IP packets for Read
@@ -148,6 +155,7 @@ type Session struct {
 	kaInterval      time.Duration
 	kaTimeout       time.Duration
 	kaOn            bool   // the keepalive runs: the handshake is complete
+	drainedClosed   bool   // drained is closed
 	pending         []byte // what crypto/tls wrote, not yet in packets
 	thirdSent       bool   // an acknowledgement of the server's reset went out
 	body, packet    []byte
@@ -180,6 +188,10 @@ func New(opts Options) *Session {
 		recv:    make(chan []byte, recvQueue),
 		sender:  reliable.NewSender(opts.RetransmitTimeout),
 		base:    time.Now(),
+		rdl:     newDeadline(),
+		drained: make(chan struct{}),
+		wake:    make(chan struct{}, 1),
+		wdl:     newDeadline(),
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
@@ -315,15 +327,30 @@ func (s *Session) fail(err error) {
 	s.cancel()
 }
 
-// Close ends the session, closes the link and waits for the goroutines. It
-// returns net.ErrClosed when it was called before. After a failure it still
-// returns the error of closing the link, if any.
+// exitWait is how long Close waits for the server to acknowledge the EXIT message:
+// it must not hang on a server that is gone.
+const exitWait = time.Second
+
+// Close ends the session, closes the link and waits for the goroutines. When the
+// handshake is complete and the session is up it first tells the server: the EXIT
+// message of the control channel when the server pushed cc-exit (waiting up to
+// exitWait for its acknowledgement), else, over a datagram link, the exit message of
+// the data channel. It returns net.ErrClosed when it was called before, even while
+// the first call is still waiting. After a failure it still returns the error of
+// closing the link, if any.
 func (s *Session) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	if !s.closing.CompareAndSwap(false, true) {
 		return net.ErrClosed
 	}
+	select {
+	case <-s.ready:
+		if s.Err() == nil {
+			s.goodbye()
+		}
+	default:
+	}
+
+	s.mu.Lock()
 	s.closed = true
 	if s.err == nil {
 		s.err = net.ErrClosed
@@ -343,6 +370,37 @@ func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closeErr
+}
+
+// SetReadDeadline, SetWriteDeadline and SetDeadline are the deadlines of net.Conn:
+// a Read or Write that is waiting, or comes later, gives os.ErrDeadlineExceeded when
+// the time has passed, and the zero time turns the deadline off. After Close they
+// return net.ErrClosed.
+func (s *Session) SetReadDeadline(t time.Time) error {
+	if s.closing.Load() {
+		return net.ErrClosed
+	}
+	s.rdl.set(t)
+	return nil
+}
+
+// SetWriteDeadline is the deadline of Write; see SetReadDeadline.
+func (s *Session) SetWriteDeadline(t time.Time) error {
+	if s.closing.Load() {
+		return net.ErrClosed
+	}
+	s.wdl.set(t)
+	return nil
+}
+
+// SetDeadline sets both deadlines; see SetReadDeadline.
+func (s *Session) SetDeadline(t time.Time) error {
+	if s.closing.Load() {
+		return net.ErrClosed
+	}
+	s.rdl.set(t)
+	s.wdl.set(t)
+	return nil
 }
 
 // Done is closed when the session has ended, by a failure or by Close.

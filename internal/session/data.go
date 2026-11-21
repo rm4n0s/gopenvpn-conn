@@ -7,8 +7,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"os"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/rm4n0s/errors"
@@ -48,7 +48,7 @@ type dataPath struct {
 	ch   datachan.Channel
 	rbuf []byte // the loop's buffer for what it opens
 
-	mu   sync.Mutex // Seal and wbuf: Write may be called from many goroutines
+	sem  chan struct{} // the right to write: Seal and wbuf, for many goroutines that may give up
 	wbuf []byte
 }
 
@@ -84,7 +84,8 @@ func (s *Session) setupData(p *ctrlmsg.Pushed, x exporter) error {
 	// aead-epoch) has a channel of its own; it exists only for DATA_V2.
 	header := datachan.Header{HasPeerID: p.HasPeerID, PeerID: p.PeerID}
 	var ch datachan.Channel
-	if slices.Contains(p.ProtocolFlags, "aead-epoch") {
+	s.ccExit = hasFlag(p.ProtocolFlags, "cc-exit")
+	if hasFlag(p.ProtocolFlags, "aead-epoch") {
 		ch, err = datachan.NewEpochChannel(cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.EpochOptions{Strict: s.opts.Stream, UsageLimit: s.opts.EpochUsageLimit})
 	} else {
 		ch, err = datachan.NewChannel(cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.ReceiverOptions{Strict: s.opts.Stream})
@@ -93,7 +94,7 @@ func (s *Session) setupData(p *ctrlmsg.Pushed, x exporter) error {
 		return err
 	}
 	mtu := cmpOr(p.MTU, s.opts.MTU, defaultMTU)
-	s.data.Store(&dataPath{mtu: mtu, ch: ch})
+	s.data.Store(&dataPath{mtu: mtu, ch: ch, sem: make(chan struct{}, 1)})
 	return nil
 }
 
@@ -130,6 +131,10 @@ func (s *Session) handleData(raw []byte) {
 		s.log.Debug("a keepalive ping arrived")
 		return
 	}
+	if isOCCExit(plain) {
+		s.serverExited()
+		return
+	}
 	select {
 	case s.recv <- bytes.Clone(plain):
 	default:
@@ -150,30 +155,48 @@ func (s *Session) awaitReady() error {
 
 // Read takes the next IP packet that the server sent, waiting for it. A buffer
 // that is too small gets the start of the packet. It runs the handshake first when
-// it has not run. When the session has ended it returns the error that ended it
-// (net.ErrClosed after Close).
+// it has not run (the read deadline does not bound that: HandshakeTimeout does).
+// When the session has ended it returns the error that ended it (net.ErrClosed
+// after Close, io.EOF after the server's EXIT); when the read deadline passes,
+// os.ErrDeadlineExceeded, even if a packet is waiting.
 func (s *Session) Read(b []byte) (int, error) {
 	if err := s.awaitReady(); err != nil {
 		return 0, err
 	}
-	select {
-	case <-s.done:
-		return 0, s.result()
-	default:
-	}
-	select {
-	case p := <-s.recv:
-		return copy(b, p), nil
-	case <-s.done:
-		return 0, s.result()
+	for {
+		select {
+		case <-s.done:
+			return 0, s.result()
+		default:
+		}
+		t, changed := s.rdl.get()
+		if !t.IsZero() && !time.Now().Before(t) {
+			return 0, errDeadline
+		}
+		timer, expired := timerFor(t)
+		select {
+		case p := <-s.recv:
+			stopTimer(timer)
+			return copy(b, p), nil
+		case <-s.done:
+			stopTimer(timer)
+			return 0, s.result()
+		case <-expired:
+			return 0, errDeadline
+		case <-changed:
+			stopTimer(timer)
+		}
 	}
 }
 
 // Write sends one IP packet to the server. It runs the handshake first when it has
 // not run. A packet larger than the MTU, or an empty one, is refused. When the
-// session has ended it returns the error that ended it. The packet ids of the key
-// are used up only after a very long time; if they ever are, the session ends
-// rather than repeat a nonce (SPEC §10).
+// session has ended it returns the error that ended it. When the write deadline
+// passes, before the packet is out or while the link will not take it, it returns
+// os.ErrDeadlineExceeded and the session goes on; the exception is a stream link
+// that took a part of the frame, which cannot go on and ends the session. The packet
+// ids of the key are used up only after a very long time; if they ever are, the
+// session ends rather than repeat a nonce (SPEC §10).
 //
 // OpenVPN: forward.c process_outgoing_tun.
 func (s *Session) Write(b []byte) (int, error) {
@@ -192,20 +215,55 @@ func (s *Session) Write(b []byte) (int, error) {
 	if len(b) > d.mtu {
 		return 0, errors.New(TagPacketTooLarge, "the packet is larger than the MTU of the tunnel", "len", len(b), "mtu", d.mtu)
 	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := s.writeLocked(d, b); err != nil {
+	if err := s.lockWrite(d, true); err != nil {
+		return 0, err
+	}
+	defer d.unlockWrite()
+	if err := s.writeLocked(d, b, true); err != nil {
+		if err == errDeadline {
+			return 0, err
+		}
 		return 0, s.result()
 	}
 	return len(b), nil
 }
 
+// lockWrite takes the right to write data. It gives up when the session ends (the
+// error that ended it) or, for a user's write, when the write deadline passes.
+func (s *Session) lockWrite(d *dataPath, user bool) error {
+	for {
+		var t time.Time
+		var changed <-chan struct{}
+		if user {
+			t, changed = s.wdl.get()
+			if !t.IsZero() && !time.Now().Before(t) {
+				return errDeadline
+			}
+		}
+		timer, expired := timerFor(t)
+		select {
+		case d.sem <- struct{}{}:
+			stopTimer(timer)
+			return nil
+		case <-s.done:
+			stopTimer(timer)
+			return s.result()
+		case <-expired:
+			return errDeadline
+		case <-changed:
+			stopTimer(timer)
+		}
+	}
+}
+
+func (d *dataPath) unlockWrite() { <-d.sem }
+
 // writeLocked seals one IP packet (or the ping) and writes it to the link. The
-// caller holds d.mu. A failure of the link, or the end of the packet ids, ends the
-// session: it is made here and stored, and the returned error is that one or, if the
-// session had ended already, no matter.
-func (s *Session) writeLocked(d *dataPath, b []byte) error {
+// caller holds the right to write. A failure of the link, or the end of the packet
+// ids, ends the session: it is made here and stored, and the returned error is that
+// one. With user set the write deadline of the connection applies, and a deadline
+// that passes gives errDeadline.
+func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
 	d.wbuf = d.wbuf[:0]
 	if s.opts.Stream {
 		d.wbuf = append(d.wbuf, 0, 0) // the length of the frame goes here
@@ -219,13 +277,40 @@ func (s *Session) writeLocked(d *dataPath, b []byte) error {
 	if s.opts.Stream {
 		binary.BigEndian.PutUint16(packet, uint16(min(len(packet)-2, 1<<16-1)))
 	}
-	if _, err := s.opts.Link.Write(packet); err != nil {
+	var wd time.Time
+	if user {
+		wd, _ = s.wdl.get()
+	}
+	n, err := s.writeLink(packet, wd)
+	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) && (!s.opts.Stream || n == 0) {
+			return errDeadline // nothing of the packet is out: the session goes on
+		}
 		e := errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
 		s.fail(e)
 		return e
 	}
 	s.touchSent()
 	return nil
+}
+
+// writeLink writes one packet (or frame) to the link, with the deadline wd if it
+// is not zero. The loop writes control packets to the same link, so the two take
+// turns (linkMu), and the deadline never reaches a control write.
+func (s *Session) writeLink(p []byte, wd time.Time) (int, error) {
+	s.linkMu.Lock()
+	defer s.linkMu.Unlock()
+	if wd.IsZero() {
+		return s.opts.Link.Write(p)
+	}
+	if err := s.opts.Link.SetWriteDeadline(wd); err != nil {
+		return 0, err
+	}
+	n, err := s.opts.Link.Write(p)
+	if rerr := s.opts.Link.SetWriteDeadline(time.Time{}); rerr != nil && err == nil {
+		err = rerr
+	}
+	return n, err
 }
 
 const (

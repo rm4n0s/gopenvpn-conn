@@ -129,6 +129,8 @@ type Server struct {
 	dataIn         [][]byte // the IP packets the server opened, in order
 	dataDropped    int      // the data packets it could not open
 	pings          int      // the keepalive pings it received
+	occExits       int      // the exit messages of the data channel it received
+	exits          int      // the EXIT messages of the control channel it received
 	tlsErr         error
 	tlsState       tls.ConnectionState
 	largest        int // the largest packet that came from the client, as it was on the link
@@ -592,6 +594,11 @@ func (s *Server) serveControl(conn *tls.Conn, buf []byte) {
 		n, err := conn.Read(buf)
 		if err != nil {
 			return
+		}
+		if string(buf[:n]) == "EXIT\x00" {
+			s.mu.Lock()
+			s.exits++
+			s.mu.Unlock()
 		}
 		if string(buf[:n]) == "PUSH_REQUEST\x00" {
 			s.mu.Lock()

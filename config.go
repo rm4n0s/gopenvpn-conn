@@ -119,7 +119,10 @@ type Config struct {
 	// that go through that format against a real server. epochUsageLimit replaces
 	// the usage limit of the epoch keys, so that a test goes through many epochs
 	// with a few packets.
-	noEpoch         bool
+	noEpoch bool
+	// noCCExit makes the client not announce the exit message of the control
+	// channel (IV_PROTO bit 7), so that Close uses the older one of the data channel.
+	noCCExit        bool
 	epochUsageLimit uint64
 }
 

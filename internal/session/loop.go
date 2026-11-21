@@ -138,6 +138,10 @@ func (s *Session) loop() {
 		if len(s.pending) > 0 {
 			outbound = nil // the bytes that are waiting go first: take no more
 		}
+		if !s.drainedClosed && s.exitSent.Load() && len(s.pending) == 0 && s.sender.Len() == 0 {
+			s.drainedClosed = true // EXIT, and all that came before it, is acknowledged
+			close(s.drained)
+		}
 		if !complete {
 			switch {
 			case s.opts.ResetOnly:
@@ -188,6 +192,7 @@ func (s *Session) loop() {
 				"timeout", s.opts.HandshakeTimeout.String()))
 			return
 		case <-retransmit.C:
+		case <-s.wake:
 		case <-keepalive.C:
 			if !s.keepaliveTick() {
 				return
@@ -275,7 +280,7 @@ func (s *Session) send(c *wire.Control) error {
 			return err
 		}
 	}
-	if _, err := s.opts.Link.Write(out); err != nil {
+	if _, err := s.writeLink(out, time.Time{}); err != nil {
 		return errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
 	}
 	s.touchSent()
@@ -478,6 +483,9 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 	case ctrlmsg.IsAuthPending(text):
 		s.extendHandshake(ctrlmsg.ParseAuthPending(text))
 		return false
+	case isExit(text):
+		s.serverExited()
+		return true
 	}
 	if sig, ok := ctrlmsg.ParseSignal(text); ok {
 		if sig.Restart {

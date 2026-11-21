@@ -68,9 +68,11 @@ func (s *Session) keepaliveTick() bool {
 	}
 	if s.kaInterval > 0 && s.sinceSent() >= s.kaInterval {
 		d := s.data.Load()
-		d.mu.Lock()
-		err := s.writeLocked(d, pingString)
-		d.mu.Unlock()
+		if err := s.lockWrite(d, false); err != nil {
+			return false // the session has ended
+		}
+		err := s.writeLocked(d, pingString, false)
+		d.unlockWrite()
 		if err != nil {
 			return false
 		}

@@ -13,6 +13,11 @@ import (
 // PushRequest is the text of the message that asks the server for the settings.
 const PushRequest = "PUSH_REQUEST"
 
+// Exit is the text of the message by which a peer says that it has ended the
+// session. A client sends it from Close when the server pushed cc-exit, and a
+// server sends it when it stops.
+const Exit = "EXIT"
+
 // AppendMessage appends a text message to dst as the control channel carries
 // it: the text and a NUL. Each message is written to TLS in one Write, so it is
 // one record.

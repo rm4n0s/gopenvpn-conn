@@ -62,15 +62,17 @@ const (
 	// pushed ping-restart, else Config.PingTimeout): the server or the path to it is
 	// gone. Metadata: "timeout".
 	TagPingTimeout = session.TagPingTimeout
+	// TagServerExit: the server said EXIT before the handshake was complete. After
+	// it, the same message ends the session with io.EOF from Read (SPEC §5.3).
+	TagServerExit = session.TagServerExit
 	// TagPacketIDExhausted: every packet id of the data key was used (4 billion
 	// packets), and the session ended rather than repeat a nonce: the last resort
 	// of the rule of SPEC §10.
 	TagPacketIDExhausted = datachan.TagPacketIDExhausted
 )
 
-// Conn is one session with a server: Read returns one IP packet that the server
-// sent, and Write sends one. The rest of net.Conn (the deadlines) comes with a
-// later step of the library.
+// Conn is one session with a server and a net.Conn of IP packets: Read returns one
+// IP packet that the server sent, and Write sends one (SPEC §5.1).
 type Conn struct {
 	s   *session.Session
 	mtu int // the tunnel MTU of the Config, for ConnectionState before the server pushes one
@@ -150,6 +152,9 @@ func keyExchangeStrings(config *Config, link net.Conn, stream bool) (options, pe
 	if config.noEpoch {
 		proto &^= ctrlmsg.IVProtoDataEpoch
 	}
+	if config.noCCExit {
+		proto &^= ctrlmsg.IVProtoCCExitNotify
+	}
 	info := ctrlmsg.PeerInfo{
 		Version:  "gopenvpn-conn " + libraryVersion,
 		Platform: platform(),
@@ -191,7 +196,7 @@ const libraryVersion = "0.2.0"
 // implementedProto is IV_PROTO: the bits of the features that this client has.
 // Each step that adds a feature adds its bit (SPEC §8.2).
 const implementedProto = ctrlmsg.IVProtoDataV2 | ctrlmsg.IVProtoRequestPush | ctrlmsg.IVProtoTLSKeyExport |
-	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp | ctrlmsg.IVProtoDataEpoch
+	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp | ctrlmsg.IVProtoDataEpoch | ctrlmsg.IVProtoCCExitNotify
 
 // Read returns the next IP packet that the server sent, waiting for it, as one
 // Read of a connected UDP socket does: a buffer that is too small gets the start
@@ -205,6 +210,21 @@ func (c *Conn) Read(b []byte) (int, error) { return c.s.Read(b) }
 // (TagPacketTooLarge). A nil error does not mean that the packet arrived: the
 // data channel does not guarantee it.
 func (c *Conn) Write(b []byte) (int, error) { return c.s.Write(b) }
+
+// SetDeadline sets the read and write deadlines of the connection, as net.Conn says:
+// a Read or Write that is waiting or comes later returns os.ErrDeadlineExceeded
+// (that value, a net.Error whose Timeout is true) when the time has passed, a time
+// in the past unblocks the calls that are waiting, and the zero time is no deadline.
+// The deadlines bound the wait for a packet and for the link, not the handshake that
+// a first Read or Write may start (HandshakeTimeout does). After Close it returns
+// net.ErrClosed.
+func (c *Conn) SetDeadline(t time.Time) error { return c.s.SetDeadline(t) }
+
+// SetReadDeadline sets the deadline of Read; see SetDeadline.
+func (c *Conn) SetReadDeadline(t time.Time) error { return c.s.SetReadDeadline(t) }
+
+// SetWriteDeadline sets the deadline of Write; see SetDeadline.
+func (c *Conn) SetWriteDeadline(t time.Time) error { return c.s.SetWriteDeadline(t) }
 
 // HandshakeContext runs the handshake if it has not run, and returns when it is
 // complete, when it fails, or when ctx is done. A done ctx ends the session: the

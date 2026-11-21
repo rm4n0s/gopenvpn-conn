@@ -95,6 +95,12 @@ func (s *Server) handleData(raw []byte) {
 		s.mu.Unlock()
 		return
 	}
+	if bytes.Equal(plain, occExitPacket) {
+		s.mu.Lock()
+		s.occExits++
+		s.mu.Unlock()
+		return
+	}
 	packet := bytes.Clone(plain)
 	s.mu.Lock()
 	s.dataIn = append(s.dataIn, packet)
@@ -152,6 +158,35 @@ func (s *Server) DataReceived() [][]byte {
 var pingString = []byte{
 	0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb,
 	0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
+}
+
+// occExitPacket is the plaintext of the exit message of the data channel: the OCC
+// magic and the byte OCC_EXIT (occ.c).
+var occExitPacket = []byte{
+	0x28, 0x7f, 0x34, 0x6b, 0xd4, 0xef, 0x7a, 0x81,
+	0x2d, 0x56, 0xb8, 0xd3, 0xaf, 0xc5, 0x45, 0x9c,
+	6,
+}
+
+// OCCExits is how many exit messages of the data channel the server has received;
+// they are not in DataReceived.
+func (s *Server) OCCExits() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.occExits
+}
+
+// Exits is how many EXIT messages of the control channel the server has received.
+func (s *Server) Exits() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.exits
+}
+
+// SendOCCExit sends the client the exit message of the data channel.
+func (s *Server) SendOCCExit() error {
+	_, err := s.SendData(occExitPacket)
+	return err
 }
 
 // Pings is how many keepalive pings the server has received from the client; they
