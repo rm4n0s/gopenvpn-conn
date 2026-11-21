@@ -46,12 +46,17 @@ func TestDatagramPairKeepsBoundariesAndOrder(t *testing.T) {
 	}
 }
 
+// writerFunc is an io.Writer made of a function.
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
 // count writes n datagrams and reads what arrives, for the time it takes.
 func count(t *testing.T, opts LinkOptions, n int) (received int, order []int) {
 	t.Helper()
 	a, b := NewDatagramPair(opts)
 	for i := 0; i < n; i++ {
-		if _, err := a.Write([]byte(fmt.Sprint(i))); err != nil {
+		if _, err := fmt.Fprint(writerFunc(a.Write), i); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -164,7 +169,15 @@ func TestDatagramPairDeadlinesAndClose(t *testing.T) {
 		}
 
 		// Close releases a waiting Read and fails every call after it.
-		go func() { _, err := b.Read(make([]byte, 1)); _, err = b.Read(buf); result <- err }()
+		go func() {
+			// The datagram that was sent to b before is read first; the next Read waits.
+			if _, err := b.Read(make([]byte, 1)); err != nil {
+				result <- err
+				return
+			}
+			_, err := b.Read(buf)
+			result <- err
+		}()
 		synctest.Wait()
 		if err := b.Close(); err != nil {
 			t.Fatal(err)
