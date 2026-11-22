@@ -1,6 +1,6 @@
 # gopenvpn-conn: specification
 
-Status: **merged into `main` at the owner's request, 2026-11-21 (tag `step-0`).** Nothing here is implemented yet. `docs/IMPLEMENTATION.md` is the plan that implements it.
+Status: **implemented up to the release candidate `v1.0.0-rc.1`** (the SPEC was merged into `main` at the owner's request, 2026-11-21, tag `step-0`). `docs/IMPLEMENTATION.md` is the plan that implemented it, and `docs/IMPLEMENTED.md` logs each step with how it was shown to work. The sections that say "decided in step N" record what a step settled; the rest is the design.
 
 This file is the source of truth. If the code and this file disagree, or a task needs a decision this file doesn't make, ask instead of guessing. When a decision changes, this file changes on the same branch.
 
@@ -178,7 +178,14 @@ func (n *Net) Listen(network, address string) (net.Listener, error)
 func (n *Net) ListenPacket(network, address string) (net.PacketConn, error)
 func (n *Net) Resolver() *net.Resolver // asks the DNS servers of the VPN, through the VPN
 func (n *Net) Close() error
+
+type Options struct {
+	CloseConn bool         // Close also closes the *openvpn.Conn
+	Logger    *slog.Logger // nil means no logs
+}
 ```
+
+`ovpn` and `vpnnet` have runnable examples in `example_test.go` files, which the README copies.
 
 ## 5. Standard library contracts
 
@@ -199,7 +206,7 @@ The owner's error package tags every error (§14). Three values are the exceptio
 | `net.ErrClosed` | Any method after `Close` |
 | `os.ErrDeadlineExceeded` | `Read` or `Write` when its deadline passes |
 
-The connections, listeners and resolver of `vpnnet` return what gVisor's `gonet` returns (`*net.OpError` and the like), untouched, for the same reason. Every other error of the module is a tagged `*errors.Error`, and `errors.Is` still finds a cause such as `context.Canceled` through it.
+The connections and listeners that `vpnnet` returns (`net.Conn`, `net.Listener`, `net.PacketConn`) are gVisor's `gonet` types and return what `gonet` returns (`*net.OpError` and the like) from their methods, untouched, for the same reason; the lookups of `Resolver` return the `*net.DNSError` of the standard library. The functions of `vpnnet` that make them (`New`, `DialContext`, `Listen`, `ListenPacket`) return tagged errors, except `net.ErrClosed` after `Close` (and the error that ended the `Conn` after the tunnel ended). Every other error of the module is a tagged `*errors.Error`, and `errors.Is` still finds a cause such as `context.Canceled` through it.
 
 ## 6. Link and framing
 
@@ -399,7 +406,7 @@ All errors use `github.com/rm4n0s/errors` v0.2.0 the way its `AI_GUIDE.md` says 
 It is made once, in the goroutine that found the failure, and stored. Every later `Read`, `Write` and `HandshakeContext` returns that same value, so its route shows where the session failed, not who asked.
 
 ### 14.3 Exported tags
-The list grows with the steps. The ones a caller will branch on: `TagHandshakeTimeout`, `TagTLSHandshakeFailed`, `TagAuthFailed` (metadata: `reason`, `session`, `temporary`, `backoff` in seconds, `advance`), `TagServerHalt` (metadata: `reason`), `TagServerRestart` (metadata: `reason`, `flags`), `TagPingTimeout`, `TagCipherNegotiationFailed`, `TagKeyDerivationUnsupported`, `TagUnsupportedPushedOption` (metadata: `option`), `TagLinkFailed`, `TagKeyExchangeFailed` (metadata: `op`), `TagCredentialsFailed`, `TagDialFailed` (metadata: `network`, `address`), `TagUnsupportedNetwork` (metadata: `network`); in `ovpn`: `TagUnsupportedOption` (metadata: `option`, `line`), `TagSyntax`.
+The list grows with the steps. The ones a caller will branch on: `TagHandshakeTimeout`, `TagTLSHandshakeFailed`, `TagAuthFailed` (metadata: `reason`, `session`, `temporary`, `backoff` in seconds, `advance`), `TagServerHalt` (metadata: `reason`), `TagServerRestart` (metadata: `reason`, `flags`), `TagPingTimeout`, `TagCipherNegotiationFailed`, `TagKeyDerivationUnsupported`, `TagUnsupportedPushedOption` (metadata: `option`), `TagLinkFailed`, `TagKeyExchangeFailed` (metadata: `op`), `TagCredentialsFailed`, `TagDialFailed` (metadata: `network`, `address`), `TagUnsupportedNetwork` (metadata: `network`); in `ovpn`: `TagUnsupportedOption` (metadata: `option`, `line`), `TagBadOption`, `TagMissingOption`, `TagFileUnavailable`, `TagSyntax`, `TagNoRemotes`, `TagCredentialsMissing`; in `vpnnet` (the tag strings begin with `Net`): `TagNotConnected`, `TagUnsupportedNetwork`, `TagBadAddress`, `TagDialFailed`, `TagResolveFailed`, `TagListenFailed`, `TagNoDNSServers`. Every exported tag has a doc comment that says its metadata.
 
 ## 15. Security rules
 
@@ -407,7 +414,7 @@ The list grows with the steps. The ones a caller will branch on: `TagHandshakeTi
 2. MACs and tags are compared in constant time (`hmac.Equal`, the AEAD's `Open`).
 3. A packet is authenticated before anything in it is used, and its replay id is accepted only after it authenticated.
 4. A nonce is never used twice with a key (§10).
-5. Bytes from the network or from a file are parsed with explicit bounds; every length is checked before it is used; every parser has a fuzz target. No `unsafe`.
+5. Bytes from the network or from a file are parsed with explicit bounds; every length is checked before it is used; every parser has a fuzz target. No `unsafe` in this module's own code (gVisor, which `vpnnet` links, has its own).
 6. Buffers that the peer can make grow have a limit (control message reassembly, the reorder window, the pushed options).
 7. A packet that anyone could have sent (unauthenticated, replayed, malformed) never ends the session and never costs more than its own processing.
 8. No secret in logs or errors (§14.1 rule 9). The logger gets the names and sizes of things, never their bytes.
@@ -419,17 +426,17 @@ The list grows with the steps. The ones a caller will branch on: `TagHandshakeTi
 
 - A connection owns its goroutines: the reader of the link, the loop (which owns the state and the timers of the control channel) and the TLS handshake (until it ends). They start at the handshake and none runs after `Close` returns; a test checks it.
 - No global mutable state. Two connections share nothing but an unchanged `Config`.
-- Time is the standard `time` package; the tests run it with `testing/synctest`, so no test sleeps.
+- Time is the standard `time` package; the tests run it with `testing/synctest`, so no test sleeps. The exceptions are the tests of `vpnnet` (gVisor's goroutines do not work with the bubble's clock, §13; they wait for events) and the tests against the real server, which run on real time.
 - The data path does not allocate per packet in the steady state (a benchmark with `ReportAllocs` holds it).
 
 ## 17. Testing
 
 - **Unit tests** need nothing but Go: the peer is `internal/vpntest` in the same process, over `net.Pipe` or an in-memory link with loss, reordering and duplication. They run on every platform, with and without cgo, under the race detector.
-- **Tests against the real server** carry the `gopenvpn_server` build tag and run under `scripts/vpn-ns.sh`, which enters a private user and network namespace (`unshare -Urn`), so they need no root and change nothing on the machine. `internal/servertest` makes the certificates and keys in Go, starts `openvpn` 2.7.9 on the loopback of the namespace with the options of the test, reads its log and its management interface, and stops it. They skip when `openvpn` or the namespace is missing. The server runs both with the kernel data channel (DCO) and with `--disable-dco`.
+- **Tests against the real server** carry the `gopenvpn_server` build tag and run under `scripts/vpn-ns.sh`, which enters a private user and network namespace (`unshare -Urn`), so they need no root and change nothing on the machine. `internal/servertest` makes the certificates and keys in Go, starts `openvpn` 2.7.9 on the loopback of the namespace with the options of the test, reads its log, and stops it (and starts the real `openvpn` client, for the check that it reads the same profile, and Wine, for the programs built for Windows). They skip when `openvpn` or the namespace is missing. The server runs with `--disable-dco`: inside the namespace the kernel data channel cannot create its peer (§21 O17); `Options.EnableDCO` is there for a machine where it can, and no test uses it.
 - **A behavior of the protocol counts as implemented when a test against the real server shows it.**
 - **Known answers:** what OpenVPN's own unit tests check with fixed vectors (`tests/unit_tests/openvpn/`) is checked with the same vectors.
-- **Faults:** `tc netem` on the loopback of the namespace gives loss, delay, reordering and duplication to the tests against the real server.
-- **Fuzzing:** a target for every parser, with its corpus in `testdata/fuzz/`.
+- **Faults and long runs:** `tc netem` on the loopback of the namespace gives loss, delay, reordering and duplication to the soak tests (build tag `gopenvpn_soak`, run by hand, listed in `CLAUDE.md`), which also hold the one-hour renegotiation run and the 1000-connection leak test.
+- **Fuzzing:** a target for every parser (19 in 1.0), with its seeds in the code (`f.Add`); a finding goes to `testdata/fuzz/` of its package as a regression test. All of them ran for 10 minutes without a finding at step 4.2.
 - **Errors:** every tag has a route test (§14.1 rule 8).
 - **Leaks:** a test opens and closes connections many times and checks the goroutines and the heap.
 - No test connects to a server on the internet.
@@ -486,7 +493,7 @@ HKDF, AES-GCM, HMAC, SHA-2, TLS and X.509 come from the standard library. Any ot
 
 ## 21. Observations
 
-What the documentation or the draft does not say or says differently from the code, and what was found by running the real server. Each entry names the test that shows it. (Empty until the steps fill it.)
+What the documentation or the draft does not say or says differently from the code, and what was found by running the real server. Each entry names the test that shows it.
 
 Known before any code, to be confirmed by their steps:
 - **O1** The draft shows the acked packet ids as 8 bytes each in one figure and 4 in another; the code uses 4 (`packet_id_type`; read in `reliable_ack_parse`, step 1.4). The real server confirms it in step 1.10.
@@ -519,6 +526,10 @@ Known before any code, to be confirmed by their steps:
 - **O24** Both exit messages of the client are understood by a real server 2.7.9, over UDP and TCP (cc-exit) and over UDP (data channel): it logs `CC-EEN exit message received by peer` and `Delayed exit in 5 seconds`, or `OCC exit message received by peer` and `SIGUSR1[soft,remote-exit] received, client-instance restarting`, within a few hundred microseconds of `Close` on the loopback; `Close` itself takes about 0.1 to 0.4 ms, the time of the acknowledgement (`TestCloseWithRealServer`, step 2.8).
 - **O25** A real server 2.7.9 renegotiates as §11.3 says, and no packet is lost: with `--reneg-sec 3` and a client that sends 10 ICMP echo requests a second, every request is answered across 13 renegotiations in 40 seconds (UDP with `tls-crypt`, and TCP with no protection), and across 2 or 3 in 9 seconds for UDP and TCP with each of no protection, `tls-auth` (SHA-1 and SHA-256), `tls-crypt` and `tls-crypt-v2`, for the epoch format and for the format with 32-bit packet ids. With the client's `RenegotiateAfter` of 3 seconds and the server's default, the client starts them, also with no loss. The server logs `TLS: soft reset sec=3/3 bytes=0/-1 pkts=0/0 aead_limit_send=0/60129542137 ...`, then `P_CONTROL_SOFT_RESET_V1 kid=1` written and read, then a new `Control Channel: TLSv1.3, cipher TLSv1.3 TLS_AES_256_GCM_SHA384` line for each new key (`TestRenegotiationWithRealServer`, `TestRenegotiationOfAMinuteWithRealServer`, `TestClientRenegotiationWithRealServer`, step 2.9).
 - **O26** With `IV_PROTO` bit 9 the server pushes `protocol-flags cc-exit tls-ekm dyn-tls-crypt` and, once the push reply is sent, logs `Outgoing dynamic tls-crypt: Cipher 'AES-256-CTR' initialized with 256 bit key` and the same for `Incoming`, with no protection, `tls-auth`, `tls-crypt` and `tls-crypt-v2` alike: so even a server that protects nothing in the first session wraps its renegotiations. The key of §7.1 (exporter bytes XORed with the static key, `tls-crypt` form, client direction inverse) is the one it uses: every soft reset of the client and its TLS session are accepted, which they would not be with any other key.
+- **O27** The real `openvpn` 2.7.9 client reads the same profile file that `ovpn.ParseFS` reads (inline CA, certificate, key and `tls-crypt`, `auth-user-pass creds.txt`, `remote ... udp`): run with `--cd <dir> --config client.ovpn --dev null --ifconfig-noexec --route-noexec` against the test server it logs `Initialization Sequence Completed` (step 3.3, `TestProfileOpenVPNClient`). `--cd` makes it find `creds.txt` as `ParseFS` does.
+- **O28** Wine reaches the loopback of the namespace of `scripts/vpn-ns.sh` (it uses the network of the process), so a program built for Windows runs against the real server there: `ping.exe` over UDP and TCP and `http.exe` get their answers (step 4.1, `TestPingForWindowsUnderWine`, `TestHTTPForWindowsUnderWine`). The error of a refused connection is `WSAECONNREFUSED` on Windows, not `syscall.ECONNREFUSED`.
+- **O29** gVisor's stack sends no ICMP error for a UDP datagram to a closed port, so a DNS server that is down is a timeout of the resolver and not a refusal (step 3.5, `TestDNSServerSelection`).
+- **O30** Under heavy loss on a UDP tunnel a TCP connection of `vpnnet` with both directions saturated can stall for minutes against a Linux peer (§13, "Known limit"; step 4.2, the finding in `docs/IMPLEMENTED.md`).
 
 ## 22. After 1.0
 
