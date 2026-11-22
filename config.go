@@ -6,10 +6,13 @@ import (
 	"context"
 	"crypto/tls"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/rm4n0s/errors"
+
+	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 )
 
 // Credentials are the user name and password of auth-user-pass. The server
@@ -48,6 +51,29 @@ var cipherKeyBits = map[string]int{
 	"CHACHA20-POLY1305": 256,
 }
 
+// PullAction is what a PullFilter does with the pushed options that it matches.
+type PullAction int
+
+const (
+	// PullAccept keeps the option; it is there to let some options through a later
+	// filter that ignores more.
+	PullAccept PullAction = iota
+	// PullIgnore removes the option, as if the server had not pushed it.
+	PullIgnore
+	// PullReject ends the handshake with TagPushedOptionRejected.
+	PullReject
+)
+
+// PullFilter is one pull-filter line of a profile: the pushed options that start with
+// Prefix get Action.
+type PullFilter struct {
+	// Action is what is done with a matching option.
+	Action PullAction
+	// Prefix is compared with the start of the pushed option as the server sent it
+	// (for example "route " or "dhcp-option DNS").
+	Prefix string
+}
+
 // DefaultHandshakeTimeout is how long the handshake may take when
 // Config.HandshakeTimeout is zero: OpenVPN's --hand-window.
 const DefaultHandshakeTimeout = 60 * time.Second
@@ -78,6 +104,11 @@ type Config struct {
 	// connection. Nil means no credentials. The password is never logged and
 	// never in an error.
 	Credentials func(ctx context.Context) (Credentials, error)
+
+	// AuthNoCache makes the client forget the user name and password once the first key
+	// exchange is done (the profile's auth-nocache). A renegotiation then uses the auth
+	// token that the server pushed, or, when it pushed none, calls Credentials again.
+	AuthNoCache bool
 
 	// DataCiphers are the ciphers of the data channel that the client offers to
 	// the server, best first (the profile's data-ciphers). The server picks one.
@@ -116,6 +147,22 @@ type Config struct {
 	// happen whatever this is.
 	RenegotiateAfter time.Duration
 
+	// RetransmitTimeout is how long the client waits for the acknowledgement of a
+	// control packet before it sends it again; each repetition waits twice as long
+	// (the profile's tls-timeout). Zero means 2 seconds.
+	RetransmitTimeout time.Duration
+
+	// PullFilters decide, in order, about each option that the server pushes: the
+	// first filter whose Prefix the option starts with decides, and an option that no
+	// filter matches is accepted (the profile's pull-filter). An ignored option is
+	// not seen by the library and is not in ConnectionState.
+	PullFilters []PullFilter
+
+	// RouteNoPull ignores the pushed options about routes and DNS (route, route-ipv6,
+	// route-gateway, redirect-gateway, redirect-private, dhcp-option, dns and
+	// block-outside-dns) and accepts the others (the profile's route-nopull).
+	RouteNoPull bool
+
 	// Logger gets the events of the connection, with the error of a failure
 	// as the attribute "err". It never gets a key, a password or a packet's
 	// bytes. Nil means no logs.
@@ -137,6 +184,11 @@ type Config struct {
 	epochUsageLimit uint64
 }
 
+// Validate reports whether the Config can be used: it returns the error that a Conn
+// made with it would fail with, or nil. The error names the field and never carries a
+// value that could be a secret.
+func (c *Config) Validate() error { return c.validate() }
+
 // validate checks the fields of a Config that can be wrong before there is a
 // connection. The error names the field and never carries a value that could be a
 // secret.
@@ -148,6 +200,8 @@ func (c *Config) validate() error {
 		return errors.New(tagInvalidConfig, "the ping interval is negative", "field", "PingInterval")
 	case c.PingTimeout < 0:
 		return errors.New(tagInvalidConfig, "the ping timeout is negative", "field", "PingTimeout")
+	case c.RetransmitTimeout < 0:
+		return errors.New(tagInvalidConfig, "the retransmit timeout is negative", "field", "RetransmitTimeout")
 	case c.TLS == nil && !c.resetOnly:
 		return errors.New(tagInvalidConfig, "Config.TLS is required: the server must be verified", "field", "TLS")
 	case c.MTU != 0 && (c.MTU < minMTU || c.MTU > maxMTU):
@@ -156,6 +210,11 @@ func (c *Config) validate() error {
 	for _, name := range c.DataCiphers {
 		if _, ok := cipherKeyBits[strings.ToUpper(name)]; !ok {
 			return errors.New(tagInvalidConfig, "a data cipher is not supported", "field", "DataCiphers", "cipher", name)
+		}
+	}
+	for _, f := range c.PullFilters {
+		if f.Action < PullAccept || f.Action > PullReject {
+			return errors.New(tagInvalidConfig, "a pull filter has an action that is not known", "field", "PullFilters")
 		}
 	}
 	if len(c.PeerInfo) > peerInfoMaxEntries {
@@ -193,3 +252,42 @@ func isNameRune(r rune) bool {
 }
 
 const tagInvalidConfig = "InvalidConfig"
+
+// pullFilter makes the function that the session asks for each pushed option from
+// PullFilters and RouteNoPull, or nil when nothing is filtered.
+func (c *Config) pullFilter() func(option string) ctrlmsg.Verdict {
+	if len(c.PullFilters) == 0 && !c.RouteNoPull {
+		return nil
+	}
+	filters := slices.Clone(c.PullFilters)
+	noPull := c.RouteNoPull
+	return func(option string) ctrlmsg.Verdict {
+		for _, f := range filters {
+			if strings.HasPrefix(option, f.Prefix) {
+				switch f.Action {
+				case PullIgnore:
+					return ctrlmsg.Ignore
+				case PullReject:
+					return ctrlmsg.Reject
+				}
+				return ctrlmsg.Accept
+			}
+		}
+		if noPull {
+			name, _, _ := strings.Cut(strings.TrimSpace(option), " ")
+			if slices.Contains(routeNoPullOptions, name) {
+				return ctrlmsg.Ignore
+			}
+		}
+		return ctrlmsg.Accept
+	}
+}
+
+// routeNoPullOptions are the pushed options that route-nopull does not take: those
+// that OpenVPN files under routes and under DNS.
+//
+// OpenVPN: init.c pull_permission_mask (OPT_P_ROUTE, OPT_P_DHCPDNS).
+var routeNoPullOptions = []string{
+	"route", "route-ipv6", "route-gateway", "redirect-gateway", "redirect-private",
+	"dhcp-option", "dns", "block-outside-dns",
+}

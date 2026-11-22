@@ -65,6 +65,19 @@ linters:
         linters:
           - gosec
         text: "G402: TLS InsecureSkipVerify"
+      # G101 flags the name "secret" in the table of refused options of the
+      # profile parser: it is OpenVPN's option for the static key mode, not a
+      # credential.
+      - path: ^ovpn/options\.go$
+        linters:
+          - gosec
+        text: "G101"
+      # G304 flags a file name that comes from a variable. The tests read the
+      # fixtures that they name themselves.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G304"
       # G304 flags a file name that comes from a variable. The examples are
       # programs for a person at a terminal: the files that a flag names are the
       # files that the person asked them to read.

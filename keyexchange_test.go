@@ -201,6 +201,8 @@ func TestInvalidConfigFields(t *testing.T) {
 		{"negative handshake timeout", Config{HandshakeTimeout: -1}, "HandshakeTimeout"},
 		{"negative ping interval", Config{resetOnly: true, PingInterval: -time.Second}, "PingInterval"},
 		{"negative ping timeout", Config{resetOnly: true, PingTimeout: -time.Second}, "PingTimeout"},
+		{"negative retransmit timeout", Config{resetOnly: true, RetransmitTimeout: -time.Second}, "RetransmitTimeout"},
+		{"a pull filter with an action that is not known", Config{resetOnly: true, PullFilters: []PullFilter{{Action: 7, Prefix: "route"}}}, "PullFilters"},
 		{"no TLS", Config{}, "TLS"},
 		{"MTU too small", Config{resetOnly: true, MTU: 575}, "MTU"},
 		{"MTU too large", Config{resetOnly: true, MTU: 9001}, "MTU"},

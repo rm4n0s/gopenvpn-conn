@@ -92,6 +92,13 @@ type Options struct {
 	// the idle time after which a ping is sent, and the silence after which the
 	// session ends. Zero is off.
 	PingInterval, PingTimeout time.Duration
+	// AuthNoCache makes the session forget the user name and password after the
+	// first key exchange: a renegotiation without an auth token calls Credentials
+	// again (OpenVPN's --auth-nocache).
+	AuthNoCache bool
+	// PullFilter, when set, decides about each option that the server pushes
+	// (accept, ignore or reject); nil accepts all.
+	PullFilter func(option string) ctrlmsg.Verdict
 	// RenegotiateAfter is how long a key is used before the client makes a new one
 	// (OpenVPN's --reneg-sec). Zero or negative means the client never starts a
 	// renegotiation by time; it still answers the server's, and still starts one

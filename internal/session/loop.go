@@ -627,6 +627,12 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 		s.fail(err)
 		return true
 	}
+	if s.opts.PullFilter != nil {
+		if err := reply.Filter(s.opts.PullFilter); err != nil {
+			s.fail(err)
+			return true
+		}
+	}
 	if err := pushed.Add(reply, s.opts.Ciphers); err != nil {
 		s.fail(err)
 		return true
@@ -711,14 +717,21 @@ func (s *Session) pushRequests(conn *tls.Conn) {
 // OpenVPN: ssl.c key_method_2_write, key_method_2_read.
 func (s *Session) keyExchange(ks *keyState, conn *tls.Conn) (*ctrlmsg.ServerKeyExchange, error) {
 	var username, password string
+	again := false // the credentials are asked for again: auth-nocache, and no auth token
 	if ks.id != 0 {
-		username, password = s.renegotiationCredentials()
-	} else if s.opts.Credentials != nil {
+		username, password, again = s.renegotiationCredentials()
+	}
+	if (ks.id == 0 || again) && s.opts.Credentials != nil {
 		var err error
 		if username, password, err = s.opts.Credentials(s.ctx); err != nil {
 			return nil, errors.NewErr(TagCredentialsFailed, err)
 		}
-		s.user, s.pass = username, password
+		if ks.id == 0 {
+			s.user = username // the name is kept: an auth token goes with it
+			if !s.opts.AuthNoCache {
+				s.pass = password
+			}
+		}
 	}
 	msg, err := ctrlmsg.AppendClientKeyExchange(nil, ctrlmsg.NewClientKeyExchange(s.opts.Options, username, password, s.opts.PeerInfo))
 	if err != nil {

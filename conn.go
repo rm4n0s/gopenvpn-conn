@@ -101,7 +101,8 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 		HandshakeTimeout: config.HandshakeTimeout,
 		TLS:              config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config), EpochUsageLimit: config.epochUsageLimit,
 		PingInterval: config.PingInterval, PingTimeout: config.PingTimeout,
-		RenegotiateAfter: renegotiateAfter(config),
+		RenegotiateAfter: renegotiateAfter(config), RetransmitTimeout: config.RetransmitTimeout,
+		PullFilter: config.pullFilter(), AuthNoCache: config.AuthNoCache,
 	}
 	if err := config.validate(); err != nil {
 		opts.Err = err

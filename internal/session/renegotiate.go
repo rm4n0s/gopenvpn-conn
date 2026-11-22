@@ -331,15 +331,16 @@ func (s *Session) updateTable(now time.Time) {
 // the first. When the server pushed an auth token the token is the password (and its
 // user name, when it has one, is the user name): the credentials are not asked for
 // again, and may be one-time. Without a token the first ones are sent again, as
-// OpenVPN does.
+// OpenVPN does; with AuthNoCache the password was not kept, and again is true: the
+// caller is asked for the credentials again.
 //
 // OpenVPN: push.c, auth-token handling in ssl.c key_method_2_write.
-func (s *Session) renegotiationCredentials() (user, pass string) {
+func (s *Session) renegotiationCredentials() (user, pass string, again bool) {
 	s.mu.Lock()
 	token, tokenUser := s.token, s.tokenUser
 	s.mu.Unlock()
 	if token == "" {
-		return s.user, s.pass
+		return s.user, s.pass, s.opts.AuthNoCache
 	}
 	user = s.user
 	if tokenUser != "" {
@@ -347,7 +348,7 @@ func (s *Session) renegotiationCredentials() (user, pass string) {
 			user = string(b)
 		}
 	}
-	return user, token
+	return user, token, false
 }
 
 // keepToken remembers the auth token that the server pushed, and its user name.
@@ -371,6 +372,12 @@ func (s *Session) pushUpdate(text string) {
 	if err != nil {
 		s.log.Debug("a later push reply does not parse", "err", err)
 		return
+	}
+	if s.opts.PullFilter != nil {
+		if err := reply.Filter(s.opts.PullFilter); err != nil {
+			s.log.Debug("a later push reply is filtered out", "err", err)
+			return
+		}
 	}
 	var update ctrlmsg.Pushed
 	if err := update.Add(reply, s.opts.Ciphers); err != nil {

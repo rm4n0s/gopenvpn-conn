@@ -428,3 +428,34 @@ func FuzzParsePushReply(f *testing.F) {
 		}
 	})
 }
+
+func TestPushReplyFilter(t *testing.T) {
+	decide := func(option string) Verdict {
+		switch {
+		case strings.HasPrefix(option, "route "):
+			return Ignore
+		case strings.HasPrefix(option, "compress"):
+			return Reject
+		}
+		return Accept
+	}
+	reply := &PushReply{Options: []string{"ifconfig 10.8.0.2 255.255.255.0", "route 10.0.0.0 255.0.0.0", "ping 10", "route 10.1.0.0 255.255.0.0"}}
+	if err := reply.Filter(decide); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(reply.Options, "|"); got != "ifconfig 10.8.0.2 255.255.255.0|ping 10" {
+		t.Errorf("options after the filter: %q", got)
+	}
+	reply = &PushReply{Options: []string{"ping 10", "compress lz4 secret-argument"}}
+	err := reply.Filter(decide)
+	appErr, ok := errors.FromError(err)
+	if !ok || appErr.Tag != TagPushedOptionRejected || !appErr.HasRoute("PushReply.Filter.PushedOptionRejected") {
+		t.Fatalf("Filter = %v", err)
+	}
+	if appErr.Metadata["option"] != "compress" {
+		t.Errorf("metadata %v: only the name of the option may be in it", appErr.Metadata)
+	}
+	if err := (&PushReply{}).Filter(decide); err != nil {
+		t.Errorf("an empty reply: %v", err)
+	}
+}

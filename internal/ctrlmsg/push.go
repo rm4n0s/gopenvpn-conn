@@ -24,7 +24,12 @@ const (
 	TagCipherNegotiationFailed = "CipherNegotiationFailed"
 
 	tagBadPushedOption = "BadPushedOption"
-	tagTooManyPushed   = "TooManyPushedOptions"
+
+	// TagPushedOptionRejected: a pull filter of the profile with the action reject
+	// matched a pushed option. Metadata: "option" (the name of the option, never its
+	// arguments).
+	TagPushedOptionRejected = "PushedOptionRejected"
+	tagTooManyPushed        = "TooManyPushedOptions"
 )
 
 // maxPushedOptions bounds the options that a server may push over all the parts
@@ -454,4 +459,36 @@ func atoiRange(args []string, lo, hi int) (int, bool) {
 	}
 	n, err := strconv.Atoi(args[0])
 	return n, err == nil && n >= lo && n <= hi
+}
+
+// Verdict is what a pull filter decides about one pushed option.
+type Verdict uint8
+
+const (
+	// Accept keeps the option.
+	Accept Verdict = iota
+	// Ignore takes the option out, as if the server had not pushed it.
+	Ignore
+	// Reject ends the handshake with an error.
+	Reject
+)
+
+// Filter applies a pull filter to the options of a part of the reply: the options for
+// which decide says Ignore are taken out, and one for which it says Reject is an error.
+//
+// OpenVPN: options.c apply_pull_filter.
+func (r *PushReply) Filter(decide func(option string) Verdict) error {
+	kept := r.Options[:0]
+	for _, opt := range r.Options {
+		switch decide(opt) {
+		case Ignore:
+			continue
+		case Reject:
+			name, _, _ := strings.Cut(strings.TrimSpace(opt), " ")
+			return errors.New(TagPushedOptionRejected, "a pull filter rejected a pushed option", "option", name)
+		}
+		kept = append(kept, opt)
+	}
+	r.Options = kept
+	return nil
 }

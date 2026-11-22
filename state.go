@@ -110,6 +110,9 @@ const (
 	// TagCipherNegotiationFailed: the server pushed a data cipher that the
 	// client did not offer. Metadata: "cipher".
 	TagCipherNegotiationFailed = ctrlmsg.TagCipherNegotiationFailed
+	// TagPushedOptionRejected: a pull filter with the action PullReject matched a
+	// pushed option. Metadata: "option" (its name, never its arguments).
+	TagPushedOptionRejected = ctrlmsg.TagPushedOptionRejected
 	// TagControlChannelFailed: reading or writing the control channel failed
 	// after the key exchange: the server ended the TLS session, or the
 	// connection broke. Metadata: "op" ("read" or "write").

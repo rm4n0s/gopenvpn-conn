@@ -588,3 +588,46 @@ func TestANewAuthTokenIsUsedByTheNextRenegotiation(t *testing.T) {
 		}
 	})
 }
+
+func TestAuthNoCacheAsksAgainWithoutAToken(t *testing.T) {
+	tests := []struct {
+		name      string
+		push      string
+		noCache   bool
+		wantAsked int32
+		wantPass  string
+	}{
+		{"cached, no token", vpntest.DefaultPushReply, false, 1, "pass-1"},
+		{"no cache, no token", vpntest.DefaultPushReply, true, 2, "pass-2"},
+		{"no cache, a token", vpntest.DefaultPushReply + ",auth-token SESS_ID_x", true, 1, "SESS_ID_x"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var asked atomic.Int32
+				r := renegRig(t, transports[0], 0, tt.push, vpntest.ServerOptions{}, func(o *Options) {
+					o.AuthNoCache = tt.noCache
+					o.Credentials = func(context.Context) (string, string, error) {
+						n := asked.Add(1)
+						return "alice", "pass-" + string(rune('0'+n)), nil
+					}
+				})
+				if err := r.session.Handshake(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				time.Sleep(15 * time.Second)
+				alive(t, r)
+				kxs := r.server.KeyExchanges()
+				if len(kxs) != 2 {
+					t.Fatalf("%d key exchanges, want 2", len(kxs))
+				}
+				if got := asked.Load(); got != tt.wantAsked {
+					t.Errorf("the credentials were asked for %d times, want %d", got, tt.wantAsked)
+				}
+				if kxs[1].Password != tt.wantPass || kxs[1].Username != "alice" {
+					t.Errorf("the renegotiation sent %q and a password of %d bytes", kxs[1].Username, len(kxs[1].Password))
+				}
+			})
+		})
+	}
+}
