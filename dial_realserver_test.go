@@ -7,6 +7,8 @@ package openvpn
 import (
 	"context"
 	"crypto"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -161,4 +163,39 @@ func TestDialRefused(t *testing.T) {
 	if !ok || appErr.Tag != TagDialFailed || !errors.Is(err, syscall.ECONNREFUSED) {
 		t.Fatalf("Dial = %v, want %s with ECONNREFUSED", err, TagDialFailed)
 	}
+}
+
+// TestDialNextAddressWithRealServer dials a name over UDP whose first two addresses
+// have no server: 127.0.0.3, where the port is closed (the kernel answers the first
+// packet with an ICMP error, which ends the attempt), and 192.0.2.1, where nothing
+// answers at all (the namespace has no route to it, or the packet is lost: the
+// attempt ends by the dial or by ServerPollTimeout). The server is at the third.
+func TestDialNextAddressWithRealServer(t *testing.T) {
+	srv := servertest.Start(t, servertest.Options{Proto: "udp"})
+	_, port, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Dialer{
+		Config: &Config{TLS: tlsConfigFor(srv.PKI), ServerPollTimeout: 2 * time.Second},
+		lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("127.0.0.3"), netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("127.0.0.1")}, nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	conn, err := d.Dial(ctx, "udp", net.JoinHostPort("vpn.test", port))
+	if err != nil {
+		t.Fatalf("Dial: %v\nserver log:\n%s", err, srv.Log())
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	if got := conn.RemoteAddr().String(); got != srv.Addr() {
+		t.Errorf("connected to %s, want the third address, %s", got, srv.Addr())
+	}
+	t.Logf("the third address answered after %v", time.Since(start).Round(time.Millisecond))
 }

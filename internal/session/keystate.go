@@ -76,8 +76,10 @@ func (s *Session) newKeyState(id uint8, wrap ctrlwrap.Wrapper) *keyState {
 //
 // OpenVPN: ssl_pkt.h tls_session_get_tls_wrap.
 func (s *Session) wrapperFor(id uint8) ctrlwrap.Wrapper {
-	if id > 0 && s.dyn != nil {
-		return s.dyn
+	if id > 0 {
+		if dyn := s.dyn.Load(); dyn != nil {
+			return *dyn
+		}
 	}
 	return s.opts.Wrapper
 }

@@ -31,6 +31,20 @@ func authScript(t *testing.T) []string {
 	return []string{"--verb", "7", "--script-security", "2", "--auth-user-pass-verify", "/bin/sh " + path, "via-file", "--username-as-common-name"}
 }
 
+// authScriptEnv is authScript for a user name and a password of letters and digits
+// of any length: the script gets them in its environment, because the file of
+// via-file takes lines of 512 bytes at most, and the user name is not made the
+// common name, which has 64.
+func authScriptEnv(t *testing.T, user, pass string) []string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "auth.sh")
+	script := "#!/bin/sh\n[ \"$username\" = " + user + " ] && [ \"$password\" = " + pass + " ]\n"
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return []string{"--verb", "7", "--script-security", "3", "--auth-user-pass-verify", "/bin/sh " + path, "via-env"}
+}
+
 // TestKeyExchangeWithRealServer sends the key exchange message to a real server
 // that checks a user name and password, and shows what the server read.
 func TestKeyExchangeWithRealServer(t *testing.T) {
@@ -94,6 +108,38 @@ func TestKeyExchangeWithRealServer(t *testing.T) {
 					t.Log(line) // the evidence for the entry of IMPLEMENTED.md
 				}
 			}
+		})
+	}
+}
+
+// TestLongCredentialsWithRealServer logs in with a user name and a password that
+// are longer than 127 bytes (the limit of an OpenVPN that is built without PKCS#11),
+// and long enough for crypto/tls to cut the message in two records if it were let
+// to: the server reads one record of the key exchange message.
+func TestLongCredentialsWithRealServer(t *testing.T) {
+	user, pass := strings.Repeat("u", 200), strings.Repeat("p", 1100)
+	for _, proto := range []string{"udp", "tcp"} {
+		t.Run(proto, func(t *testing.T) {
+			srv := servertest.Start(t, servertest.Options{Proto: proto, Extra: authScriptEnv(t, user, pass)})
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			conn, err := Dial(ctx, proto, srv.Addr(), &Config{
+				TLS: tlsConfigFor(srv.PKI),
+				Credentials: func(context.Context) (Credentials, error) {
+					return Credentials{Username: user, Password: pass}, nil
+				},
+				PeerInfo: map[string]string{"UV_FROM": "the long login"},
+			})
+			if err != nil {
+				t.Fatalf("Dial: %v\nserver log:\n%s", err, srv.Log())
+			}
+			defer func() {
+				if err := conn.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			}()
+			srv.WaitLog(t, "authentication succeeded for username '"+user+"'", 3*time.Second)
+			srv.WaitLog(t, "UV_FROM=the_long_login", 3*time.Second) // the peer info comes after the password
 		})
 	}
 }

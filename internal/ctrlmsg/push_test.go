@@ -183,6 +183,19 @@ func TestPushedOptionsUsed(t *testing.T) {
 				t.Errorf("ping = %v, ping-restart = %v", p.PingInterval, p.PingRestart)
 			}
 		}},
+		{"ping-exit is the same timer", "PUSH_REPLY,ping 10,ping-exit 45", func(t *testing.T, p *Pushed) {
+			if p.PingInterval != 10*time.Second || p.PingRestart != 45*time.Second {
+				t.Errorf("ping = %v, the timeout = %v", p.PingInterval, p.PingRestart)
+			}
+			if len(p.Skipped) != 0 {
+				t.Errorf("skipped: %v", p.Skipped)
+			}
+		}},
+		{"the later of ping-restart and ping-exit counts", "PUSH_REPLY,ping-exit 45,ping-restart 60", func(t *testing.T, p *Pushed) {
+			if p.PingRestart != 60*time.Second {
+				t.Errorf("the timeout = %v", p.PingRestart)
+			}
+		}},
 		{"reneg-sec", "PUSH_REPLY,reneg-sec 0", func(t *testing.T, p *Pushed) {
 			if !p.HasReneg || p.RenegInterval != 0 {
 				t.Errorf("reneg-sec = %v (%v)", p.RenegInterval, p.HasReneg)
@@ -303,6 +316,7 @@ func TestPushedOptionsThatCannotBeReadAreSkipped(t *testing.T) {
 		{"PUSH_REPLY,ping -1", "ping"},
 		{"PUSH_REPLY,ping", "ping"},
 		{"PUSH_REPLY,ping-restart x", "ping-restart"},
+		{"PUSH_REPLY,ping-exit x", "ping-exit"},
 		{"PUSH_REPLY,reneg-sec -5", "reneg-sec"},
 		{"PUSH_REPLY,explicit-exit-notify x", "explicit-exit-notify"},
 		{"PUSH_REPLY,route remote_host 255.255.255.255 net_gateway", "route"},

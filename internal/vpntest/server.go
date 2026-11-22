@@ -176,7 +176,9 @@ type Server struct {
 	dataDropped  int         // the data packets it could not open
 	pings        int         // the keepalive pings it received
 	occExits     int         // the exit messages of the data channel it received
-	exits        int         // the EXIT messages of the control channel it received
+	exits        int         // the EXIT messages of the control channel it received, in the TLS session of the newest key
+	staleExits   int         // the EXIT messages that came in the TLS session of a key that is not the newest: not read by a real server
+	newest       *serverKS   // the key state that was made last, complete or not: OpenVPN's primary key
 	tlsErr       error
 	tlsState     tls.ConnectionState
 	largest      int // the largest packet that came from the client, as it was on the link
@@ -244,6 +246,7 @@ func (s *Server) newKS(id uint8) *serverKS {
 		s.nextID = id%7 + 1
 	}
 	s.setKS(id, ks)
+	s.setNewest(ks)
 	if s.opts.TLS != nil {
 		go s.runTLS(ks)
 		go s.bridgeRead(ks)
@@ -611,6 +614,7 @@ func (s *Server) handle(raw []byte) {
 func (s *Server) newMutedKS(id uint8) *serverKS {
 	ks := &serverKS{id: id, sender: reliable.NewSender(s.opts.RetransmitTimeout), muted: true}
 	s.setKS(id, ks)
+	s.setNewest(ks)
 	s.nextID = id%7 + 1
 	return ks
 }
@@ -770,7 +774,7 @@ func (s *Server) keyExchange(ks *serverKS, conn *tls.Conn) {
 		s.mu.Lock()
 		s.control = conn
 		s.mu.Unlock()
-		s.serveRenegotiated(conn, make([]byte, 1<<15))
+		s.serveRenegotiated(ks, conn, make([]byte, 1<<15))
 		return
 	}
 	if s.opts.CloseAfterKeyExchange {
@@ -835,9 +839,7 @@ func (s *Server) serveControl(ks *serverKS, conn *tls.Conn, buf []byte) {
 			return
 		}
 		if string(buf[:n]) == "EXIT\x00" {
-			s.mu.Lock()
-			s.exits++
-			s.mu.Unlock()
+			s.countExit(ks)
 		}
 		if string(buf[:n]) == "PUSH_REQUEST\x00" {
 			s.mu.Lock()
@@ -854,18 +856,39 @@ func (s *Server) serveControl(ks *serverKS, conn *tls.Conn, buf []byte) {
 
 // serveRenegotiated reads the control messages that come in the TLS session of a
 // renegotiated key: only EXIT is counted. There is no push after the first key.
-func (s *Server) serveRenegotiated(conn *tls.Conn, buf []byte) {
+func (s *Server) serveRenegotiated(ks *serverKS, conn *tls.Conn, buf []byte) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
 			return
 		}
 		if string(buf[:n]) == "EXIT\x00" {
-			s.mu.Lock()
-			s.exits++
-			s.mu.Unlock()
+			s.countExit(ks)
 		}
 	}
+}
+
+// setNewest makes ks the key state that the server reads control messages of.
+func (s *Server) setNewest(ks *serverKS) {
+	s.mu.Lock()
+	s.newest = ks
+	s.mu.Unlock()
+}
+
+// countExit counts an EXIT that came in the TLS session of ks. OpenVPN's server reads
+// the cleartext of the newest key only, from the moment that its soft reset came: an
+// EXIT in the session of the key before it, while a renegotiation is under way, is
+// never read.
+//
+// OpenVPN: ssl.c tls_process (the primary key), tls_rec_payload.
+func (s *Server) countExit(ks *serverKS) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ks != s.newest {
+		s.staleExits++
+		return
+	}
+	s.exits++
 }
 
 // SendControl sends one control message (with its closing NUL) to the client,

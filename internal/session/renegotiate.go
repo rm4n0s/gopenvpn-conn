@@ -216,6 +216,10 @@ func (s *Session) beginKey(id uint8, now time.Time) (*keyState, error) {
 	s.attemptEnd = now.Add(s.opts.HandshakeTimeout)
 	s.needKey.Store(0)
 	s.dirty = true
+	if s.rekey.Load() == nil {
+		under := make(chan struct{})
+		s.rekey.Store(&under)
+	}
 	s.log.Debug("a renegotiation began", "key_id", id)
 	s.wg.Add(1)
 	go s.tlsMain(ks)
@@ -270,6 +274,9 @@ func (s *Session) onKeyEvent(ev keyEvent) {
 	}
 	ks.dk, ks.tlsConn = dk, ev.conn
 	s.ctlTLS.Store(ev.conn)
+	if under := s.rekey.Swap(nil); under != nil {
+		close(*under) // an EXIT that waited for the new key can go now
+	}
 	s.keyMade(ks, now)
 	s.log.Debug("a renegotiation is done", "key_id", ks.id)
 }
@@ -386,6 +393,6 @@ func (s *Session) setupDynamic(x exporter) error {
 	if err != nil {
 		return err
 	}
-	s.dyn = w
+	s.dyn.Store(&w)
 	return nil
 }

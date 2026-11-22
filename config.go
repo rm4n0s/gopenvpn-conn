@@ -15,13 +15,16 @@ import (
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 )
 
-// Credentials are the user name and password of auth-user-pass. The server
-// accepts at most 127 bytes of each.
+// Credentials are the user name and password of auth-user-pass. They travel in one
+// message of at most 2048 bytes, with the peer info and the options string, which
+// leaves about 1400 bytes for the two together; a longer one makes the handshake
+// fail before anything of it is sent. A server may accept less: an OpenVPN that was
+// built without PKCS#11 takes 127 bytes of each, and answers a longer one with
+// TagAuthFailed.
 type Credentials struct {
-	// Username is the user name; at most 127 bytes.
+	// Username is the user name.
 	Username string
-	// Password is the password; at most 127 bytes. It is never logged and never in
-	// an error.
+	// Password is the password. It is never logged and never in an error.
 	Password string
 }
 
@@ -33,11 +36,15 @@ const (
 	// the minimum IPv6 does not work and above 9000 there are no packets.
 	minMTU = 576
 	maxMTU = 9000
-	// peerInfoMaxEntries, peerInfoMaxName and peerInfoMaxValue keep the peer
-	// info far from the 64 KB that a message can carry.
+	// peerInfoMaxEntries, peerInfoMaxName, peerInfoMaxValue and peerInfoMaxTotal
+	// (the bytes of all the lines "name=value\n") keep the peer info inside the
+	// key exchange message, which a server reads up to 2048 bytes of: with the
+	// most peer info there is room left for a user name and a password of some
+	// 600 bytes together.
 	peerInfoMaxEntries = 32
 	peerInfoMaxName    = 64
 	peerInfoMaxValue   = 256
+	peerInfoMaxTotal   = 1024
 )
 
 // defaultDataCiphers is OpenVPN's data-ciphers default, with ChaCha20 last.
@@ -121,7 +128,9 @@ type Config struct {
 
 	// PeerInfo are variables that the server's scripts get with the other
 	// information about the client (the profile's setenv UV_name value). Each
-	// name starts with "UV_".
+	// name starts with "UV_". At most 32 variables, 64 bytes a name, 256 a value
+	// and 1024 bytes of all the lines "name=value" together: they travel in a
+	// message that a server reads 2048 bytes of.
 	PeerInfo map[string]string
 
 	// HandshakeTimeout is how long the handshake may take; zero means
@@ -232,6 +241,7 @@ func (c *Config) validate() error {
 	if len(c.PeerInfo) > peerInfoMaxEntries {
 		return errors.New(tagInvalidConfig, "too many peer info variables", "field", "PeerInfo", "max", peerInfoMaxEntries)
 	}
+	total := 0
 	for name, value := range c.PeerInfo {
 		if !validUVName(name) || len(name) > peerInfoMaxName {
 			return errors.New(tagInvalidConfig, "a peer info name is not UV_ and letters, digits and underscores", "field", "PeerInfo", "name", name)
@@ -239,6 +249,11 @@ func (c *Config) validate() error {
 		if len(value) > peerInfoMaxValue || strings.ContainsAny(value, "\n\x00") {
 			return errors.New(tagInvalidConfig, "a peer info value is too long or has a newline or NUL", "field", "PeerInfo", "name", name)
 		}
+		total += len(name) + len(value) + 2 // "name=value\n"
+	}
+	if total > peerInfoMaxTotal {
+		// A server reads 2048 bytes of the key exchange message and cuts the rest.
+		return errors.New(tagInvalidConfig, "the peer info variables are too long together", "field", "PeerInfo", "length", total, "max", peerInfoMaxTotal)
 	}
 	return nil
 }

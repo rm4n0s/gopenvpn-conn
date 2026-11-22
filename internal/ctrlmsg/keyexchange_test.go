@@ -91,11 +91,16 @@ func TestAppendClientKeyExchangeRefusesBadStrings(t *testing.T) {
 	}{
 		{"options at the limit", ClientKeyExchange{Options: long(MaxOptionsLen - 1)}, "", ""},
 		{"options too long", ClientKeyExchange{Options: long(MaxOptionsLen)}, "AppendClientKeyExchange.StringTooLong", "options"},
-		{"username at the limit", ClientKeyExchange{Options: "o", Username: long(MaxCredentialLen - 1)}, "", ""},
+		// A user name and a password of more than 127 bytes: a token of a login service.
+		{"a long username and password", ClientKeyExchange{Options: "o", Username: long(500), Password: long(1200)}, "", ""},
 		{"username too long", ClientKeyExchange{Options: "o", Username: long(MaxCredentialLen)}, "AppendClientKeyExchange.StringTooLong", "username"},
 		{"password too long", ClientKeyExchange{Options: "o", Password: long(MaxCredentialLen)}, "AppendClientKeyExchange.StringTooLong", "password"},
-		{"peer info at the limit", ClientKeyExchange{Options: "o", PeerInfo: long(0xffff - 1)}, "", ""},
 		{"peer info too long", ClientKeyExchange{Options: "o", PeerInfo: long(0xffff)}, "AppendClientKeyExchange.StringTooLong", "peer info"},
+		// The whole message: 117 bytes before the strings, 4 of the options "o", 4 of
+		// the two empty credentials, and the peer info with its length and its NUL.
+		{"the message at the limit", ClientKeyExchange{Options: "o", PeerInfo: long(MaxKeyExchangeLen - 128)}, "", ""},
+		{"the message too long by the peer info", ClientKeyExchange{Options: "o", PeerInfo: long(MaxKeyExchangeLen - 127)}, "AppendClientKeyExchange.KeyExchangeTooLong", ""},
+		{"the message too long by the password", ClientKeyExchange{Options: "o", Username: "u", Password: long(MaxKeyExchangeLen)}, "AppendClientKeyExchange.KeyExchangeTooLong", ""},
 		{"NUL in the options", ClientKeyExchange{Options: "a\x00b"}, "AppendClientKeyExchange.StringHasNUL", "options"},
 		{"NUL in the password", ClientKeyExchange{Options: "o", Password: "a\x00b"}, "AppendClientKeyExchange.StringHasNUL", "password"},
 	}
@@ -106,6 +111,9 @@ func TestAppendClientKeyExchangeRefusesBadStrings(t *testing.T) {
 				if err != nil {
 					t.Fatalf("refused: %v", err)
 				}
+				if len(got) > MaxKeyExchangeLen {
+					t.Errorf("the message has %d bytes, more than a server reads", len(got))
+				}
 				return
 			}
 			appErr, ok := errors.FromError(err)
@@ -115,7 +123,7 @@ func TestAppendClientKeyExchangeRefusesBadStrings(t *testing.T) {
 			if !appErr.HasRoute(tt.route) {
 				t.Errorf("unexpected failure path: %s", appErr.Route())
 			}
-			if appErr.Metadata["field"] != tt.field {
+			if field, _ := appErr.Metadata["field"].(string); field != tt.field {
 				t.Errorf("metadata = %v, want field %q", appErr.Metadata, tt.field)
 			}
 			if got != nil {

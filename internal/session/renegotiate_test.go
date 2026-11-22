@@ -455,6 +455,43 @@ func TestDynamicTLSCrypt(t *testing.T) {
 	}
 }
 
+// A soft reset may come at any moment of the handshake, from a stranger too (the
+// loop looks for the protection of its key id before it can know who sent it): also
+// at the moment when the TLS goroutine makes the key of the renegotiations. The two
+// must not touch that key without a rule. It is the race detector that fails this
+// test.
+func TestASoftResetWhileTheDynamicKeyIsMade(t *testing.T) {
+	push := vpntest.DefaultPushReply + ",protocol-flags dyn-tls-crypt"
+	for range 20 {
+		synctest.Test(t, func(t *testing.T) {
+			r := renegRig(t, transports[1], 0, push, vpntest.ServerOptions{}, nil)
+			stop, stopped := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(stopped)
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					// The stream link takes one packet when the client reads it.
+					if err := r.server.Inject(wire.Control{Opcode: wire.SoftResetV1, KeyID: 1, SessionID: r.server.SessionID()}); err != nil {
+						return
+					}
+				}
+			}()
+			if err := r.session.Handshake(t.Context()); err != nil {
+				t.Error(err)
+			}
+			close(stop)
+			if err := r.session.Close(); err != nil {
+				t.Error(err)
+			}
+			<-stopped
+		})
+	}
+}
+
 func TestDynamicKeyIsNotUsedWhenTheServerDidNotAsk(t *testing.T) {
 	// The server uses the dynamic key and the client does not: they cannot talk, and
 	// every renegotiation fails; the old key lives until its window ends.

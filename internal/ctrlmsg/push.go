@@ -64,7 +64,7 @@ type Pushed struct {
 	SearchDomains   []string
 	MTU             int // 0 when not pushed
 	PingInterval    time.Duration
-	PingRestart     time.Duration
+	PingRestart     time.Duration // ping-restart or ping-exit: the silence that ends the session
 	PeerID          uint32
 	HasPeerID       bool
 	Cipher          string
@@ -109,7 +109,7 @@ var aead = []string{"AES-128-GCM", "AES-192-GCM", "AES-256-GCM", "CHACHA20-POLY1
 var ignored = []string{
 	"block-outside-dns", "register-dns", "persist-tun", "persist-key", "sndbuf", "rcvbuf", "socket-flags",
 	"route-delay", "route-method", "ip-win32", "dhcp-renew", "dhcp-release", "tun-ipv6", "inactive",
-	"ping-timer-rem", "ping-exit", "push-peer-info", "route-nopull", "redirect-private", "ifconfig-nowarn",
+	"ping-timer-rem", "push-peer-info", "route-nopull", "redirect-private", "ifconfig-nowarn",
 	"ifconfig-pool-persist", "resolv-retry", "route-up", "push-update",
 }
 
@@ -233,7 +233,12 @@ func (p *Pushed) understand(name string, args, offered []string) (out outcome, d
 			return malformed, "the time is not a number of seconds"
 		}
 		p.PingInterval = time.Duration(n) * time.Second
-	case "ping-restart":
+	case "ping-restart", "ping-exit":
+		// The two are one timer in OpenVPN, with another thing to do at its end (to
+		// connect again, or to leave); the later one of a reply counts. For a library
+		// both are the end of the session: the program decides what comes next.
+		//
+		// OpenVPN: options.c add_option (ping_rec_timeout, ping_rec_timeout_action).
 		n, ok := atoiRange(args, 0, 1<<24)
 		if !ok {
 			return malformed, "the time is not a number of seconds"

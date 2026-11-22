@@ -8,7 +8,7 @@ machine, and works on Linux, Windows and macOS.
 > OpenVPN's own program, it is not affiliated with OpenVPN Inc, and OpenVPN is a
 > trademark of OpenVPN Inc.
 
-**Status: 1.0 (`v1.0.0`).** The tunnel (package `openvpn`), the profile parser (`ovpn`)
+**Status: 1.0 (`v1.0.1`).** The tunnel (package `openvpn`), the profile parser (`ovpn`)
 and the userspace network (`vpnnet`) are complete and were run against a real OpenVPN
 2.7.9 server on Linux, under Wine on Windows, and on macOS (Apple silicon, against a
 server in a Linux VM, over UDP and TCP, with the server's kernel data channel (DCO) and

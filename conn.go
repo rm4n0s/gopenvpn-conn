@@ -46,6 +46,10 @@ const (
 	// TagCredentialsFailed: Config.Credentials returned an error; the cause can
 	// be found with errors.Is.
 	TagCredentialsFailed = session.TagCredentialsFailed
+	// TagKeyExchangeTooLong: the user name and the password that Config.Credentials
+	// returned do not fit, with the peer info, in the one message of 2048 bytes
+	// that a server reads. Nothing of them was sent. Metadata: "length", "max".
+	TagKeyExchangeTooLong = ctrlmsg.TagKeyExchangeTooLong
 	// TagTLSHandshakeFailed: the TLS handshake with the server failed: a
 	// certificate that does not verify, a client certificate that the server
 	// refuses, no TLS version in common. The cause, a crypto/tls or x509

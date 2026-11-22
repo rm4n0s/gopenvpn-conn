@@ -9,6 +9,7 @@
 //
 // The files that the profile names are read from the directory of the profile.
 // A profile with auth-user-pass and no file takes -user and -password-file.
+// Ctrl-C stops it at any moment, and the tunnel is closed before it exits.
 package main
 
 import (
@@ -19,8 +20,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rm4n0s/errors"
@@ -40,9 +43,19 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	if err := run(ctx, *profile, *url, *user, *passwordFile); err != nil {
+	// Ctrl-C (or a kill) ends the context: the dial or the request stops, and run
+	// closes the tunnel on its way out, which tells the server that the client leaves.
+	interrupted, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithTimeout(interrupted, 2*time.Minute)
+	err := run(ctx, *profile, *url, *user, *passwordFile)
+	wasInterrupted := interrupted.Err() != nil
+	cancel()
+	stop()
+	switch {
+	case wasInterrupted:
+		log.Print("interrupted")
+		os.Exit(130)
+	case err != nil:
 		log.Fatal(err)
 	}
 }

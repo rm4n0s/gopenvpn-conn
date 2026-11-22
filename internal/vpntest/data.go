@@ -259,11 +259,28 @@ func (s *Server) OCCExits() int {
 	return s.occExits
 }
 
-// Exits is how many EXIT messages of the control channel the server has received.
+// Exits is how many EXIT messages of the control channel the server has received in
+// the TLS session of its newest key, which is the one that a real server reads.
 func (s *Server) Exits() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.exits
+}
+
+// Renegotiating reports whether a renegotiation is under way: the newest key state
+// is not the first and has no data key yet.
+func (s *Server) Renegotiating() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.newest != nil && s.newest.id > 0 && s.newest.data == nil
+}
+
+// StaleExits is how many EXIT messages came in the TLS session of a key that was not
+// the newest: a real server does not read them.
+func (s *Server) StaleExits() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.staleExits
 }
 
 // SendOCCExit sends the client the exit message of the data channel.

@@ -156,6 +156,7 @@ func TestDatagramWriteErrorsDoNotEndTheSession(t *testing.T) {
 			if err := r.session.Handshake(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			synctest.Wait() // the writes of the handshake are out
 			for _, cause := range []error{syscall.ENETUNREACH, syscall.ECONNREFUSED, syscall.ENOBUFS, syscall.EPERM} {
 				link.set(func(c *faultConn) { c.writeErr = &net.OpError{Op: "write", Net: "udp", Err: cause} })
 				if n, err := r.session.Write([]byte{0x45, 1}); err != nil || n != 2 {
@@ -185,6 +186,10 @@ func TestDatagramWriteErrorsDoNotEndTheSession(t *testing.T) {
 			if err := r.session.Handshake(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			// The writes of the handshake are out. An acknowledgement that the fault took
+			// would make the server send its packet again and again, and the client would
+			// hear the server for a minute more.
+			synctest.Wait()
 			link.set(func(c *faultConn) { c.writeErr = syscall.ENETUNREACH })
 			_, err := r.session.Read(make([]byte, 10))
 			wantRoute(t, err, TagPingTimeout, "Session.keepaliveTick.PingTimeout")
@@ -236,6 +241,10 @@ func TestStuckStreamLink(t *testing.T) {
 			if err := r.session.Handshake(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			// The writes of the handshake are out. An acknowledgement that the fault took
+			// would make the server send its packet again and again, and the client would
+			// hear the server for a minute more.
+			synctest.Wait()
 			link.set(func(c *faultConn) { c.stuck = true })
 			start := time.Now()
 			wrote := make(chan error, 1)
@@ -257,6 +266,10 @@ func TestStuckStreamLink(t *testing.T) {
 			if err := r.session.Handshake(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			// The writes of the handshake are out. An acknowledgement that the fault took
+			// would make the server send its packet again and again, and the client would
+			// hear the server for a minute more.
+			synctest.Wait()
 			link.set(func(c *faultConn) { c.stuck = true })
 			wrote := make(chan error, 1)
 			go func() { _, err := r.session.Write([]byte{0x45, 1}); wrote <- err }()
@@ -284,6 +297,10 @@ func TestStuckStreamLink(t *testing.T) {
 			if err := r.session.Handshake(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			// The writes of the handshake are out. An acknowledgement that the fault took
+			// would make the server send its packet again and again, and the client would
+			// hear the server for a minute more.
+			synctest.Wait()
 			link.set(func(c *faultConn) { c.stuck = true })
 			wrote := make(chan error, 1)
 			go func() { _, err := r.session.Write([]byte{0x45, 1}); wrote <- err }()
@@ -324,6 +341,10 @@ func TestStuckStreamLink(t *testing.T) {
 			if err := r.session.Handshake(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			// The writes of the handshake are out. An acknowledgement that the fault took
+			// would make the server send its packet again and again, and the client would
+			// hear the server for a minute more.
+			synctest.Wait()
 			link.set(func(c *faultConn) { c.stuck = true })
 			wrote := make(chan error, 1)
 			go func() { _, err := r.session.Write([]byte{0x45, 1}); wrote <- err }()

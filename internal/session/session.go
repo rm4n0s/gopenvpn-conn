@@ -72,7 +72,8 @@ type Options struct {
 	// Logger gets the events of the session; nil means no logs.
 	Logger *slog.Logger
 	// TLS is the configuration of the TLS client that runs over the control
-	// channel. It is cloned, and a MinVersion below TLS 1.2 is raised to it.
+	// channel. It is cloned; a MinVersion below TLS 1.2 is raised to it and the
+	// dynamic record sizing is turned off (a message is one record).
 	// It is required unless ResetOnly is set.
 	TLS *tls.Config
 	// Options is the options string and PeerInfo the peer info of the key exchange
@@ -153,40 +154,41 @@ type Session struct {
 	tlsCfg       *tls.Config
 	ctx          context.Context // ends with the session
 	cancel       context.CancelFunc
-	serverKX     *ctrlmsg.ServerKeyExchange // set before tlsReady is closed
-	pushed       *ctrlmsg.Pushed            // set before tlsReady is closed
-	pushDone     chan struct{}              // closed when the push reply is complete
-	dyn          ctrlwrap.Wrapper           // the protection of the renegotiations (dynamic tls-crypt), or nil; set before tlsReady is closed
-	user         string                     // the credentials of the key exchange of key id 0, kept for the renegotiations, as OpenVPN keeps them
-	pass         string                     // a secret: never logged
-	token        string                     // the auth token that the server pushed, the password of a renegotiation; guarded by mu; a secret
-	tokenUser    string                     // its user name, base64, or ""; guarded by mu
-	ctlTLS       atomic.Pointer[tls.Conn]   // the TLS session of the newest key: what EXIT is written to
-	needKey      atomic.Int32               // 1 + the key id whose data channel asked for a renegotiation, or 0
-	extend       chan struct{}              // from the control reader to the loop: extendAt has a later end for the handshake
-	extendAt     time.Time                  // the latest end that AUTH_PENDING asked for; guarded by mu
-	began        time.Time                  // when the handshake began
-	data         atomic.Pointer[dataPath]   // the data channel, set before tlsReady is closed
-	closing      atomic.Bool                // Close was called
-	ccExit       bool                       // the server pushed cc-exit; set before tlsReady is closed
-	exitSent     atomic.Bool                // the EXIT message is written: the loop watches for its acknowledgement
-	wake         chan struct{}              // wakes the loop to look at what Close changed
-	drained      chan struct{}              // closed by the loop when everything it sent is acknowledged, after EXIT
-	rdl, wdl     *deadline                  // the read and write deadlines of the connection
-	linkSem      chan struct{}              // holds a token while a writer has the link: one at a time
-	ctl          chan []byte                // from the loop to the writer of the link: control packets and pings
-	ctlDone      chan struct{}              // closed when the writer of the link has returned
-	loopDone     chan struct{}              // closed when the loop has returned
-	wmu          sync.Mutex                 // guards userWriting, linkDeadline and the write deadline of the link
-	userWriting  bool                       // a Write of the connection is writing to the link
-	linkDeadline bool                       // the link has a write deadline that is to be cleared
-	sawServer    atomic.Bool                // a packet of the server was taken: the server is there
-	wfailSince   atomic.Int64               // since when every write of the datagram link fails, as time since base; 0 when the last one worked
-	kaTimeoutNs  atomic.Int64               // the keepalive timeout, for the writers; 0 when there is none
-	base         time.Time                  // the zero of sentAt
-	sentAt       atomic.Int64               // when a packet last went to the link, as time since base
-	recv         chan *packetBuf            // decrypted IP packets for Read
-	wkcLen       int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
+	serverKX     *ctrlmsg.ServerKeyExchange       // set before tlsReady is closed
+	pushed       *ctrlmsg.Pushed                  // set before tlsReady is closed
+	pushDone     chan struct{}                    // closed when the push reply is complete
+	dyn          atomic.Pointer[ctrlwrap.Wrapper] // the protection of the renegotiations (dynamic tls-crypt), or nil; the TLS goroutine of the first key sets it, the loop reads it for any packet of another key id
+	user         string                           // the credentials of the key exchange of key id 0, kept for the renegotiations, as OpenVPN keeps them
+	pass         string                           // a secret: never logged
+	token        string                           // the auth token that the server pushed, the password of a renegotiation; guarded by mu; a secret
+	tokenUser    string                           // its user name, base64, or ""; guarded by mu
+	ctlTLS       atomic.Pointer[tls.Conn]         // the TLS session of the newest key: what EXIT is written to
+	needKey      atomic.Int32                     // 1 + the key id whose data channel asked for a renegotiation, or 0
+	extend       chan struct{}                    // from the control reader to the loop: extendAt has a later end for the handshake
+	extendAt     time.Time                        // the latest end that AUTH_PENDING asked for; guarded by mu
+	began        time.Time                        // when the handshake began
+	data         atomic.Pointer[dataPath]         // the data channel, set before tlsReady is closed
+	closing      atomic.Bool                      // Close was called
+	ccExit       bool                             // the server pushed cc-exit; set before tlsReady is closed
+	exitSent     atomic.Bool                      // the EXIT message is written: the loop watches for its acknowledgement
+	rekey        atomic.Pointer[chan struct{}]    // a renegotiation is under way: the loop closes the channel when its key is made, and EXIT waits for that
+	wake         chan struct{}                    // wakes the loop to look at what Close changed
+	drained      chan struct{}                    // closed by the loop when everything it sent is acknowledged, after EXIT
+	rdl, wdl     *deadline                        // the read and write deadlines of the connection
+	linkSem      chan struct{}                    // holds a token while a writer has the link: one at a time
+	ctl          chan []byte                      // from the loop to the writer of the link: control packets and pings
+	ctlDone      chan struct{}                    // closed when the writer of the link has returned
+	loopDone     chan struct{}                    // closed when the loop has returned
+	wmu          sync.Mutex                       // guards userWriting, linkDeadline and the write deadline of the link
+	userWriting  bool                             // a Write of the connection is writing to the link
+	linkDeadline bool                             // the link has a write deadline that is to be cleared
+	sawServer    atomic.Bool                      // a packet of the server was taken: the server is there
+	wfailSince   atomic.Int64                     // since when every write of the datagram link fails, as time since base; 0 when the last one worked
+	kaTimeoutNs  atomic.Int64                     // the keepalive timeout, for the writers; 0 when there is none
+	base         time.Time                        // the zero of sentAt
+	sentAt       atomic.Int64                     // when a packet last went to the link, as time since base
+	recv         chan *packetBuf                  // decrypted IP packets for Read
+	wkcLen       int                              // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
 	// Owned by the loop goroutine.
 	keys          [datachan.MaxKeyID + 1]*keyState // the control channels, by key id
@@ -252,6 +254,14 @@ func New(opts Options) *Session {
 		if s.tlsCfg.MinVersion < tls.VersionTLS12 {
 			s.tlsCfg.MinVersion = tls.VersionTLS12
 		}
+		// One message is one TLS record. crypto/tls cuts the first writes of a
+		// connection into records of about 1200 bytes (for TCP's sake), and OpenVPN
+		// reads one record at a time into its message buffer: of a key exchange
+		// message in two records the server reads the first, finds a password that
+		// ends too early and answers AUTH_FAILED.
+		//
+		// OpenVPN: ssl.c key_state_read_plaintext. Observed: SPEC §21 O33.
+		s.tlsCfg.DynamicRecordSizingDisabled = true
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.out = make(chan outMsg)
@@ -481,6 +491,10 @@ func (s *Session) Err() error {
 
 // Link is the connection to the server.
 func (s *Session) Link() net.Conn { return s.opts.Link }
+
+// SawServer reports whether a packet of the server was taken: a server is at the
+// other end of the link, whatever happened after.
+func (s *Session) SawServer() bool { return s.sawServer.Load() }
 
 // Dropped is how many packets were dropped: too short, with a bad protection,
 // from another session, or of no use at this point of the handshake.

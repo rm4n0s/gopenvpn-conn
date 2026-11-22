@@ -5,6 +5,7 @@ package openvpn
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/netip"
 	"reflect"
@@ -165,6 +166,54 @@ func TestCredentialsFailure(t *testing.T) {
 	})
 }
 
+// A user name and a password of more than 127 bytes (a token of a login service)
+// reach the server whole: 127 is the limit of an OpenVPN built without PKCS#11, and
+// it is the server that says so, not the client.
+func TestLongCredentialsAreSent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		user, pass := strings.Repeat("u", 200), strings.Repeat("p", 1000)
+		_, kx := kxRig(t, kinds[0], &Config{
+			Credentials: func(context.Context) (Credentials, error) {
+				return Credentials{Username: user, Password: pass}, nil
+			},
+		})
+		if kx.Username != user || kx.Password != pass {
+			t.Errorf("the server read a user name of %d bytes and a password of %d, want %d and %d",
+				len(kx.Username), len(kx.Password), len(user), len(pass))
+		}
+	})
+}
+
+// Credentials that do not fit in the message that a server reads end the handshake
+// with their own tag, and nothing of them is in the error.
+func TestCredentialsThatDoNotFit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pki := servertest.NewPKI(t)
+		link, _ := tlsPair(t, kinds[0], protections()[0], serverTLS(pki, pki.ServerCert))
+		pass := strings.Repeat("s3cret", 400)
+		conn := PacketClient(link, &Config{
+			TLS: NewTLSConfig(TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}}),
+			Credentials: func(context.Context) (Credentials, error) {
+				return Credentials{Username: "alice", Password: pass}, nil
+			},
+		})
+		closeAtEnd(t, conn)
+		err := conn.HandshakeContext(t.Context())
+		appErr, ok := errors.FromError(err)
+		if !ok {
+			t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+		}
+		if appErr.Tag != TagKeyExchangeTooLong || !appErr.HasRoute("Session.keyExchange->AppendClientKeyExchange.KeyExchangeTooLong") {
+			t.Errorf("unexpected failure path: %s", appErr.Route())
+		}
+		for _, text := range []string{err.Error(), appErr.Route(), fmt.Sprint(appErr.Metadata)} {
+			if strings.Contains(text, "s3cret") || strings.Contains(text, "alice") {
+				t.Errorf("the error has a credential in it: %s", appErr.Route())
+			}
+		}
+	})
+}
+
 func TestCredentialsContextEndsWithTheConnection(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		pki := servertest.NewPKI(t)
@@ -216,6 +265,10 @@ func TestInvalidConfigFields(t *testing.T) {
 		{"peer info value with a NUL", Config{resetOnly: true, PeerInfo: map[string]string{"UV_A": "x\x00"}}, "PeerInfo"},
 		{"peer info value too long", Config{resetOnly: true, PeerInfo: map[string]string{"UV_A": long}}, "PeerInfo"},
 		{"too many peer info variables", Config{resetOnly: true, PeerInfo: manyVariables(peerInfoMaxEntries + 1)}, "PeerInfo"},
+		{"peer info variables too long together", Config{resetOnly: true, PeerInfo: map[string]string{
+			"UV_A": strings.Repeat("v", peerInfoMaxValue), "UV_B": strings.Repeat("v", peerInfoMaxValue),
+			"UV_C": strings.Repeat("v", peerInfoMaxValue), "UV_D": strings.Repeat("v", peerInfoMaxValue),
+		}}, "PeerInfo"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -575,3 +575,104 @@ func TestManyCallersAndClose(t *testing.T) {
 		})
 	}
 }
+
+// slowConn is a link whose writes take a while, when the test says so: a
+// renegotiation over it is under way long enough for the test to act in the middle.
+type slowConn struct {
+	net.Conn
+	mu    sync.Mutex
+	delay time.Duration
+}
+
+func (c *slowConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	delay := c.delay
+	c.mu.Unlock()
+	time.Sleep(delay)
+	return c.Conn.Write(p)
+}
+
+func (c *slowConn) slow(d time.Duration) {
+	c.mu.Lock()
+	c.delay = d
+	c.mu.Unlock()
+}
+
+// Close in the middle of a renegotiation: the server reads the control messages of
+// the new key only, from the moment that the renegotiation began (OpenVPN: ssl.c
+// tls_process works on the primary key), so EXIT in the TLS session of the old key
+// is never read, and the server keeps the client until its ping timeout. EXIT waits
+// for the new key, as OpenVPN's client makes it wait (ssl.c tls_send_payload keeps
+// what is sent before the key is active).
+func TestExitInTheMiddleOfARenegotiation(t *testing.T) {
+	for _, tr := range transports {
+		for _, who := range []string{"the client's renegotiation", "the server's renegotiation"} {
+			t.Run(tr.name+"/"+who, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					var link *slowConn
+					r := newTLSRig(t, tlsOptions{
+						rigOptions: rigOptions{transport: tr, wrap: wrapKinds[0], server: vpntest.ServerOptions{PushMessages: []string{ccExitPush}}},
+						wrapLink: func(c net.Conn) net.Conn {
+							link = &slowConn{Conn: c}
+							return link
+						},
+						tweak: func(o *Options) { o.RenegotiateAfter = renegAfter },
+					})
+					if err := r.session.Handshake(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					link.slow(20 * time.Millisecond)
+					if who == "the server's renegotiation" {
+						r.server.Renegotiate()
+					} else {
+						time.Sleep(renegAfter - time.Second)
+					}
+					for range 600 { // until the renegotiation has begun at the server
+						if r.server.Renegotiating() {
+							break
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+					synctest.Wait() // the client has the server's soft reset, when it is the server that began
+					if !r.server.Renegotiating() {
+						t.Fatalf("no renegotiation is under way (%d are done): the test is not in the middle of one", r.server.Renegotiations())
+					}
+					start := time.Now()
+					if err := r.session.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if elapsed := time.Since(start); elapsed >= exitWait {
+						t.Errorf("Close took %v", elapsed)
+					}
+					synctest.Wait()
+					if got, stale := r.server.Exits(), r.server.StaleExits(); got != 1 || stale != 0 {
+						t.Errorf("the server read %d EXIT messages, and %d came on the old key where it does not read; want 1 and 0", got, stale)
+					}
+				})
+			})
+		}
+	}
+}
+
+// A renegotiation that does not finish does not hold Close for longer than the wait
+// for the acknowledgement of EXIT.
+func TestCloseDoesNotWaitLongForARenegotiation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := renegRig(t, transports[0], 0, ccExitPush, vpntest.ServerOptions{RejectRenegotiations: 1}, nil)
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(renegAfter + time.Second) // the client's renegotiation gets no answer
+		start := time.Now()
+		if err := r.session.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if elapsed := time.Since(start); elapsed > exitWait+100*time.Millisecond {
+			t.Errorf("Close took %v, want about %v", elapsed, exitWait)
+		}
+		synctest.Wait()
+		if got, stale := r.server.Exits(), r.server.StaleExits(); got != 0 || stale != 0 {
+			t.Errorf("the server read %d EXIT messages and got %d on the old key, want none: there was no key to send it with", got, stale)
+		}
+	})
+}

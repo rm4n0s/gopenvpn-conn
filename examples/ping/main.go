@@ -6,6 +6,8 @@
 // and reads the packets itself.
 //
 //	go run ./examples/ping -server vpn.example.com:1194 -ca ca.crt -cert client.crt -key client.key -tls-crypt ta.key
+//
+// Ctrl-C stops it at any moment, and the tunnel is closed before it exits.
 package main
 
 import (
@@ -18,6 +20,8 @@ import (
 	"log"
 	"net/netip"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/rm4n0s/errors"
@@ -39,12 +43,22 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(*server, *network, *caFile, *certFile, *keyFile, *cryptFile, *target, *count); err != nil {
+	// Ctrl-C (or a kill) ends the context: run stops where it is and closes the
+	// tunnel on its way out, which tells the server that the client leaves.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := run(ctx, *server, *network, *caFile, *certFile, *keyFile, *cryptFile, *target, *count)
+	wasInterrupted := ctx.Err() != nil
+	stop()
+	switch {
+	case wasInterrupted:
+		log.Print("interrupted")
+		os.Exit(130)
+	case err != nil:
 		log.Fatal(err)
 	}
 }
 
-func run(server, network, caFile, certFile, keyFile, cryptFile, target string, count int) (err error) {
+func run(ctx context.Context, server, network, caFile, certFile, keyFile, cryptFile, target string, count int) (err error) {
 	roots, err := loadRoots(caFile)
 	if err != nil {
 		return err
@@ -68,9 +82,9 @@ func run(server, network, caFile, certFile, keyFile, cryptFile, target string, c
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	conn, err := openvpn.Dial(ctx, network, server, config)
+	conn, err := openvpn.Dial(dialCtx, network, server, config)
 	if err != nil {
 		return err
 	}
@@ -79,6 +93,14 @@ func run(server, network, caFile, certFile, keyFile, cryptFile, target string, c
 			err = cerr
 		}
 	}()
+	// The context does not bound the connection: when it ends, a deadline in the
+	// past wakes the Read that waits for a reply.
+	stopWake := context.AfterFunc(ctx, func() {
+		if derr := conn.SetReadDeadline(time.Unix(1, 0)); derr != nil {
+			log.Printf("waking the read: %v", derr)
+		}
+	})
+	defer stopWake()
 
 	state := conn.ConnectionState()
 	me, dst, err := pingAddresses(state.Addrs, state.Gateway, target)
@@ -90,6 +112,9 @@ func run(server, network, caFile, certFile, keyFile, cryptFile, target string, c
 	const id = 0x4f50
 	buf := make([]byte, state.MTU)
 	for seq := 1; seq <= count; seq++ {
+		if ctx.Err() != nil {
+			return nil // interrupted: main says so
+		}
 		payload := []byte(fmt.Sprintf("ping %04d from gopenvpn-conn", seq))
 		start := time.Now()
 		if _, err := conn.Write(echoRequest(me, dst, id, uint16(seq), payload)); err != nil {
@@ -101,6 +126,9 @@ func run(server, network, caFile, certFile, keyFile, cryptFile, target string, c
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil // interrupted: main says so
+				}
 				fmt.Fprintf(os.Stderr, "no reply to request %d\n", seq)
 				return err
 			}
@@ -111,7 +139,10 @@ func run(server, network, caFile, certFile, keyFile, cryptFile, target string, c
 			fmt.Printf("%d bytes from %v: seq=%d time=%v payload=%q\n", n-28, src, gotSeq, time.Since(start).Round(10*time.Microsecond), data)
 			break
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+		}
 	}
 	return nil
 }

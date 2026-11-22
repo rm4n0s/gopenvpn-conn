@@ -34,7 +34,8 @@ const (
 // every remote failed, Dial returns the error of the last one, with the metadata
 // "remotes_tried" (how many were tried) and "remotes" (how many the profile has).
 // When ctx is done, Dial stops at once and returns the error of the remote that it
-// was trying.
+// was trying. A remote over UDP whose name has several addresses is tried at each
+// of them until a server answers, each with ConnectTimeout (see openvpn.Dial).
 //
 // A profile with auth-user-pass and no file needs Config.Credentials to be set
 // before Dial (Profile.NeedsCredentials says so); without it, Dial returns

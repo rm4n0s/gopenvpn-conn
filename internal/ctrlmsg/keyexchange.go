@@ -24,8 +24,20 @@ const (
 	// TLS_OPTIONS_LEN.
 	MaxOptionsLen = 512
 	// MaxCredentialLen is the longest user name or password, with its NUL:
-	// OpenVPN's USER_PASS_LEN. The server answers a longer one with AUTH_FAILED.
-	MaxCredentialLen = 128
+	// OpenVPN's USER_PASS_LEN when it is built with PKCS#11, as the packages of the
+	// systems are; a build without it has 128, and answers a longer one with
+	// AUTH_FAILED ("Username or password is too long"). What bounds a credential
+	// first is MaxKeyExchangeLen.
+	//
+	// OpenVPN: misc.h USER_PASS_LEN.
+	MaxCredentialLen = 4096
+	// MaxKeyExchangeLen is the longest key exchange message: OpenVPN reads the
+	// cleartext of the control channel into a buffer of this size, so a server cuts a
+	// longer message there, loses the peer info and reads the rest as a control
+	// message. OpenVPN's client cannot write a longer one either.
+	//
+	// OpenVPN: common.h TLS_CHANNEL_BUF_SIZE, ssl.c key_state_init.
+	MaxKeyExchangeLen = 2048
 	// maxPeerInfoLen is the longest peer info that is read, with its NUL. The
 	// server's peer info is not used yet and a control message is one TLS
 	// record (16 KB at most), so the bound is far above what is sent.
@@ -65,9 +77,10 @@ func NewClientKeyExchange(options, username, password, peerInfo string) *ClientK
 // method, the random fields, and the four strings. A string is a 16-bit length
 // that counts the NUL at its end, the bytes and the NUL; with no user name and no
 // password, those two are strings of length 0, with no NUL. A string that is too
-// long, or has a NUL inside, is refused: a user name or password is never part
-// of the error.
+// long, or has a NUL inside, is refused, and so is a message that is longer than
+// MaxKeyExchangeLen: a user name or password is never part of the error.
 func AppendClientKeyExchange(dst []byte, m *ClientKeyExchange) ([]byte, error) {
+	start := len(dst)
 	dst = append(dst, 0, 0, 0, 0, KeyMethod)
 	dst = append(dst, m.PreMaster[:]...)
 	dst = append(dst, m.Random1[:]...)
@@ -101,6 +114,11 @@ func AppendClientKeyExchange(dst []byte, m *ClientKeyExchange) ([]byte, error) {
 		dst = binary.BigEndian.AppendUint16(dst, uint16(min(len(f.value)+1, math.MaxUint16))) // checked above: at most 0xffff
 		dst = append(dst, f.value...)
 		dst = append(dst, 0)
+	}
+	if n := len(dst) - start; n > MaxKeyExchangeLen {
+		clear(dst[start:]) // the password is in it
+		return nil, errors.New(TagKeyExchangeTooLong, "the key exchange message is longer than a server reads: the peer info, the user name or the password is too long",
+			"length", n, "max", MaxKeyExchangeLen)
 	}
 	return dst, nil
 }
@@ -194,3 +212,7 @@ const (
 	tagKeyExchangeTrailing  = "KeyExchangeTrailing"
 	tagBadKeyMethod         = "BadKeyMethod"
 )
+
+// TagKeyExchangeTooLong is the tag of the error of a key exchange message that is
+// longer than MaxKeyExchangeLen. Metadata: "length", "max".
+const TagKeyExchangeTooLong = "KeyExchangeTooLong"

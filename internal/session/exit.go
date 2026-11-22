@@ -28,7 +28,8 @@ var occExit = []byte{
 
 // goodbye tells the server that the client is leaving, as well as the link allows.
 // Close calls it before it ends the session. With cc-exit it writes EXIT in the
-// control channel and waits up to exitWait for the acknowledgement, while the loop
+// control channel (of the new key, when a renegotiation is under way: it waits for
+// it) and waits for the acknowledgement, up to exitWait in all, while the loop
 // goes on sending it again; without it, on a datagram link, one data packet says it
 // (OpenVPN's default is one try); on a stream there is nothing to send. Failing to
 // say goodbye is no failure of Close: it is logged.
@@ -37,6 +38,24 @@ var occExit = []byte{
 func (s *Session) goodbye() {
 	switch {
 	case s.ccExit:
+		timer := time.NewTimer(exitWait) // for all of it: the new key, and the acknowledgement
+		defer timer.Stop()
+		// While a renegotiation is under way the server reads the control messages of
+		// the new key only, and that key cannot carry one yet: EXIT waits for it, as
+		// OpenVPN's client keeps what it has to send until the new key is active.
+		// Written to the key before it, EXIT would never be read.
+		//
+		// OpenVPN: ssl.c tls_send_payload (paybuf), tls_process (the primary key).
+		if under := s.rekey.Load(); under != nil {
+			select {
+			case <-*under:
+			case <-timer.C:
+				s.log.Debug("EXIT was not sent: a renegotiation did not finish in time")
+				return
+			case <-s.done:
+				return
+			}
+		}
 		conn := s.ctlTLS.Load()
 		if _, err := conn.Write(ctrlmsg.AppendMessage(nil, ctrlmsg.Exit)); err != nil {
 			s.log.Debug("could not send EXIT", "err", err)
@@ -47,8 +66,6 @@ func (s *Session) goodbye() {
 		case s.wake <- struct{}{}:
 		default:
 		}
-		timer := time.NewTimer(exitWait)
-		defer timer.Stop()
 		select {
 		case <-s.drained:
 		case <-timer.C:

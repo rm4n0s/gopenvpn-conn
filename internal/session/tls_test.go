@@ -14,6 +14,7 @@ import (
 
 	"github.com/rm4n0s/errors"
 
+	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/servertest"
 	"github.com/rm4n0s/gopenvpn-conn/internal/vpntest"
@@ -564,26 +565,43 @@ func TestKeyExchangeWaitsForTheServer(t *testing.T) {
 }
 
 func TestKeyExchangeRefusesCredentialsThatAreTooLong(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		pki := servertest.NewPKI(t)
-		link, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
-		vpntest.NewServer(t, peer, vpntest.ServerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{pki.ServerCert}}})
-		s := New(Options{
-			Link: link, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute,
-			TLS:         &tls.Config{RootCAs: pki.CAPool, ServerName: "server"},
-			Options:     "o",
-			Credentials: func(context.Context) (string, string, error) { return "alice", strings.Repeat("p", 128), nil },
+	tests := []struct {
+		name     string
+		password int // its length
+		route    string
+	}{
+		// Longer than any OpenVPN takes (USER_PASS_LEN of a build with PKCS#11).
+		{"a password longer than a server's buffer for it", ctrlmsg.MaxCredentialLen, "keyExchange->AppendClientKeyExchange.StringTooLong"},
+		// Short enough for that, and the message is longer than a server reads.
+		{"a message longer than a server reads", ctrlmsg.MaxKeyExchangeLen, "keyExchange->AppendClientKeyExchange.KeyExchangeTooLong"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				pki := servertest.NewPKI(t)
+				link, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
+				vpntest.NewServer(t, peer, vpntest.ServerOptions{TLS: &tls.Config{Certificates: []tls.Certificate{pki.ServerCert}}})
+				s := New(Options{
+					Link: link, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute,
+					TLS:         &tls.Config{RootCAs: pki.CAPool, ServerName: "server"},
+					Options:     "o",
+					Credentials: func(context.Context) (string, string, error) { return "alice", strings.Repeat("p", tt.password), nil },
+				})
+				closeAtEnd(t, s)
+				err := s.Handshake(t.Context())
+				appErr, ok := errors.FromError(err)
+				if !ok {
+					t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+				}
+				if !appErr.HasRoute(tt.route) {
+					t.Errorf("unexpected failure path: %s", appErr.Route())
+				}
+				if strings.Contains(appErr.Error(), "ppp") || strings.Contains(appErr.Error(), "alice") {
+					t.Error("a credential is in the error")
+				}
+			})
 		})
-		closeAtEnd(t, s)
-		err := s.Handshake(t.Context())
-		appErr, ok := errors.FromError(err)
-		if !ok || appErr.Tag != "StringTooLong" || !appErr.HasRoute("keyExchange->AppendClientKeyExchange.StringTooLong") {
-			t.Fatalf("Handshake = %v, want StringTooLong", err)
-		}
-		if strings.Contains(appErr.Error(), "ppp") {
-			t.Error("the password is in the error")
-		}
-	})
+	}
 }
 
 func TestServerKeyExchangeIsKept(t *testing.T) {

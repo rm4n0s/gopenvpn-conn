@@ -4,8 +4,11 @@ package openvpn
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
+	"net/netip"
 	"runtime"
+	"slices"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/rm4n0s/errors"
 
+	"github.com/rm4n0s/gopenvpn-conn/internal/servertest"
 	"github.com/rm4n0s/gopenvpn-conn/internal/vpntest"
 )
 
@@ -259,4 +263,222 @@ func TestDialContextOfTheCallerEndsOnlyTheHandshake(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+// addressDialer is a Dialer for a name with the addresses that the test gives: the
+// lookup returns them, and links[address] makes the link to each (the server on the
+// far end is what the test chose). It keeps what was asked of the lookup and of the
+// dial function.
+func addressDialer(cfg *Config, addrs []string, links map[string]func() (net.Conn, error)) (*Dialer, *[]string) {
+	var asked []string
+	return &Dialer{
+		Config: cfg,
+		lookup: func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+			asked = append(asked, "lookup "+network+" "+host)
+			out := make([]netip.Addr, len(addrs))
+			for i, a := range addrs {
+				out[i] = netip.MustParseAddr(a)
+			}
+			return out, nil
+		},
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			asked = append(asked, network+" "+address)
+			return links[address]()
+		},
+	}, &asked
+}
+
+// Over UDP nothing says that a server is at an address before the server answers:
+// the dialer of the link "connects" to the first address of a name and stops. Dial
+// goes on to the next address when one sends nothing, as OpenVPN does with the
+// addresses of a remote.
+func TestDialTriesTheAddressesOfAName(t *testing.T) {
+	p := protections()[0]
+	// A link to a server, made in the bubble of the test that asks for it.
+	linkTo := func(t *testing.T, fault vpntest.Fault) func() (net.Conn, error) {
+		return func() (net.Conn, error) {
+			link, _ := pair(t, kinds[0], p, fault)
+			return link, nil
+		}
+	}
+	unreachable := func() (net.Conn, error) { return nil, syscall.ENETUNREACH }
+	config := func(t *testing.T) *Config {
+		return &Config{ControlWrap: p.wrap(t), resetOnly: true, ServerPollTimeout: 3 * time.Second, HandshakeTimeout: time.Minute}
+	}
+	t.Run("the third address answers", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			d, asked := addressDialer(config(t), []string{"192.0.2.1", "2001:db8::2", "192.0.2.3"}, map[string]func() (net.Conn, error){
+				"192.0.2.1:1194": linkTo(t, vpntest.Silent), "[2001:db8::2]:1194": unreachable, "192.0.2.3:1194": linkTo(t, vpntest.NoFault),
+			})
+			start := time.Now()
+			conn, err := d.Dial(t.Context(), "udp", "vpn.example:1194")
+			if err != nil {
+				t.Fatalf("Dial: %v (asked: %v)", err, *asked)
+			}
+			closeAtEnd(t, conn)
+			want := []string{"lookup ip vpn.example", "udp 192.0.2.1:1194", "udp [2001:db8::2]:1194", "udp 192.0.2.3:1194"}
+			if !slices.Equal(*asked, want) {
+				t.Errorf("asked %v, want %v", *asked, want)
+			}
+			if elapsed := time.Since(start); elapsed != 3*time.Second {
+				t.Errorf("Dial took %v, want the 3s of the address that was silent", elapsed)
+			}
+		})
+	})
+	t.Run("no address answers", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			d, asked := addressDialer(config(t), []string{"192.0.2.1", "192.0.2.2"}, map[string]func() (net.Conn, error){
+				"192.0.2.1:1194": linkTo(t, vpntest.Silent), "192.0.2.2:1194": linkTo(t, vpntest.Silent),
+			})
+			start := time.Now()
+			_, err := d.Dial(t.Context(), "udp4", "vpn.example:1194")
+			appErr, ok := errors.FromError(err)
+			if !ok {
+				t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+			}
+			if !appErr.HasRoute("Session.loop.ServerPollTimeout") {
+				t.Errorf("unexpected failure path: %s", appErr.Route())
+			}
+			if appErr.Metadata["addresses"] != 2 || appErr.Metadata["addresses_tried"] != 2 {
+				t.Errorf("metadata = %v, want 2 addresses, 2 tried", appErr.Metadata)
+			}
+			if want := []string{"lookup ip4 vpn.example", "udp4 192.0.2.1:1194", "udp4 192.0.2.2:1194"}; !slices.Equal(*asked, want) {
+				t.Errorf("asked %v, want %v", *asked, want)
+			}
+			if elapsed := time.Since(start); elapsed != 6*time.Second {
+				t.Errorf("Dial took %v, want 3s for each of the two addresses", elapsed)
+			}
+		})
+	})
+	t.Run("no address can be reached", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			d, _ := addressDialer(config(t), []string{"2001:db8::1", "2001:db8::2"}, map[string]func() (net.Conn, error){
+				"[2001:db8::1]:1194": unreachable, "[2001:db8::2]:1194": unreachable,
+			})
+			_, err := d.Dial(t.Context(), "udp6", "vpn.example:1194")
+			appErr, ok := errors.FromError(err)
+			if !ok {
+				t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+			}
+			if !appErr.HasRoute("Dialer.Dial.DialFailed") || !errors.Is(err, syscall.ENETUNREACH) {
+				t.Errorf("unexpected failure path: %s (%v)", appErr.Route(), err)
+			}
+			if appErr.Metadata["address"] != "vpn.example:1194" || appErr.Metadata["addresses_tried"] != 2 {
+				t.Errorf("metadata = %v", appErr.Metadata)
+			}
+		})
+	})
+	t.Run("a server that answered and failed is the answer", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// The server at the first address is there, and its certificate is of another CA.
+			pki, other := servertest.NewPKI(t), servertest.NewPKI(t)
+			cfg := &Config{
+				TLS:               NewTLSConfig(TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}}),
+				ServerPollTimeout: 3 * time.Second,
+			}
+			d, asked := addressDialer(cfg, []string{"192.0.2.1", "192.0.2.2"}, map[string]func() (net.Conn, error){
+				"192.0.2.1:1194": func() (net.Conn, error) {
+					link, _ := tlsPair(t, kinds[0], p, serverTLS(other, other.ServerCert))
+					return link, nil
+				},
+				"192.0.2.2:1194": func() (net.Conn, error) {
+					t.Error("the next address was tried after a server had answered")
+					return nil, syscall.ENETUNREACH
+				},
+			})
+			_, err := d.Dial(t.Context(), "udp", "vpn.example:1194")
+			appErr, ok := errors.FromError(err)
+			if !ok || appErr.Tag != TagTLSHandshakeFailed {
+				t.Fatalf("Dial = %v, want %s", err, TagTLSHandshakeFailed)
+			}
+			if appErr.Metadata["addresses_tried"] != 1 {
+				t.Errorf("metadata = %v, want 1 address tried", appErr.Metadata)
+			}
+			if len(*asked) != 2 {
+				t.Errorf("asked %v", *asked)
+			}
+		})
+	})
+	t.Run("the caller gives up at the first address", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			d, asked := addressDialer(config(t), []string{"192.0.2.1", "192.0.2.2"}, map[string]func() (net.Conn, error){
+				"192.0.2.1:1194": linkTo(t, vpntest.Silent), "192.0.2.2:1194": linkTo(t, vpntest.NoFault),
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			if _, err := d.Dial(ctx, "udp", "vpn.example:1194"); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Dial = %v, want the deadline of the caller", err)
+			}
+			if len(*asked) != 2 {
+				t.Errorf("asked %v, want the lookup and the first address", *asked)
+			}
+		})
+	})
+	t.Run("the lookup fails", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cause := &net.DNSError{Err: "no such host", Name: "vpn.example", IsNotFound: true}
+			d := &Dialer{
+				Config: config(t),
+				lookup: func(context.Context, string, string) ([]netip.Addr, error) { return nil, cause },
+				DialContext: func(context.Context, string, string) (net.Conn, error) {
+					t.Error("a link was dialed for a name with no address")
+					return nil, syscall.ENETUNREACH
+				},
+			}
+			_, err := d.Dial(t.Context(), "udp", "vpn.example:1194")
+			appErr, ok := errors.FromError(err)
+			if !ok {
+				t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+			}
+			if !appErr.HasRoute("Dialer.Dial.DialFailed") || !errors.Is(err, cause) {
+				t.Errorf("unexpected failure path: %s (%v)", appErr.Route(), err)
+			}
+		})
+	})
+	t.Run("what is not looked up", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			for _, row := range []struct{ network, address string }{
+				{"udp", "192.0.2.9:1194"},     // an address
+				{"udp", "[2001:db8::9]:1194"}, // an address
+				{"tcp", "vpn.example:1194"},   // a stream: the dialer of the link tries the addresses
+				{"udp", "vpn.example"},        // no port: the dialer of the link says so
+			} {
+				var asked []string
+				d := &Dialer{
+					Config: config(t),
+					lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+						t.Errorf("%s %s was looked up", row.network, row.address)
+						return nil, syscall.ENETUNREACH
+					},
+					DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+						asked = append(asked, network+" "+address)
+						return nil, syscall.ENETUNREACH
+					},
+				}
+				if _, err := d.Dial(t.Context(), row.network, row.address); !errors.Is(err, syscall.ENETUNREACH) {
+					t.Errorf("%s %s: Dial = %v", row.network, row.address, err)
+				}
+				if want := []string{row.network + " " + row.address}; !slices.Equal(asked, want) {
+					t.Errorf("the dial function was asked for %v, want %v", asked, want)
+				}
+			}
+		})
+	})
+}
+
+// With DialContext the name is not looked up: the function gets it as Dial did.
+func TestDialContextGetsTheName(t *testing.T) {
+	d := &Dialer{DialContext: func(context.Context, string, string) (net.Conn, error) { return nil, syscall.ENETUNREACH }}
+	if lookup, _, _ := d.lookupFor("udp", "vpn.example:1194", false); lookup != nil {
+		t.Error("a name is looked up though DialContext is set")
+	}
+	d = &Dialer{}
+	if lookup, host, port := d.lookupFor("udp", "vpn.example:1194", false); lookup == nil || host != "vpn.example" || port != "1194" {
+		t.Errorf("a name over UDP is not looked up by Dial: %q %q", host, port)
+	}
+	resolver := &net.Resolver{}
+	d = &Dialer{NetDialer: &net.Dialer{Resolver: resolver}}
+	if lookup, _, _ := d.lookupFor("udp", "vpn.example:1194", false); lookup == nil {
+		t.Error("a name over UDP is not looked up with the resolver of NetDialer")
+	}
 }
