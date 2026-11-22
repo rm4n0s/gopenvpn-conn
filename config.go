@@ -128,6 +128,16 @@ type Config struct {
 	// DefaultHandshakeTimeout. It is OpenVPN's --hand-window.
 	HandshakeTimeout time.Duration
 
+	// ServerPollTimeout is how long the client waits for the server to answer: in
+	// Dial, for the link to be made and for the first packet of the server; with
+	// Client and PacketClient, for the first packet, from the start of the handshake.
+	// When it passes the connection fails with TagDialFailed (the link) or
+	// TagServerPollTimeout (no packet). Once the server has answered it bounds
+	// nothing more: HandshakeTimeout bounds the handshake. It is OpenVPN's
+	// --connect-timeout (--server-poll-timeout). Zero means no limit of its own;
+	// negative is invalid.
+	ServerPollTimeout time.Duration
+
 	// PingInterval is how long the connection may be idle before the client sends
 	// a keepalive ping (OpenVPN's --ping). A value that the server pushes (ping)
 	// wins. Zero means no ping unless the server pushes one; negative is invalid.
@@ -196,6 +206,8 @@ func (c *Config) validate() error {
 	switch {
 	case c.HandshakeTimeout < 0:
 		return errors.New(tagInvalidConfig, "the handshake timeout is negative", "field", "HandshakeTimeout")
+	case c.ServerPollTimeout < 0:
+		return errors.New(tagInvalidConfig, "the server poll timeout is negative", "field", "ServerPollTimeout")
 	case c.PingInterval < 0:
 		return errors.New(tagInvalidConfig, "the ping interval is negative", "field", "PingInterval")
 	case c.PingTimeout < 0:

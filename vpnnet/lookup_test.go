@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -213,19 +214,20 @@ func dnsReply(query []byte, flags uint16, a bool) []byte {
 	return out
 }
 
-// TestLookupFailover: a server that answers with an error gives way to the next one, the
-// one that worked is the first of the next lookup, and "no such name" is an answer that
-// ends the search.
+// TestLookupFailover: a server that answers with an error gives way to the next one
+// and is tried after the others for a while, then it has its place again; "no such
+// name" is an answer that ends the search.
 func TestLookupFailover(t *testing.T) {
 	na, nb := newNetWith(t, false, nil, &Options{DNSServers: []netip.AddrPort{
 		netip.MustParseAddrPort("10.8.0.3:5301"), // SERVFAIL
 		netip.MustParseAddrPort("10.8.0.3:5302"), // answers
 		netip.MustParseAddrPort("10.8.0.3:5303"), // says that every name exists
 	}})
-	var asked [3]int
+	var asked [3]atomic.Int32
 	count := func(i int, f func(q []byte) []byte) func(q []byte) []byte {
-		return func(q []byte) []byte { asked[i]++; return f(q) }
+		return func(q []byte) []byte { asked[i].Add(1); return f(q) }
 	}
+	counts := func() [3]int32 { return [3]int32{asked[0].Load(), asked[1].Load(), asked[2].Load()} }
 	listenDNS(t, nb, "10.8.0.3:5301", count(0, func(q []byte) []byte { return dnsReply(q, 0x8182, false) }))
 	listenDNS(t, nb, "10.8.0.3:5302", count(1, func(q []byte) []byte {
 		return dnsAnswer(zone{"web.vpn.test": {netip.MustParseAddr("10.8.0.3")}}, q)
@@ -236,27 +238,148 @@ func TestLookupFailover(t *testing.T) {
 	if err != nil || !slices.Equal(strs(got), []string{"10.8.0.3"}) {
 		t.Fatalf("LookupNetIP = %v, %v", got, err)
 	}
-	if asked != [3]int{1, 1, 0} || na.dnsStart.Load() != 1 {
-		t.Errorf("asked %v, start %d: want the first and the second asked once, and the second to start with", asked, na.dnsStart.Load())
+	if c := counts(); c != [3]int32{1, 1, 0} {
+		t.Errorf("asked %v: want the first and the second asked once", c)
 	}
+	// The first server failed: for a while the lookups start at the second.
 	if _, err := na.LookupNetIP(t.Context(), "ip4", "web.vpn.test"); err != nil {
 		t.Fatalf("second LookupNetIP: %v", err)
 	}
-	if asked != [3]int{1, 2, 0} {
-		t.Errorf("asked %v: the second lookup should start at the server that worked", asked)
+	if c := counts(); c != [3]int32{1, 2, 0} {
+		t.Errorf("asked %v: the second lookup should leave the server that failed for last", c)
 	}
-	// NXDOMAIN of the server that is first ends the search: the third would have an answer.
+	// NXDOMAIN of the server that is asked ends the search: the third would have an answer.
 	_, err = na.LookupNetIP(t.Context(), "ip4", "nothing.vpn.test")
 	wantRoute(t, err, "parseResponse."+TagNoSuchHost)
-	if asked[2] != 0 {
-		t.Errorf("the third server was asked after a NXDOMAIN")
+	if c := counts(); c != [3]int32{1, 3, 0} {
+		t.Errorf("asked %v after a NXDOMAIN: want only the second server asked", c)
+	}
+	// When the time is over the first server is asked first again: one failure does not
+	// move the lookups away from the server that the VPN names first for good.
+	na.dnsDown[0].Store(time.Now().Add(-time.Second).UnixNano())
+	if _, err := na.LookupNetIP(t.Context(), "ip4", "web.vpn.test"); err != nil {
+		t.Fatalf("LookupNetIP after the cool-down: %v", err)
+	}
+	if c := counts(); c != [3]int32{2, 4, 0} {
+		t.Errorf("asked %v after the cool-down: want the first server asked again", c)
 	}
 	// Every server fails with an error: the last error is returned.
-	na.dnsStart.Store(0)
 	nbad, nbBad := newNetWith(t, false, nil, &Options{DNSServers: []netip.AddrPort{netip.MustParseAddrPort("10.8.0.3:5301")}})
 	listenDNS(t, nbBad, "10.8.0.3:5301", func(q []byte) []byte { return dnsReply(q, 0x8185, false) }) // REFUSED
 	_, err = nbad.LookupNetIP(t.Context(), "ip4", "web.vpn.test")
 	wantRoute(t, err, "parseResponse."+TagDNSServerError)
+}
+
+// TestLookupKeepsTheAddressesOfOneType: a server that says "no such name" for the AAAA
+// of a name that has an A (RFC 4074 §4.2) does not make the name unknown: the A
+// addresses are the answer. And the other way round.
+func TestLookupKeepsTheAddressesOfOneType(t *testing.T) {
+	na, nb, _, _ := newNetsDNS(t, true, []string{"DNS 10.8.0.3"})
+	z := zone{"web.vpn.test": {netip.MustParseAddr("10.8.0.3")}, "six.vpn.test": {netip.MustParseAddr("fd00:8::3")}}
+	listenDNS(t, nb, testServer.String(), func(q []byte) []byte {
+		name, qtype, _, ok := dnsQuestion(q)
+		if !ok {
+			return nil
+		}
+		// NXDOMAIN for the type that the name has no address of.
+		if (name == "web.vpn.test" && qtype == typeAAAA) || (name == "six.vpn.test" && qtype == typeA) {
+			return dnsReply(q, 0x8183, false)
+		}
+		return dnsAnswer(z, q)
+	})
+	for host, want := range map[string]string{"web.vpn.test": "10.8.0.3", "six.vpn.test": "fd00:8::3"} {
+		got, err := na.LookupNetIP(t.Context(), "ip", host)
+		if err != nil || !slices.Equal(strs(got), []string{want}) {
+			t.Errorf("LookupNetIP(ip, %s) = %v, %v; want %s", host, got, err, want)
+		}
+	}
+	// No address of any type: the name does not exist.
+	_, err := na.LookupNetIP(t.Context(), "ip", "nothing.vpn.test")
+	wantRoute(t, err, "parseResponse."+TagNoSuchHost)
+}
+
+// TestLookupErrorWithoutAQuestion: a server may leave the question out of an answer
+// that is an error. It is the error that it is, and the next server is asked at once,
+// not after the wait for an answer that will not come.
+func TestLookupErrorWithoutAQuestion(t *testing.T) {
+	na, nb := newNetWith(t, false, nil, &Options{DNSServers: []netip.AddrPort{
+		netip.MustParseAddrPort("10.8.0.3:5301"), netip.MustParseAddrPort("10.8.0.3:5302"),
+	}})
+	listenDNS(t, nb, "10.8.0.3:5301", func(q []byte) []byte {
+		return []byte{q[0], q[1], 0x81, 0x85, 0, 0, 0, 0, 0, 0, 0, 0} // REFUSED, no question
+	})
+	listenDNS(t, nb, "10.8.0.3:5302", func(q []byte) []byte {
+		return dnsAnswer(zone{"web.vpn.test": {netip.MustParseAddr("10.8.0.3")}}, q)
+	})
+	start := time.Now()
+	got, err := na.LookupNetIP(t.Context(), "ip4", "web.vpn.test")
+	if err != nil || !slices.Equal(strs(got), []string{"10.8.0.3"}) {
+		t.Fatalf("LookupNetIP = %v, %v", got, err)
+	}
+	if took := time.Since(start); took > queryTimeout/2 {
+		t.Errorf("the lookup took %v: the error of the first server was waited out", took)
+	}
+}
+
+// TestDialContextTriesTheNextAddress: a name with two addresses, the first of which
+// does not answer. Each address has a part of the time of the context, so the second
+// is reached; the whole time used to go to the first.
+func TestDialContextTriesTheNextAddress(t *testing.T) {
+	na, nb, _, _ := newNetsDNS(t, false, []string{"DNS 10.8.0.3"})
+	listenDNS(t, nb, testServer.String(), func(q []byte) []byte {
+		return dnsAnswer(zone{"web.vpn.test": {netip.MustParseAddr("10.8.0.77"), netip.MustParseAddr("10.8.0.3")}}, q)
+	})
+	l, err := nb.Listen("tcp", ":7000")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer closeOrFail(t, l)
+	echoServer(t, l)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	c, err := na.DialContext(ctx, "tcp", "web.vpn.test:7000")
+	if err != nil {
+		t.Fatalf("DialContext = %v after %v: the second address was not reached", err, time.Since(start))
+	}
+	defer closeOrFail(t, c)
+	if got := c.RemoteAddr().String(); got != "10.8.0.3:7000" {
+		t.Errorf("connected to %s", got)
+	}
+	if took := time.Since(start); took < 2*time.Second || took > 4*time.Second {
+		t.Errorf("the dial took %v, want the half of the 5 s that the first address had", took)
+	}
+}
+
+func TestAttemptContext(t *testing.T) {
+	parent, cancel := context.WithTimeout(t.Context(), 9*time.Second)
+	defer cancel()
+	left := func(ctx context.Context) time.Duration {
+		d, ok := ctx.Deadline()
+		if !ok {
+			return -1
+		}
+		return time.Until(d).Round(time.Second)
+	}
+	rows := []struct {
+		name   string
+		parent context.Context
+		left   int
+		want   time.Duration
+	}{
+		{"the last address has all the time", parent, 1, 9 * time.Second},
+		{"one of three has a third", parent, 3, 3 * time.Second},
+		{"not less than the minimum", parent, 9, attemptMin},
+		{"no deadline, the last address", t.Context(), 1, -1},
+		{"no deadline, one of two", t.Context(), 2, attemptDefault},
+	}
+	for _, row := range rows {
+		ctx, cancel := attemptContext(row.parent, row.left)
+		if got := left(ctx); got != row.want {
+			t.Errorf("%s: %v left, want %v", row.name, got, row.want)
+		}
+		cancel()
+	}
 }
 
 // TestLookupTruncated: a truncated UDP answer is asked again over TCP.
@@ -420,6 +543,9 @@ func TestParseResponse(t *testing.T) {
 		{name: "a bad label", msg: with(func(m []byte) []byte { m[len(query)] = 0x80; return m }), route: TagBadDNSResponse},
 		{name: "NXDOMAIN", msg: with(func(m []byte) []byte { m[3] |= 3; return m }), route: TagNoSuchHost},
 		{name: "SERVFAIL", msg: with(func(m []byte) []byte { m[3] |= 2; return m }), route: TagDNSServerError},
+		{name: "REFUSED with no question", msg: []byte{0x12, 0x34, 0x81, 0x85, 0, 0, 0, 0, 0, 0, 0, 0}, route: TagDNSServerError},
+		{name: "an answer with no question", msg: []byte{0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0}, route: TagBadDNSResponse},
+		{name: "NXDOMAIN with no question", msg: []byte{0x12, 0x34, 0x81, 0x83, 0, 0, 0, 0, 0, 0, 0, 0}, route: TagBadDNSResponse},
 		{name: "an address of the wrong size", msg: with(func(m []byte) []byte { m[len(m)-5] = 3; return m[:len(m)-1] }), addrs: nil},
 	}
 	for _, row := range rows {

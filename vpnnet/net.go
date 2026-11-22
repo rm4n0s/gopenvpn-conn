@@ -75,7 +75,7 @@ type Net struct {
 	has6   bool // the tunnel has an IPv6 address
 
 	resolver *net.Resolver
-	dnsStart atomic.Int32 // the index in dnsServers() where the next lookup starts
+	dnsDown  []atomic.Int64 // for each server of dnsServers(): until when it is tried after the others (Unix nanoseconds), 0 when it is good
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -113,6 +113,7 @@ func New(conn *openvpn.Conn, opts *Options) (*Net, error) {
 		n.has6 = n.has6 || p.Addr().Unmap().Is6()
 	}
 	n.resolver = &net.Resolver{PreferGo: true, Dial: n.dialDNS}
+	n.dnsDown = make([]atomic.Int64, len(n.dnsServers()))
 	if n.logger == nil {
 		n.logger = slog.New(slog.DiscardHandler)
 	}
@@ -245,7 +246,8 @@ func (n *Net) err() error {
 
 // Close ends the Net: its connections and listeners fail, its goroutines stop and,
 // with Options.CloseConn, the Conn is closed. When Close returns no goroutine of the
-// Net runs. Without CloseConn the read deadline of the Conn is cleared at the end.
+// Net runs. Without CloseConn the deadlines of the Conn are cleared at the end; a
+// Write of the Conn that the link does not take is interrupted after a second.
 // Close may be called more than once.
 func (n *Net) Close() error {
 	n.mu.Lock()
@@ -265,11 +267,42 @@ func (n *Net) Close() error {
 		n.logger.Debug("the read of the connection could not be interrupted", "err", err)
 	}
 	n.down()
+	if !n.opts.CloseConn {
+		n.waitForWriter()
+	}
 	n.wg.Wait()
 	if !n.opts.CloseConn {
-		if err := n.conn.SetReadDeadline(time.Time{}); err != nil && !errors.Is(err, net.ErrClosed) {
-			n.logger.Debug("the read deadline of the connection could not be cleared", "err", err)
+		if err := n.conn.SetDeadline(time.Time{}); err != nil && !errors.Is(err, net.ErrClosed) {
+			n.logger.Debug("the deadlines of the connection could not be cleared", "err", err)
 		}
 	}
 	return closeErr
+}
+
+// closeGrace is how long Close waits for a Write of the Conn that is under way before
+// it interrupts it.
+const closeGrace = time.Second
+
+// waitForWriter gives the goroutines a moment to return, and then interrupts a Write
+// of the Conn that does not: the link of the Conn takes no bytes (a TCP connection
+// whose peer does not read), and Close must not wait for it. On a stream link a
+// Write that is cut in the middle of a packet ends the Conn (it cannot go on), which
+// is why the moment is given first.
+func (n *Net) waitForWriter() {
+	done := make(chan struct{})
+	go func() {
+		n.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(closeGrace)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+	}
+	if err := n.conn.SetWriteDeadline(time.Unix(1, 0)); err != nil && !errors.Is(err, net.ErrClosed) {
+		n.logger.Debug("the write of the connection could not be interrupted", "err", err)
+	}
+	<-done
 }

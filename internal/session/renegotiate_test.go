@@ -13,7 +13,9 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/rm4n0s/errors"
 	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
+
 	"github.com/rm4n0s/gopenvpn-conn/internal/vpntest"
 	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
 )
@@ -252,27 +254,70 @@ func TestNoPacketIsLostAcrossRenegotiations(t *testing.T) {
 	}
 }
 
-func TestAFailedRenegotiationIsTriedAgain(t *testing.T) {
+// TestAFailedRenegotiationEndsTheSession: a renegotiation that does not finish ends
+// the session, with data flowing on the old key until then. A real server takes no
+// second soft reset of a session whose renegotiation failed (it has thrown its side
+// away, and the key ids are out of step), so trying again in the session, as this
+// library did, could not work: the caller dials again.
+func TestAFailedRenegotiationEndsTheSession(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := renegRig(t, transports[0], 0, "", vpntest.ServerOptions{RejectRenegotiations: 1}, nil)
 		if err := r.session.Handshake(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		// The first attempt starts at 10 s and gives up at 40 s; the second starts 5
-		// seconds later and works. The old key is good until 3610 s.
-		for range 5 {
+		start := time.Now()
+		// The attempt starts at 10 s and is given up at 40 s; the old key works until then.
+		for range 3 {
 			time.Sleep(10 * time.Second)
 			alive(t, r)
 			exchange(t, r, 1)
 		}
-		if n := r.server.Renegotiations(); n != 1 {
-			t.Fatalf("%d renegotiations, want 1 (the first was rejected)", n)
+		if err := r.session.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
 		}
-		if h := r.server.KeyHistory(); !slices.Equal(h, []uint8{0, 2}) {
-			t.Errorf("key ids %v, want 0, 2: the second attempt has the next id", h)
+		_, err := r.session.Read(make([]byte, 10))
+		wantRoute(t, err, TagRenegotiationFailed, "Session.loop->Session.renegTick.RenegotiationFailed")
+		if elapsed := time.Since(start); elapsed != 40*time.Second {
+			t.Errorf("the session ended after %v, want 40s", elapsed)
 		}
-		if err := r.session.Err(); err != nil {
-			t.Fatalf("the session ended: %v", err)
+		if appErr, _ := errors.FromError(err); appErr.Metadata["key_id"] != float64(1) && appErr.Metadata["key_id"] != uint8(1) {
+			t.Errorf("metadata = %v", appErr.Metadata)
+		}
+		if n := r.server.Renegotiations(); n != 0 {
+			t.Errorf("%d renegotiations: a second attempt was made", n)
+		}
+		if h := r.server.KeyHistory(); !slices.Equal(h, []uint8{0}) {
+			t.Errorf("key ids %v, want only 0", h)
+		}
+	})
+}
+
+// TestARenegotiationThatFailsForAReasonEndsTheSessionWithIt: the credentials cannot
+// be had for the renegotiation; the session ends with that error.
+func TestARenegotiationThatFailsForAReasonEndsTheSessionWithIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var asked atomic.Int32
+		const tagNoPrompt = "NoPrompt"
+		boom := errors.New(tagNoPrompt, "nobody is there to type the password")
+		r := renegRig(t, transports[0], 0, "", vpntest.ServerOptions{}, func(o *Options) {
+			o.AuthNoCache = true
+			o.Credentials = func(context.Context) (string, string, error) {
+				if asked.Add(1) > 1 {
+					return "", "", boom
+				}
+				return "alice", "secret", nil
+			}
+		})
+		if err := r.session.Handshake(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		_, err := r.session.Read(make([]byte, 10))
+		wantRoute(t, err, TagCredentialsFailed, ".CredentialsFailed")
+		if !errors.Is(err, boom) {
+			t.Errorf("the cause is lost: %v", err)
+		}
+		if got := time.Since(r.session.began); got < 10*time.Second || got > 11*time.Second {
+			t.Errorf("the session ended %v after its start, want at the renegotiation at 10 s", got)
 		}
 	})
 }
@@ -280,13 +325,14 @@ func TestAFailedRenegotiationIsTriedAgain(t *testing.T) {
 func TestTheSessionEndsWhenTheOldKeyExpires(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := renegRig(t, transports[0], 0, "", vpntest.ServerOptions{RejectRenegotiations: 1000}, func(o *Options) {
-			o.TransitionWindow = 40 * time.Second
+			o.TransitionWindow = 20 * time.Second
 		})
 		if err := r.session.Handshake(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		// The renegotiation starts at 10 s, so the old key ends at 50 s.
-		for range 5 {
+		// The renegotiation starts at 10 s, so the old key ends at 30 s, before the
+		// renegotiation is given up (at 40 s).
+		for range 4 {
 			time.Sleep(10 * time.Second)
 			if r.session.Err() == nil {
 				alive(t, r)

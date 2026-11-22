@@ -63,7 +63,8 @@ func NewClientKeyExchange(options, username, password, peerInfo string) *ClientK
 
 // AppendClientKeyExchange appends the message to dst: four zero bytes, the key
 // method, the random fields, and the four strings. A string is a 16-bit length
-// that counts the NUL at its end, the bytes and the NUL. A string that is too
+// that counts the NUL at its end, the bytes and the NUL; with no user name and no
+// password, those two are strings of length 0, with no NUL. A string that is too
 // long, or has a NUL inside, is refused: a user name or password is never part
 // of the error.
 func AppendClientKeyExchange(dst []byte, m *ClientKeyExchange) ([]byte, error) {
@@ -81,6 +82,7 @@ func AppendClientKeyExchange(dst []byte, m *ClientKeyExchange) ([]byte, error) {
 		{"password", m.Password, MaxCredentialLen},
 		{"peer info", m.PeerInfo, 0xffff},
 	}
+	noCredentials := m.Username == "" && m.Password == ""
 	for _, f := range fields {
 		if len(f.value)+1 > f.max {
 			return nil, errors.New(tagStringTooLong, "a string of the key exchange message is too long",
@@ -88,6 +90,13 @@ func AppendClientKeyExchange(dst []byte, m *ClientKeyExchange) ([]byte, error) {
 		}
 		if bytes.IndexByte([]byte(f.value), 0) >= 0 {
 			return nil, errors.New(tagStringHasNUL, "a string of the key exchange message has a NUL inside", "field", f.name)
+		}
+		if noCredentials && (f.name == "username" || f.name == "password") {
+			// OpenVPN: ssl.c key_method_2_write, write_empty_string: a client that has no
+			// user name and password to give writes two strings of length 0, with no NUL.
+			// A server that asks for them tells "none given" from "empty" by that.
+			dst = append(dst, 0, 0)
+			continue
 		}
 		dst = binary.BigEndian.AppendUint16(dst, uint16(min(len(f.value)+1, math.MaxUint16))) // checked above: at most 0xffff
 		dst = append(dst, f.value...)

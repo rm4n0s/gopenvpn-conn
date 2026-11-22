@@ -524,7 +524,7 @@ func TestWriteEndsTheSessionWhenThePacketIDsEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := r.session.Write([]byte{0x45, 2})
-		wantRoute(t, err, datachan.TagPacketIDExhausted, "Session.Write->Session.writeLocked->Sender.Seal.DataPacketIDExhausted")
+		wantRoute(t, err, datachan.TagPacketIDExhausted, "Session.Write->Session.writeLocked->Session.sealLocked->Sender.Seal.DataPacketIDExhausted")
 		if _, again := r.session.Read(make([]byte, 10)); again != err {
 			t.Errorf("Read = %v, want the same error", again)
 		}

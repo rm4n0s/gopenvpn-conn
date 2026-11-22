@@ -103,6 +103,57 @@ func TestDialFunction(t *testing.T) {
 	}
 }
 
+// TestDialServerPollTimeout: Config.ServerPollTimeout bounds the making of the link
+// and the wait for the first packet of the server, not the handshake.
+func TestDialServerPollTimeout(t *testing.T) {
+	t.Run("the link is not made in time", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			d := Dialer{
+				Config: &Config{ServerPollTimeout: 3 * time.Second, resetOnly: true},
+				DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				},
+			}
+			start := time.Now()
+			_, err := d.Dial(t.Context(), "tcp", "vpn.example:1194")
+			appErr, ok := errors.FromError(err)
+			if !ok || appErr.Tag != TagDialFailed || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Dial = %v, want %s caused by the deadline", err, TagDialFailed)
+			}
+			if elapsed := time.Since(start); elapsed != 3*time.Second {
+				t.Errorf("Dial gave up after %v, want 3s", elapsed)
+			}
+		})
+	})
+	for _, k := range kinds {
+		t.Run("a server that does not answer, "+k.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				p := protections()[0]
+				d, _ := dialerOver(t, k, p, vpntest.Silent, &Config{ControlWrap: p.wrap(t), resetOnly: true, ServerPollTimeout: 3 * time.Second, HandshakeTimeout: time.Minute})
+				start := time.Now()
+				network := "udp"
+				if k.stream {
+					network = "tcp"
+				}
+				_, err := d.Dial(t.Context(), network, "vpn.example:1194")
+				appErr, ok := errors.FromError(err)
+				if !ok || appErr.Tag != TagServerPollTimeout || !appErr.HasRoute("Session.loop.ServerPollTimeout") {
+					t.Fatalf("Dial = %v, want %s", err, TagServerPollTimeout)
+				}
+				if elapsed := time.Since(start); elapsed != 3*time.Second {
+					t.Errorf("Dial gave up after %v, want 3s", elapsed)
+				}
+			})
+		})
+	}
+	t.Run("a negative value is refused", func(t *testing.T) {
+		if err := (&Config{ServerPollTimeout: -time.Second}).Validate(); err == nil {
+			t.Error("a negative ServerPollTimeout is valid")
+		}
+	})
+}
+
 func TestDialUnsupportedNetwork(t *testing.T) {
 	for _, network := range []string{"", "unix", "ip", "udp5", "TCP", "tcp "} {
 		conn, err := Dial(t.Context(), network, "127.0.0.1:1", nil)

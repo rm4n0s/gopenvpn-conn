@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"time"
 
 	"github.com/rm4n0s/errors"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -123,7 +124,8 @@ func (t target) full() tcpip.FullAddress {
 // "tcp6", "udp", "udp4" or "udp6", and address is a host and a port. A host that is
 // not an IP address is looked up with LookupNetIP, through the tunnel, and the
 // addresses that it has (of the families that the tunnel has and the network allows)
-// are tried in order. The connection is a net.Conn whose errors are the ones of
+// are tried in order, each for a part of the time that ctx leaves (10 seconds each
+// but the last when ctx has no deadline). The connection is a net.Conn whose errors are the ones of
 // gVisor's gonet, which behave as those of the net package. ctx bounds the looking
 // up and the connecting only. After Close, and after the tunnel has ended,
 // DialContext returns the error that ended the Net: net.ErrClosed after Close.
@@ -142,18 +144,25 @@ func (n *Net) DialContext(ctx context.Context, network, address string) (net.Con
 	if err != nil {
 		return nil, err
 	}
-	var lastErr error
+	usable := addrs[:0:0]
 	for _, ip := range addrs {
 		ip = ip.Unmap()
-		if (ip.Is4() && !n.has4) || (ip.Is6() && !n.has6) {
-			continue
+		if (ip.Is4() && n.has4) || (ip.Is6() && n.has6) {
+			usable = append(usable, ip)
 		}
+	}
+	var lastErr error
+	for i, ip := range usable {
 		c := t
 		c.addr, c.family = ip, ipv4.ProtocolNumber
 		if ip.Is6() {
 			c.family = ipv6.ProtocolNumber
 		}
-		conn, err := n.dialTarget(ctx, network, address, c)
+		// Each address has a part of the time, so that one that does not answer leaves
+		// time for the next.
+		attempt, cancel := attemptContext(ctx, len(usable)-i)
+		conn, err := n.dialTarget(attempt, network, address, c)
+		cancel()
 		if err == nil {
 			return conn, nil
 		}
@@ -166,6 +175,30 @@ func (n *Net) DialContext(ctx context.Context, network, address string) (net.Con
 		return nil, errors.New(TagResolveFailed, "the host has no address that the tunnel can reach", "network", network, "address", address)
 	}
 	return nil, lastErr
+}
+
+// The time that one address of several gets in DialContext: with a deadline, an equal
+// part of what is left, and not less than attemptMin (as net.Dialer does); with no
+// deadline, attemptDefault, so that an address that does not answer does not take
+// the two minutes of the TCP connect before the next one is tried. The last address
+// has all the time that is left.
+const (
+	attemptMin     = 2 * time.Second
+	attemptDefault = 10 * time.Second
+)
+
+// attemptContext is the context of the attempt at one address, when left addresses
+// are still to be tried, this one among them.
+func attemptContext(ctx context.Context, left int) (context.Context, context.CancelFunc) {
+	if left <= 1 {
+		return ctx, func() {}
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithTimeout(ctx, attemptDefault)
+	}
+	part := max(time.Until(deadline)/time.Duration(left), attemptMin)
+	return context.WithTimeout(ctx, part)
 }
 
 // lookupNetwork is the network of the lookup for a dial: the families that the

@@ -379,9 +379,7 @@ func TestRefusedOptions(t *testing.T) {
 	}{
 		{"dev tap", "dev tap\n"}, {"dev tap0", "dev tap0\n"}, {"dev-type tap", "dev-type tap\n"},
 		{"remote-cert-tls client", "remote-cert-tls client\n"},
-		{"tls-version-min 1.1", "tls-version-min 1.1\n"}, {"tls-version-min 1.0", "tls-version-min 1.0\n"},
 		{"a group that crypto/tls does not have", "tls-groups X448\n"},
-		{"a cipher that is not AEAD and no data-ciphers", "cipher AES-256-CBC\n"},
 		{"an option in a connection block", "<connection>\nremote a\ntls-auth x\n</connection>\n"},
 		{"a block inside a connection block", "<connection>\nremote a\n<ca>\n</ca>\n</connection>\n"},
 		{"compression under setenv opt", "setenv opt compress lz4\n"},
@@ -452,7 +450,7 @@ func TestBadOptions(t *testing.T) {
 		{"keepalive with a word", "keepalive 10 x\n", "builder.hKeepalive.BadOption"},
 		{"keepalive with one argument", "keepalive 10\n", "apply.BadOption"},
 		{"tun-mtu that is not a number", "tun-mtu big\n", "builder.hTunMTU.BadOption"},
-		{"explicit-exit-notify of 0", "explicit-exit-notify 0\n", "builder.hExplicitExitNotify.BadOption"},
+		{"explicit-exit-notify that is not a number", "explicit-exit-notify often\n", "builder.hExplicitExitNotify.BadOption"},
 		{"pull-filter with an action that is not known", "pull-filter drop route\n", "builder.hPullFilter.BadOption"},
 		{"pull-filter with one argument", "pull-filter ignore\n", "apply.BadOption"},
 		{"key-direction that is not known", "key-direction 2\n", "builder.hKeyDirection.BadOption"},
@@ -618,6 +616,12 @@ func TestCiphers(t *testing.T) {
 		{"the cipher is already there", "data-ciphers AES-256-GCM:AES-128-GCM\ncipher AES-256-GCM\n", []string{"AES-256-GCM", "AES-128-GCM"}},
 		{"a cipher that is not AEAD next to data-ciphers", "data-ciphers AES-128-GCM\ncipher AES-256-CBC\n", []string{"AES-128-GCM"}},
 		{"the cipher is one of the defaults", "cipher chacha20-poly1305\n", []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}},
+		// What profiles of providers have: OpenVPN ignores a cipher that is not in the
+		// list of the negotiation, and offers its default list.
+		{"a cipher that is not AEAD and no data-ciphers", "cipher AES-256-CBC\n", nil},
+		{"DEFAULT in data-ciphers", "data-ciphers DEFAULT:AES-256-CBC\n", []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}},
+		{"DEFAULT after a cipher", "data-ciphers AES-192-GCM:DEFAULT\n", []string{"AES-192-GCM", "AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}},
+		{"an optional cipher", "data-ciphers AES-256-GCM:AES-128-GCM:?CHACHA20-POLY1305\n", []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -627,6 +631,59 @@ func TestCiphers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestProfilesOfTheRealWorld: options that OpenVPN 2.7 takes with no harm, which the
+// profiles of providers, of pfSense and of OpenVPN Access Server have, do not make
+// the profile unreadable.
+func TestProfilesOfTheRealWorld(t *testing.T) {
+	f := newFixture(t)
+	tests := []struct {
+		name, text string
+		ignored    string // one of Profile.Ignored
+	}{
+		{"cipher AES-256-CBC", "cipher AES-256-CBC\n", "cipher AES-256-CBC: not AEAD; the default ciphers are offered"},
+		{"data-ciphers-fallback", "data-ciphers AES-256-GCM\ndata-ciphers-fallback AES-256-CBC\n", "data-ciphers-fallback"},
+		{"tls-version-min 1.0", "tls-version-min 1.0\n", "tls-version-min 1.0: the lowest version is 1.2"},
+		{"tls-version-min 1.0 under setenv opt", "setenv opt tls-version-min 1.0 or-highest\n", "tls-version-min 1.0: the lowest version is 1.2"},
+		{"tls-version-min 1.1", "tls-version-min 1.1\n", "tls-version-min 1.1: the lowest version is 1.2"},
+		{"tun-ipv6", "tun-ipv6\n", "tun-ipv6"},
+		{"block-ipv6", "block-ipv6\n", "block-ipv6"},
+		{"disable-occ", "disable-occ\n", "disable-occ"},
+		{"redirect-private", "redirect-private def1\n", "redirect-private"},
+		{"route-metric", "route-metric 50\n", "route-metric"},
+		{"mtu-disc", "mtu-disc yes\n", "mtu-disc"},
+		{"status", "status /var/log/openvpn-status.log 10\n", "status"},
+		{"tls-cert-profile", "tls-cert-profile preferred\n", "tls-cert-profile"},
+		{"reneg-sec with two numbers", "reneg-sec 3600 3000\n", "reneg-sec: the second number"},
+		{"explicit-exit-notify 0", "explicit-exit-notify 0\n", "explicit-exit-notify 0: Close tells the server all the same"},
+		{"an option of a later version after FORWARD_COMPATIBLE", "setenv FORWARD_COMPATIBLE 1\nsome-option-of-3.0 x y\n", "some-option-of-3.0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := parseText(t, f.base()+tt.text)
+			if !slices.Contains(p.Ignored, tt.ignored) {
+				t.Errorf("Ignored = %v, want %q in it", p.Ignored, tt.ignored)
+			}
+			if err := p.Config.Validate(); err != nil {
+				t.Errorf("the Config is not valid: %v", err)
+			}
+		})
+	}
+	// TLS 1.2 stays the lowest version, whatever the profile says.
+	if p := parseText(t, f.base()+"tls-version-min 1.0\n"); p.Config.TLS.MinVersion != 0 && p.Config.TLS.MinVersion < tls.VersionTLS12 {
+		t.Errorf("MinVersion = %x after tls-version-min 1.0, want TLS 1.2 or the default", p.Config.TLS.MinVersion)
+	}
+	// reneg-sec takes the first number.
+	if p := parseText(t, f.base()+"reneg-sec 3600 3000\n"); p.Config.RenegotiateAfter != time.Hour {
+		t.Errorf("RenegotiateAfter = %v, want 1h", p.Config.RenegotiateAfter)
+	}
+	// Without FORWARD_COMPATIBLE, and before it, an option that is not known is an error.
+	_, err := Parse(strings.NewReader(f.base() + "some-option-of-3.0 x\nsetenv FORWARD_COMPATIBLE 1\n"))
+	wantErr(t, err, TagUnsupportedOption, "apply.UnsupportedOption")
+	// An option that is refused stays refused after it.
+	_, err = Parse(strings.NewReader(f.base() + "setenv FORWARD_COMPATIBLE 1\ncompress lz4\n"))
+	wantErr(t, err, TagUnsupportedOption, "apply.UnsupportedOption")
 }
 
 func TestFingerprintsInABlock(t *testing.T) {

@@ -60,15 +60,24 @@ func TestAppendClientKeyExchange(t *testing.T) {
 	}
 }
 
+// TestAppendClientKeyExchangeEmptyCredentials: with no user name and no password the
+// two strings have the length 0 and no NUL, as OpenVPN's client writes them
+// (write_empty_string); they used to be a length of 1 and a NUL, which a server reads
+// as credentials that are empty, not as none.
 func TestAppendClientKeyExchangeEmptyCredentials(t *testing.T) {
-	got, err := AppendClientKeyExchange(nil, &ClientKeyExchange{Options: "o", PeerInfo: "p"})
-	if err != nil {
-		t.Fatal(err)
+	strings := func(m *ClientKeyExchange) []byte {
+		got, err := AppendClientKeyExchange(nil, m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got[5+48+32+32:]
 	}
-	// An absent user name or password is the empty string: length 1, one NUL.
-	tail := got[len(got)-len("\x00\x02o\x00\x00\x01\x00\x00\x01\x00\x00\x02p\x00"):]
-	if want := []byte("\x00\x02o\x00\x00\x01\x00\x00\x01\x00\x00\x02p\x00"); !bytes.Equal(tail, want) {
-		t.Errorf("strings = %q, want %q", tail, want)
+	if got, want := strings(&ClientKeyExchange{Options: "o", PeerInfo: "p"}), []byte("\x00\x02o\x00\x00\x00\x00\x00\x00\x02p\x00"); !bytes.Equal(got, want) {
+		t.Errorf("no credentials: strings = %q, want %q", got, want)
+	}
+	// One of the two is enough for both to be written as strings.
+	if got, want := strings(&ClientKeyExchange{Options: "o", Password: "t", PeerInfo: "p"}), []byte("\x00\x02o\x00\x00\x01\x00\x00\x02t\x00\x00\x02p\x00"); !bytes.Equal(got, want) {
+		t.Errorf("a password and no user name: strings = %q, want %q", got, want)
 	}
 }
 

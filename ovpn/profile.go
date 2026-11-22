@@ -16,8 +16,8 @@ import (
 	openvpn "github.com/rm4n0s/gopenvpn-conn"
 )
 
-// DefaultConnectTimeout is how long the connection to one remote may take, the link
-// and the handshake together, when the profile has no connect-timeout: OpenVPN's 120
+// DefaultConnectTimeout is how long one remote has to answer (the link, and the first
+// packet of the server) when the profile has no connect-timeout: OpenVPN's 120
 // seconds.
 const DefaultConnectTimeout = 120 * time.Second
 
@@ -42,8 +42,10 @@ type Profile struct {
 	Remotes []Remote
 	// RemoteRandom is true when the profile has remote-random.
 	RemoteRandom bool
-	// ConnectTimeout is how long the link and the handshake to one remote may take
-	// (connect-timeout); DefaultConnectTimeout when the profile has none.
+	// ConnectTimeout is how long one remote has to answer: for the link to be made
+	// and the first packet of the server to come (connect-timeout, or
+	// server-poll-timeout); DefaultConnectTimeout when the profile has none. It does
+	// not bound the handshake with a server that has answered.
 	ConnectTimeout time.Duration
 	// NeedsCredentials is true when the profile has auth-user-pass with no file: the
 	// caller has to set Config.Credentials before it dials.

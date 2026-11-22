@@ -128,6 +128,16 @@ func (s *Session) loop() {
 	reneg := time.NewTimer(time.Hour)
 	reneg.Stop()
 	defer reneg.Stop()
+	// The server must answer within ServerPollTimeout; once it has, only the time of
+	// the handshake is left to bound the rest (the TLS handshake, a slow login).
+	//
+	// OpenVPN: forward.c check_server_poll_timeout.
+	var poll <-chan time.Time
+	if d := s.opts.ServerPollTimeout; d > 0 {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		poll = t.C
+	}
 
 	if _, err := s.ks0.sender.Queue(s.ks0.resetOp, nil); err != nil {
 		s.fail(err)
@@ -204,6 +214,13 @@ func (s *Session) loop() {
 		case err := <-s.readErr:
 			s.fail(err)
 			return
+		case <-poll:
+			poll = nil
+			if !s.haveRemote {
+				s.fail(errors.New(TagServerPollTimeout, "the server did not answer in time",
+					"timeout", s.opts.ServerPollTimeout.String()))
+				return
+			}
 		case <-handshake.C:
 			s.fail(errors.New(TagHandshakeTimeout, "the handshake did not finish in time",
 				"timeout", s.opts.HandshakeTimeout.String()))
@@ -219,8 +236,22 @@ func (s *Session) loop() {
 	}
 }
 
-// closeLink closes the link, once the loop is done with it.
+// closeLink closes the link, once the loop is done with it. After Close (not after a
+// failure) the writer of the link first sends what the loop gave it, for at most
+// exitWait: the write deadline that is set here ends a write that the link does not
+// take.
 func (s *Session) closeLink() {
+	close(s.loopDone)
+	if s.closing.Load() {
+		if err := s.opts.Link.SetWriteDeadline(time.Now().Add(exitWait)); err == nil {
+			timer := time.NewTimer(2 * exitWait)
+			select {
+			case <-s.ctlDone:
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+	}
 	if err := s.opts.Link.Close(); err != nil {
 		s.mu.Lock()
 		s.closeErr = errors.NewErr(tagLinkCloseFailed, err)
@@ -336,7 +367,7 @@ func (s *Session) addAcks(ks *keyState, c *wire.Control) {
 	}
 }
 
-// send protects a control packet and writes it to the link.
+// send protects a control packet and gives it to the writer of the link.
 func (s *Session) send(ks *keyState, c *wire.Control) error {
 	var err error
 	if s.body, err = wire.AppendControlBody(s.body[:0], c); err != nil {
@@ -345,16 +376,16 @@ func (s *Session) send(ks *keyState, c *wire.Control) error {
 	if s.packet, err = ks.wrap.Wrap(s.packet[:0], wire.FirstByte(c.Opcode, c.KeyID), c.SessionID, s.body); err != nil {
 		return err
 	}
-	out := s.packet
+	// The writer of the link sends it: the loop does not wait for the link.
+	var out []byte
 	if s.opts.Stream {
 		if out, err = wire.AppendFrame(nil, s.packet); err != nil {
 			return err
 		}
+	} else {
+		out = append(out, s.packet...)
 	}
-	if _, err := s.writeLink(out, time.Time{}); err != nil {
-		return errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
-	}
-	s.touchSent()
+	s.queueForLink(out)
 	if ks.peerReset && len(c.Acks) > 0 {
 		ks.thirdSent = true
 	}
@@ -445,6 +476,7 @@ func (s *Session) handle(raw []byte) {
 	s.lastRecv = time.Now()
 	if !s.haveRemote {
 		s.remote, s.haveRemote = c.SessionID, true
+		s.sawServer.Store(true)
 	}
 	for _, id := range c.Acks {
 		ks.sender.Ack(id)
@@ -646,6 +678,9 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 	}
 	for _, name := range pushed.Unknown {
 		s.log.Warn("the server pushed an option that is not known", "option", name)
+	}
+	for _, o := range pushed.Skipped {
+		s.log.Warn("the server pushed an option that cannot be read; it is left out", "option", o.Option, "problem", o.Problem)
 	}
 	state := s.tlsConn.ConnectionState()
 	if err := s.setupData(pushed, &state); err != nil {

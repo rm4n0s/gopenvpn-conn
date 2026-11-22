@@ -12,6 +12,7 @@ import (
 	"encoding/asn1"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -43,9 +44,11 @@ type TLSOptions struct {
 	// Certificates is the client's certificate and key (the profile's cert and
 	// key). The servers that are set up as usual refuse a client without one.
 	Certificates []tls.Certificate
-	// RemoteCertTLSServer requires the server's certificate to be good for a
-	// TLS server: the extended key usage "TLS Web Server Authentication"
-	// (--remote-cert-tls server).
+	// RemoteCertTLSServer requires the server's certificate to be one for a TLS
+	// server, as --remote-cert-tls server does: it must have a key usage
+	// extension and the extended key usage "TLS Web Server Authentication". A
+	// certificate with no extended key usage is refused. Without it a client's
+	// certificate of the same authority can pass for the server's.
 	RemoteCertTLSServer bool
 	// MinVersion is the lowest TLS version, tls.VersionTLS12 or
 	// tls.VersionTLS13; zero means TLS 1.2, which is also the lowest that the
@@ -113,11 +116,14 @@ func verifyServer(o *TLSOptions, cs tls.ConnectionState) error {
 	usages := []x509.ExtKeyUsage{x509.ExtKeyUsageAny}
 	if o.RemoteCertTLSServer {
 		usages = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		if err := checkServerUsage(leaf); err != nil {
+			return err
+		}
 	}
 	if len(o.PeerFingerprints) > 0 && o.RootCAs == nil {
 		// Pinned: no chain to verify, but the certificate must still be good now, and for
 		// a server when the profile says so.
-		if err := checkPinned(leaf, o.RemoteCertTLSServer); err != nil {
+		if err := checkPinned(leaf); err != nil {
 			return err
 		}
 	} else {
@@ -135,9 +141,29 @@ func verifyServer(o *TLSOptions, cs tls.ConnectionState) error {
 	return nil
 }
 
+// checkServerUsage is the check of --remote-cert-tls server: the certificate has a
+// key usage extension, and its extended key usage names "TLS Web Server
+// Authentication". A certificate with no extended key usage, or with "any", does not
+// pass, though crypto/x509 reads those as good for every use: a client's certificate
+// of an authority that puts no usage in its certificates would else pass for the
+// server's, which is the attack that the option is there to stop.
+//
+// OpenVPN: options.c remote-cert-tls (remote_cert_ku[0] = OPENVPN_KU_REQUIRED,
+// remote_cert_eku = "TLS Web Server Authentication"), ssl_verify_openssl.c
+// x509_verify_cert_ku, x509_verify_cert_eku.
+func checkServerUsage(leaf *x509.Certificate) error {
+	if leaf.KeyUsage == 0 {
+		return errors.New(TagServerCertificateUsage, "the server's certificate has no key usage extension, which remote-cert-tls server requires", "missing", "key usage")
+	}
+	if !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+		return errors.New(TagServerCertificateUsage, "the server's certificate does not have the extended key usage of a TLS server, which remote-cert-tls server requires", "missing", "extended key usage serverAuth")
+	}
+	return nil
+}
+
 // checkPinned checks what is left to check of a certificate that is trusted by its
-// fingerprint: that it is valid now, and good for a TLS server when asked.
-func checkPinned(leaf *x509.Certificate, server bool) error {
+// fingerprint: that it is valid now.
+func checkPinned(leaf *x509.Certificate) error {
 	now := time.Now()
 	switch {
 	case now.Before(leaf.NotBefore):
@@ -145,15 +171,7 @@ func checkPinned(leaf *x509.Certificate, server bool) error {
 	case now.After(leaf.NotAfter):
 		return x509.CertificateInvalidError{Cert: leaf, Reason: x509.Expired, Detail: "the certificate has expired"}
 	}
-	if !server || len(leaf.ExtKeyUsage) == 0 && len(leaf.UnknownExtKeyUsage) == 0 {
-		return nil // no extended key usage means any, as crypto/x509 reads it
-	}
-	for _, u := range leaf.ExtKeyUsage {
-		if u == x509.ExtKeyUsageServerAuth || u == x509.ExtKeyUsageAny {
-			return nil
-		}
-	}
-	return x509.CertificateInvalidError{Cert: leaf, Reason: x509.IncompatibleUsage}
+	return nil
 }
 
 // checkName compares the name of the profile with the server's certificate.
@@ -250,6 +268,10 @@ const (
 	// fingerprints of TLSOptions.PeerFingerprints. Metadata: "fingerprint" (the
 	// server's, in hexadecimal).
 	TagServerFingerprintMismatch = "ServerFingerprintMismatch"
+	// TagServerCertificateUsage: TLSOptions.RemoteCertTLSServer is set and the
+	// server's certificate has no key usage extension, or its extended key usage
+	// does not name a TLS server. Metadata: "missing".
+	TagServerCertificateUsage = "ServerCertificateUsage"
 	// TagServerNameMismatch: the server's certificate does not have the name that
 	// TLSOptions.VerifyName asks for. Metadata: "subject", "want".
 	TagServerNameMismatch = "ServerNameMismatch"

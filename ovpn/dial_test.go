@@ -20,12 +20,12 @@ import (
 type attempt struct {
 	network, address string
 	config           *openvpn.Config
-	timeLeft         time.Duration // what the context of the attempt had left
+	timeLeft         time.Duration // the ServerPollTimeout of the attempt's Config
 }
 
 // fakeDialer answers the n-th call with results[n], and records the calls. A result
-// with a nil conn and a nil err blocks until the context is done, like a server
-// that does not answer, and returns the error of the context.
+// with a nil conn and a nil err is a server that does not answer: it blocks for the
+// ServerPollTimeout of the Config, as openvpn.Dial does, or until the context is done.
 type fakeDialer struct {
 	results []fakeResult
 	calls   []attempt
@@ -37,15 +37,18 @@ type fakeResult struct {
 }
 
 func (d *fakeDialer) dial(ctx context.Context, network, address string, config *openvpn.Config) (*openvpn.Conn, error) {
-	a := attempt{network: network, address: address, config: config}
-	if dl, ok := ctx.Deadline(); ok {
-		a.timeLeft = time.Until(dl)
-	}
+	a := attempt{network: network, address: address, config: config, timeLeft: config.ServerPollTimeout}
 	d.calls = append(d.calls, a)
 	r := d.results[len(d.calls)-1]
 	if r.conn == nil && r.err == nil {
-		<-ctx.Done()
-		return nil, errors.NewErr(tagFakeNoAnswer, ctx.Err())
+		timer := time.NewTimer(config.ServerPollTimeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil, errors.New(tagFakeNoAnswer, "the server did not answer")
+		case <-ctx.Done():
+			return nil, errors.NewErr(tagFakeNoAnswer, ctx.Err())
+		}
 	}
 	return r.conn, r.err
 }
@@ -66,7 +69,7 @@ func threeRemotes() []Remote {
 
 func TestProfileDialOrder(t *testing.T) {
 	conn := &openvpn.Conn{}
-	cfg := &openvpn.Config{}
+	cfg := &openvpn.Config{MTU: 1400}
 	rows := []struct {
 		name      string
 		random    bool
@@ -106,9 +109,13 @@ func TestProfileDialOrder(t *testing.T) {
 				t.Errorf("tried %v, want %v", d.addresses(), row.wantCalls)
 			}
 			for _, c := range d.calls {
-				if c.config != cfg {
-					t.Errorf("the attempt at %s got another Config", c.address)
+				// A copy of the profile's Config, with the time for the server to answer.
+				if c.config.MTU != 1400 || c.config.ServerPollTimeout != 5*time.Second {
+					t.Errorf("the attempt at %s got the Config %+v", c.address, c.config)
 				}
+			}
+			if cfg.ServerPollTimeout != 0 {
+				t.Errorf("the Config of the profile was changed: ServerPollTimeout = %v", cfg.ServerPollTimeout)
 			}
 		})
 	}
@@ -259,13 +266,37 @@ func TestProfileDialTimeout(t *testing.T) {
 			t.Errorf("timeout = %v, want %v", d.calls[0].timeLeft, DefaultConnectTimeout)
 		}
 
+		// A Config that has a ServerPollTimeout of its own keeps it.
+		d = &fakeDialer{results: []fakeResult{{conn: conn}}}
+		p = &Profile{Config: &openvpn.Config{ServerPollTimeout: 3 * time.Second}, Remotes: threeRemotes(), ConnectTimeout: 9 * time.Second}
+		if _, err := p.dial(t.Context(), inOrder, d.dial); err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		if d.calls[0].timeLeft != 3*time.Second {
+			t.Errorf("timeout = %v, want the 3 s of the Config", d.calls[0].timeLeft)
+		}
+		// The context of the attempt is the caller's: the time of the handshake with a
+		// server that has answered is not cut by ConnectTimeout.
+		d = &fakeDialer{results: []fakeResult{{conn: conn}}}
+		var deadlines int
+		p = &Profile{Config: &openvpn.Config{}, Remotes: threeRemotes(), ConnectTimeout: time.Second}
+		_, err = p.dial(t.Context(), inOrder, func(ctx context.Context, network, address string, config *openvpn.Config) (*openvpn.Conn, error) {
+			if _, ok := ctx.Deadline(); ok {
+				deadlines++
+			}
+			return d.dial(ctx, network, address, config)
+		})
+		if err != nil || deadlines != 0 {
+			t.Errorf("dial = %v; %d attempts had a deadline on their context, want none", err, deadlines)
+		}
+
 		// Every remote times out: the error is the one of the last, and the tries are counted.
 		d = &fakeDialer{results: []fakeResult{{}, {}, {}}}
 		p = &Profile{Config: &openvpn.Config{}, Remotes: threeRemotes(), ConnectTimeout: 2 * time.Second}
 		start = time.Now()
 		_, err = p.dial(t.Context(), inOrder, d.dial)
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("err = %v, want the deadline of the last remote", err)
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != tagFakeNoAnswer {
+			t.Errorf("err = %v, want the one of the last remote, which did not answer", err)
 		}
 		if appErr, ok := errors.FromError(err); !ok || appErr.Metadata["remotes_tried"] != 3 {
 			t.Errorf("metadata of %v", err)

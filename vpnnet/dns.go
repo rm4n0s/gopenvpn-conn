@@ -6,6 +6,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/rm4n0s/errors"
 )
@@ -24,8 +25,8 @@ const dnsPort = 53
 // Resolver returns a *net.Resolver whose queries go through the tunnel to the DNS
 // servers of Options.DNSServers, or, when there are none, to the ones that the VPN
 // server pushed, one after the other: a server whose answers fail (an error, or no
-// answer in time) is left, and the next one is tried at the next attempt of the
-// resolver. With no DNS server (none pushed, none in Options) every lookup fails (the
+// answer in time) is tried after the others for a while (dnsCooldown), so the next
+// attempt of the resolver goes to the next one. With no DNS server (none pushed, none in Options) every lookup fails (the
 // *net.DNSError says that there is no server: the standard library keeps the text of
 // the error of a Dial function, not the error).
 //
@@ -62,39 +63,64 @@ func (n *Net) dnsServers() []netip.AddrPort {
 	return out
 }
 
-// noteDNS records the result of a query to the server at index of count: the server
-// that answered is the one to start with; one that failed gives its place to the
-// next, unless another query has moved on.
-func (n *Net) noteDNS(index, count int, err error) {
-	if err == nil {
-		n.dnsStart.Store(int32(index & 0xff))
+// dnsCooldown is how long a DNS server that failed is tried after the others. Then it
+// has its place again: the first server of the list is the one that the VPN means to
+// be asked (an internal one before a public one, say), so one lost answer must not
+// move the lookups to the next server for good.
+const dnsCooldown = 30 * time.Second
+
+// dnsOrder is the order in which count servers are tried: the ones that have not
+// failed lately in the order of the list, then the ones that have, so that every
+// server is tried when the good ones fail.
+func (n *Net) dnsOrder(count int) []int {
+	now := time.Now().UnixNano()
+	order := make([]int, 0, count)
+	var down []int
+	for i := range count {
+		if i < len(n.dnsDown) && n.dnsDown[i].Load() > now {
+			down = append(down, i)
+			continue
+		}
+		order = append(order, i)
+	}
+	return append(order, down...)
+}
+
+// noteDNS records how the server at index did: one that failed (an error, no answer
+// in time) is tried after the others for dnsCooldown; one that answered is in its
+// place. "No such name" is an answer.
+func (n *Net) noteDNS(index int, err error) {
+	if index >= len(n.dnsDown) {
 		return
 	}
-	n.dnsStart.CompareAndSwap(int32(index&0xff), int32((index+1)%count&0xff))
+	if err == nil {
+		n.dnsDown[index].Store(0)
+		return
+	}
+	n.dnsDown[index].Store(time.Now().Add(dnsCooldown).UnixNano())
 }
 
 // dialDNS is the Dial function of the resolver. It connects to the first DNS server
-// that takes a connection, from the one that worked last; the address that the
-// resolver asked for is not used.
+// that takes a connection, in the order of dnsOrder; the address that the resolver
+// asked for is not used.
 func (n *Net) dialDNS(ctx context.Context, network, _ string) (net.Conn, error) {
 	servers := n.dnsServers()
 	if len(servers) == 0 {
 		return nil, errors.New(TagNoDNSServers, "no DNS server that the tunnel can reach: none was pushed and Options.DNSServers has none")
 	}
-	start := int(n.dnsStart.Load())
 	var lastErr error
-	for i := range servers {
-		idx := (start + i) % len(servers)
+	for _, idx := range n.dnsOrder(len(servers)) {
 		server := servers[idx]
 		conn, err := n.DialContext(ctx, network, server.String())
 		if err != nil {
+			n.noteDNS(idx, err)
 			lastErr = err
 			if ctx.Err() != nil {
 				break
 			}
 			continue
 		}
-		c := dnsConn{Conn: conn, n: n, index: idx, count: len(servers)}
+		c := dnsConn{Conn: conn, n: n, index: idx}
 		if pc, ok := conn.(net.PacketConn); ok {
 			// The resolver tells a datagram connection from a stream by the type.
 			return &dnsPacketConn{dnsConn: c, pc: pc}, nil
@@ -104,17 +130,16 @@ func (n *Net) dialDNS(ctx context.Context, network, _ string) (net.Conn, error) 
 	return nil, lastErr
 }
 
-// dnsConn is a connection to a DNS server that tells the Net how the server did: the
-// first server whose read fails is left for the next one.
+// dnsConn is a connection to a DNS server that tells the Net how the server did: a
+// server whose read fails is tried after the others for a while.
 type dnsConn struct {
 	net.Conn
 	n     *Net
 	index int // the server in dnsServers
-	count int
 }
 
 // note records the result of a read.
-func (c *dnsConn) note(err error) { c.n.noteDNS(c.index, c.count, err) }
+func (c *dnsConn) note(err error) { c.n.noteDNS(c.index, err) }
 
 func (c *dnsConn) Read(b []byte) (int, error) {
 	size, err := c.Conn.Read(b)

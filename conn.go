@@ -21,6 +21,10 @@ const (
 	// TagHandshakeTimeout: the handshake did not finish within
 	// Config.HandshakeTimeout. Metadata: "timeout".
 	TagHandshakeTimeout = session.TagHandshakeTimeout
+	// TagServerPollTimeout: no packet of the server came within
+	// Config.ServerPollTimeout: the server is not there, or a firewall drops the
+	// packets. Metadata: "timeout".
+	TagServerPollTimeout = session.TagServerPollTimeout
 	// TagLinkFailed: reading or writing the link to the server failed. The
 	// cause (an io.EOF, a closed connection) can be found with errors.Is.
 	// Metadata: "op" ("read" or "write").
@@ -83,23 +87,28 @@ type Conn struct {
 // takes conn over: Close closes it, and so does the end of the session. A nil
 // config is the zero Config.
 func Client(conn net.Conn, config *Config) *Conn {
-	return newConn(conn, true, config)
+	return newConn(conn, true, config, 0)
 }
 
 // PacketClient is Client for a connected datagram socket: each Read and Write
 // of conn is one packet.
 func PacketClient(conn net.Conn, config *Config) *Conn {
-	return newConn(conn, false, config)
+	return newConn(conn, false, config, 0)
 }
 
-func newConn(link net.Conn, stream bool, config *Config) *Conn {
+// newConn makes a Conn over link. poll, when it is not zero, is what is left of
+// Config.ServerPollTimeout after Dial made the link.
+func newConn(link net.Conn, stream bool, config *Config, poll time.Duration) *Conn {
 	if config == nil {
 		config = &Config{}
 	}
+	if poll == 0 {
+		poll = config.ServerPollTimeout
+	}
 	opts := session.Options{
 		Link: link, Stream: stream, Logger: config.Logger,
-		HandshakeTimeout: config.HandshakeTimeout,
-		TLS:              config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config), EpochUsageLimit: config.epochUsageLimit,
+		HandshakeTimeout: config.HandshakeTimeout, ServerPollTimeout: poll,
+		TLS: config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config), EpochUsageLimit: config.epochUsageLimit,
 		PingInterval: config.PingInterval, PingTimeout: config.PingTimeout,
 		RenegotiateAfter: renegotiateAfter(config), RetransmitTimeout: config.RetransmitTimeout,
 		PullFilter: config.pullFilter(), AuthNoCache: config.AuthNoCache,

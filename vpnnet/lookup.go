@@ -61,9 +61,10 @@ const (
 // servers of the VPN alone, and the name is asked as it is given, with no search list
 // and no "ndots". host may be an IP address, which is returned as it is.
 //
-// The servers are tried in order, starting with the one that answered last. A server
-// that fails (an error, or no answer in time) gives its place to the next one; "no such
-// name" is an answer and ends the lookup. ctx bounds the lookup. The errors are tagged
+// The servers are tried in order. A server that fails (an error, or no answer in time)
+// gives its place to the next one, and is tried after the others for the next half
+// minute; "no such name" is an answer, and no other server is asked. ctx bounds the
+// lookup. The errors are tagged
 // (TagNoSuchHost, TagNoDNSServers, TagDNSQueryFailed, ...); after Close, and after the
 // tunnel has ended, the error is the one that ended the Net, as for DialContext.
 func (n *Net) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
@@ -96,13 +97,14 @@ func (n *Net) LookupNetIP(ctx context.Context, network, host string) ([]netip.Ad
 	for _, t := range types {
 		got, err := n.exchange(ctx, host, t)
 		if err != nil {
-			// A name that does not exist has no record of any type, and a context that
-			// is done ends the lookup; another failure (a server error, no answer) may
-			// be of this type only, so the other type is still asked.
-			if ctx.Err() != nil || isTag(err, TagNoSuchHost) {
+			if ctx.Err() != nil {
 				return nil, err
 			}
-			if firstErr == nil {
+			// The other type is still asked, also after "no such name": some servers
+			// say that for the AAAA of a name that has an A (RFC 4074 §4.2), and the
+			// addresses of the one type are the answer then. When no type has an
+			// address, a failure is reported before "no such name", which it may hide.
+			if firstErr == nil || isTag(firstErr, TagNoSuchHost) {
 				firstErr = err
 			}
 			continue
@@ -138,9 +140,9 @@ func isTag(err error, tag string) bool {
 	return ok && appErr.Tag == tag
 }
 
-// exchange asks the DNS servers for the records of qtype of name, in order from the one
-// that answered last. The first answer is the result; a name that does not exist ends
-// the search.
+// exchange asks the DNS servers for the records of qtype of name, in the order of
+// dnsOrder. The first answer is the result; a name that does not exist ends the
+// search.
 func (n *Net) exchange(ctx context.Context, name string, qtype uint16) ([]netip.Addr, error) {
 	servers := n.dnsServers()
 	if len(servers) == 0 {
@@ -154,16 +156,16 @@ func (n *Net) exchange(ctx context.Context, name string, qtype uint16) ([]netip.
 	if err != nil {
 		return nil, err
 	}
-	start := int(n.dnsStart.Load())
 	var lastErr error
-	for i := range servers {
-		idx := (start + i) % len(servers)
+	for _, idx := range n.dnsOrder(len(servers)) {
 		addrs, err := n.queryServer(ctx, servers[idx], query, qtype)
 		if err == nil || isTag(err, TagNoSuchHost) {
-			n.noteDNS(idx, len(servers), nil)
+			n.noteDNS(idx, nil)
 			return addrs, err
 		}
-		n.noteDNS(idx, len(servers), err)
+		if ctx.Err() == nil {
+			n.noteDNS(idx, err) // not the server's fault when the caller gave up
+		}
 		lastErr = err
 		if ctx.Err() != nil {
 			break
@@ -349,15 +351,20 @@ func parseResponse(msg, query []byte, qtype uint16, server netip.AddrPort) (addr
 		return nil, false, errors.New(TagBadDNSResponse, "the message is not the response to a query", "reason", "flags")
 	}
 	// The question must be the one that was asked; names are not case sensitive, and
-	// some servers change the case.
-	if binary.BigEndian.Uint16(msg[4:]) != 1 || len(msg) < len(query) ||
-		!equalASCIIFold(msg[12:len(query)], query[12:]) {
-		return nil, false, errors.New(TagBadDNSResponse, "the question is not the one that was asked", "reason", "question")
+	// some servers change the case. A server may leave the question out of an answer
+	// that is an error (REFUSED, SERVFAIL, a query that it could not read): the id is
+	// then all that ties it to the query, and it is taken as the error that it is, so
+	// that the next server is asked at once and not after the wait for an answer.
+	rcode := flags & 0xf
+	if questions := binary.BigEndian.Uint16(msg[4:]); questions != 0 || rcode == 0 || rcode == 3 {
+		if questions != 1 || len(msg) < len(query) || !equalASCIIFold(msg[12:len(query)], query[12:]) {
+			return nil, false, errors.New(TagBadDNSResponse, "the question is not the one that was asked", "reason", "question")
+		}
 	}
 	if flags&0x0200 != 0 {
 		return nil, true, nil
 	}
-	switch rcode := flags & 0xf; rcode {
+	switch rcode {
 	case 0:
 	case 3:
 		return nil, false, errors.New(TagNoSuchHost, "the DNS server says that the name does not exist", "server", server.String())

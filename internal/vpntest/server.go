@@ -909,7 +909,8 @@ func (s *Server) KeyExchange() *ClientKeyExchange {
 
 // parseClientKX reads the client's message the way the plan describes it: 4 zero
 // bytes, 1 byte 2, 48 + 32 + 32 random bytes, then four strings, each with a
-// 16-bit length that counts its NUL. It returns what is wrong with the message,
+// 16-bit length that counts its NUL (the user name and the password may have the
+// length 0: none given). It returns what is wrong with the message,
 // in words, or "" when nothing is.
 func parseClientKX(b []byte) (*ClientKeyExchange, string) {
 	if len(b) < 5+48+32+32 {
@@ -928,6 +929,9 @@ func parseClientKX(b []byte) (*ClientKeyExchange, string) {
 		}
 		n := int(binary.BigEndian.Uint16(rest))
 		rest = rest[2:]
+		if n == 0 && (i == 1 || i == 2) {
+			continue // no user name, no password: OpenVPN's client writes a length of 0
+		}
 		if n < 1 || len(rest) < n || rest[n-1] != 0 {
 			return nil, "string " + strconv.Itoa(i) + " is not " + strconv.Itoa(n) + " bytes that end in a NUL"
 		}

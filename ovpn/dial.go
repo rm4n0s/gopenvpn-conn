@@ -26,8 +26,11 @@ const (
 
 // Dial connects to the first remote of the profile that answers and returns when
 // the handshake with it is complete, as openvpn.Dial does. Each remote gets
-// ConnectTimeout for the link and the handshake together; when it fails, or the
-// time is up, the next remote is tried (in a random order with RemoteRandom). When
+// ConnectTimeout to answer: for the link to be made and the first packet of the
+// server to come (it is Config.ServerPollTimeout of the attempt). A server that has
+// answered has the time of the handshake (Config.HandshakeTimeout) to finish it, so
+// that a slow login is not cut short. When a remote fails, the next one is tried (in
+// a random order with RemoteRandom). When
 // every remote failed, Dial returns the error of the last one, with the metadata
 // "remotes_tried" (how many were tried) and "remotes" (how many the profile has).
 // When ctx is done, Dial stops at once and returns the error of the remote that it
@@ -35,8 +38,8 @@ const (
 //
 // A profile with auth-user-pass and no file needs Config.Credentials to be set
 // before Dial (Profile.NeedsCredentials says so); without it, Dial returns
-// TagCredentialsMissing and tries no remote. The Config is shared by the
-// connections and is not changed.
+// TagCredentialsMissing and tries no remote. The Config is not changed: each attempt
+// has a copy of it with ServerPollTimeout set, unless the Config has one of its own.
 func (p *Profile) Dial(ctx context.Context) (*openvpn.Conn, error) {
 	return p.dial(ctx, shuffled, openvpn.Dial)
 }
@@ -59,14 +62,21 @@ func (p *Profile) dial(
 	if timeout <= 0 {
 		timeout = DefaultConnectTimeout
 	}
+	// OpenVPN: forward.c check_server_poll_timeout (connect-timeout ends an attempt
+	// only while no packet of the server has come).
+	var cfg openvpn.Config
+	if p.Config != nil {
+		cfg = *p.Config
+	}
+	if cfg.ServerPollTimeout == 0 {
+		cfg.ServerPollTimeout = timeout
+	}
 	// Deviation: one round through the remotes, not the endless rounds of --connect-retry (SPEC §20 V13).
 	var lastErr error
 	tried := 0
 	for _, i := range order(len(p.Remotes), p.RemoteRandom) {
 		r := p.Remotes[i]
-		attempt, cancel := context.WithTimeout(ctx, timeout)
-		conn, err := dialOne(attempt, r.Network, r.Address, p.Config)
-		cancel()
+		conn, err := dialOne(ctx, r.Network, r.Address, &cfg)
 		tried++
 		if err == nil {
 			return conn, nil

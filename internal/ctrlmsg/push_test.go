@@ -274,6 +274,65 @@ func TestPushedParts(t *testing.T) {
 	}
 }
 
+// TestPushedOptionsThatCannotBeReadAreSkipped: an option that the tunnel can do
+// without and that cannot be read is left out, with a note, and the reply is taken:
+// OpenVPN's errors of pushed options are not fatal. The route whose network is a
+// keyword is one that real servers push (the route to the server itself, past the
+// VPN).
+func TestPushedOptionsThatCannotBeReadAreSkipped(t *testing.T) {
+	tests := []struct {
+		reply  string
+		option string
+	}{
+		{"PUSH_REPLY,route", "route"},
+		{"PUSH_REPLY,route 1.2.3.4 255.255.255.0 gw 1 2", "route"},
+		{"PUSH_REPLY,route nope", "route"},
+		{"PUSH_REPLY,route ::1", "route"},
+		{"PUSH_REPLY,route 10.0.0.0 nope", "route"},
+		{"PUSH_REPLY,route 10.0.0.0 255.0.255.0", "route"},
+		{"PUSH_REPLY,route 10.0.0.0 255.0.0.0 gateway-name", "route"},
+		{"PUSH_REPLY,route 10.0.0.0 255.0.0.0 10.8.0.1 -3", "route"},
+		{"PUSH_REPLY,route-ipv6", "route-ipv6"},
+		{"PUSH_REPLY,route-ipv6 2001:db8::", "route-ipv6"},
+		{"PUSH_REPLY,route-ipv6 10.0.0.0/8", "route-ipv6"},
+		{"PUSH_REPLY,route-ipv6 fd00::/8 a b c", "route-ipv6"},
+		{"PUSH_REPLY,route-gateway", "route-gateway"},
+		{"PUSH_REPLY,route-gateway nope", "route-gateway"},
+		{"PUSH_REPLY,dhcp-option DNS nope", "dhcp-option"},
+		{"PUSH_REPLY,dns server 1 address nope", "dns"},
+		{"PUSH_REPLY,ping -1", "ping"},
+		{"PUSH_REPLY,ping", "ping"},
+		{"PUSH_REPLY,ping-restart x", "ping-restart"},
+		{"PUSH_REPLY,reneg-sec -5", "reneg-sec"},
+		{"PUSH_REPLY,explicit-exit-notify x", "explicit-exit-notify"},
+		{"PUSH_REPLY,route remote_host 255.255.255.255 net_gateway", "route"},
+		{"PUSH_REPLY,route vpn_gateway", "route"},
+		{"PUSH_REPLY,reneg-sec 10 20", "reneg-sec"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reply, func(t *testing.T) {
+			p, err := pushOne(t, tt.reply+",topology subnet,ifconfig 10.8.0.2 255.255.255.0,route 10.9.0.0 255.255.255.0")
+			if err != nil {
+				t.Fatalf("the reply was refused: %v", err)
+			}
+			if len(p.Skipped) != 1 || p.Skipped[0].Option != tt.option || p.Skipped[0].Problem == "" {
+				t.Errorf("Skipped = %+v, want the option %q with what was wrong", p.Skipped, tt.option)
+			}
+			// What follows the option is still read.
+			if len(p.Addrs) != 1 || len(p.Routes) != 1 || p.Routes[0].Prefix != pfx("10.9.0.0/24") {
+				t.Errorf("addresses %v, routes %v", p.Addrs, p.Routes)
+			}
+			if len(p.DNSServers) != 0 || p.PingInterval != 0 || p.PingRestart != 0 || p.HasReneg || p.ExitNotify != 0 || p.Gateway.IsValid() {
+				t.Errorf("the option that could not be read left something: %+v", p)
+			}
+		})
+	}
+	// explicit-exit-notify 0 is a value, not a mistake.
+	if p, err := pushOne(t, "PUSH_REPLY,explicit-exit-notify 0"); err != nil || len(p.Skipped) != 0 || p.ExitNotify != 0 {
+		t.Errorf("explicit-exit-notify 0: %+v, %v", p, err)
+	}
+}
+
 func TestPushedFailures(t *testing.T) {
 	tests := []struct {
 		reply  string
@@ -291,36 +350,15 @@ func TestPushedFailures(t *testing.T) {
 		{"PUSH_REPLY,ifconfig-ipv6", "apply.BadPushedOption", "ifconfig-ipv6"},
 		{"PUSH_REPLY,ifconfig-ipv6 fd00::1", "apply.BadPushedOption", "ifconfig-ipv6"},
 		{"PUSH_REPLY,ifconfig-ipv6 10.0.0.1/24 x", "apply.BadPushedOption", "ifconfig-ipv6"},
-		{"PUSH_REPLY,route", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route 1.2.3.4 255.255.255.0 gw 1 2", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route nope", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route ::1", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route 10.0.0.0 nope", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route 10.0.0.0 255.0.255.0", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route 10.0.0.0 255.0.0.0 gateway-name", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route 10.0.0.0 255.0.0.0 10.8.0.1 -3", "apply.BadPushedOption", "route"},
-		{"PUSH_REPLY,route-ipv6", "apply.BadPushedOption", "route-ipv6"},
-		{"PUSH_REPLY,route-ipv6 2001:db8::", "apply.BadPushedOption", "route-ipv6"},
-		{"PUSH_REPLY,route-ipv6 10.0.0.0/8", "apply.BadPushedOption", "route-ipv6"},
-		{"PUSH_REPLY,route-ipv6 fd00::/8 a b c", "apply.BadPushedOption", "route-ipv6"},
-		{"PUSH_REPLY,route-gateway", "apply.BadPushedOption", "route-gateway"},
-		{"PUSH_REPLY,route-gateway nope", "apply.BadPushedOption", "route-gateway"},
-		{"PUSH_REPLY,dhcp-option DNS nope", "apply.BadPushedOption", "dhcp-option"},
-		{"PUSH_REPLY,dns server 1 address nope", "apply.BadPushedOption", "dns"},
 		{"PUSH_REPLY,tun-mtu 67", "apply.BadPushedOption", "tun-mtu"},
 		{"PUSH_REPLY,tun-mtu 65536", "apply.BadPushedOption", "tun-mtu"},
 		{"PUSH_REPLY,tun-mtu x", "apply.BadPushedOption", "tun-mtu"},
-		{"PUSH_REPLY,ping -1", "apply.BadPushedOption", "ping"},
-		{"PUSH_REPLY,ping", "apply.BadPushedOption", "ping"},
-		{"PUSH_REPLY,ping-restart x", "apply.BadPushedOption", "ping-restart"},
-		{"PUSH_REPLY,reneg-sec -5", "apply.BadPushedOption", "reneg-sec"},
 		{"PUSH_REPLY,peer-id 16777216", "apply.BadPushedOption", "peer-id"},
 		{"PUSH_REPLY,peer-id -1", "apply.BadPushedOption", "peer-id"},
 		{"PUSH_REPLY,cipher", "apply.BadPushedOption", "cipher"},
 		{"PUSH_REPLY,key-derivation", "apply.BadPushedOption", "key-derivation"},
 		{"PUSH_REPLY,auth-token", "apply.BadPushedOption", "auth-token"},
 		{"PUSH_REPLY,auth-token-user", "apply.BadPushedOption", "auth-token-user"},
-		{"PUSH_REPLY,explicit-exit-notify x", "apply.BadPushedOption", "explicit-exit-notify"},
 		{"PUSH_REPLY,compress lz4", "apply.UnsupportedPushedOption", "compress"},
 		{"PUSH_REPLY,compress", "apply.UnsupportedPushedOption", "compress"},
 		{"PUSH_REPLY,comp-lzo no", "apply.UnsupportedPushedOption", "comp-lzo"},

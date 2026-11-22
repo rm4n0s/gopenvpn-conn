@@ -134,8 +134,10 @@ tunnel:
 go run ./examples/ping -server vpn.example.com:1194 -ca ca.crt -cert client.crt -key client.key -tls-crypt ta.key
 ```
 
-A `Conn` is one session: when it ends (the server says so, the keepalive times out, the
-link fails) `Read` and `Write` return the error and the program dials again.
+A `Conn` is one session: when it ends (the server says so, the keepalive times out, a
+renegotiation fails, a TCP link fails) `Read` and `Write` return the error and the program
+dials again. A UDP link that loses packets, or refuses some for a moment, does not end it:
+the keepalive decides.
 
 ## What it supports
 

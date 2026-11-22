@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"os"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -311,12 +310,11 @@ func (s *Session) lockWrite(d *dataPath, user bool) error {
 
 func (d *dataPath) unlockWrite() { <-d.sem }
 
-// writeLocked seals one IP packet (or the ping) and writes it to the link. The
-// caller holds the right to write. A failure of the link, or the end of the packet
-// ids, ends the session: it is made here and stored, and the returned error is that
-// one. With user set the write deadline of the connection applies, and a deadline
-// that passes gives errDeadline.
-func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
+// sealLocked seals one IP packet (or the ping) into the buffer of the data path, as
+// a frame on a stream link. The caller holds the right to write, and uses the packet
+// before it gives the right back. The end of the packet ids ends the session: the
+// error is stored and returned.
+func (s *Session) sealLocked(d *dataPath, b []byte) ([]byte, *dataKey, error) {
 	d.wbuf = d.wbuf[:0]
 	if s.opts.Stream {
 		d.wbuf = append(d.wbuf, 0, 0) // the length of the frame goes here
@@ -325,52 +323,32 @@ func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
 	packet, err := k.ch.Seal(d.wbuf, b)
 	if err != nil {
 		s.fail(err)
-		return err
+		return nil, nil, err
 	}
 	d.wbuf = packet
 	if s.opts.Stream {
 		binary.BigEndian.PutUint16(packet, uint16(min(len(packet)-2, 1<<16-1)))
 	}
-	var wd time.Time
-	if user {
-		wd, _ = s.wdl.get()
-	}
-	n, err := s.writeLink(packet, wd)
+	return packet, k, nil
+}
+
+// writeLocked seals one IP packet and writes it to the link. The caller holds the
+// right to write. A failure of the link that ends the session, or the end of the
+// packet ids, is made and stored where it happens, and the returned error is that
+// one. With user set the write deadline of the connection applies, and a deadline
+// that passes gives errDeadline.
+func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
+	packet, k, err := s.sealLocked(d, b)
 	if err != nil {
-		if errors.Is(err, os.ErrDeadlineExceeded) && (!s.opts.Stream || n == 0) {
-			return errDeadline // nothing of the packet is out: the session goes on
-		}
-		e := errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
-		s.fail(e)
-		return e
+		return err
 	}
-	s.touchSent()
+	if err := s.writeLink(packet, user); err != nil {
+		return err
+	}
 	if k.ch.NeedsRenegotiation() {
 		s.requestRenegotiation(k.id)
 	}
 	return nil
-}
-
-// writeLink writes one packet (or frame) to the link, with the deadline wd if it
-// is not zero. The loop writes control packets to the same link, so the two take
-// turns (linkSem), and the deadline never reaches a control write.
-func (s *Session) writeLink(p []byte, wd time.Time) (int, error) {
-	// A channel and not a mutex: a writer that waits for the other is then blocked in
-	// a way that the fake clock of the tests sees, so that time goes on to the deadline
-	// of the writer that holds the link.
-	s.linkSem <- struct{}{}
-	defer func() { <-s.linkSem }()
-	if wd.IsZero() {
-		return s.opts.Link.Write(p)
-	}
-	if err := s.opts.Link.SetWriteDeadline(wd); err != nil {
-		return 0, err
-	}
-	n, err := s.opts.Link.Write(p)
-	if rerr := s.opts.Link.SetWriteDeadline(time.Time{}); rerr != nil && err == nil {
-		err = rerr
-	}
-	return n, err
 }
 
 const (

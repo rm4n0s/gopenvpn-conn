@@ -541,7 +541,7 @@ func TestLinkFailures(t *testing.T) {
 			closeAtEnd(t, s)
 			err := s.Handshake(t.Context())
 			appErr, ok := errors.FromError(err)
-			if !ok || appErr.Tag != TagLinkFailed || !appErr.HasRoute("send.LinkFailed") {
+			if !ok || appErr.Tag != TagLinkFailed || !appErr.HasRoute("Session.writeLoop->Session.writeLink.LinkFailed") {
 				t.Fatalf("Handshake = %v, want a failed write", err)
 			}
 			if !errors.Is(err, os.ErrPermission) {

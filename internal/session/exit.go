@@ -60,7 +60,14 @@ func (s *Session) goodbye() {
 		if d == nil {
 			return // no data channel: a handshake that is only the exchange of resets
 		}
-		if err := s.lockWrite(d, false); err != nil {
+		// Not for longer than exitWait: a Write that holds the data path must not hold Close.
+		timer := time.NewTimer(exitWait)
+		defer timer.Stop()
+		select {
+		case d.sem <- struct{}{}:
+		case <-timer.C:
+			return
+		case <-s.done:
 			return
 		}
 		defer d.unlockWrite()

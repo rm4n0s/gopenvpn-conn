@@ -174,11 +174,11 @@ func TestResolverWithoutServers(t *testing.T) {
 	wantRoute(t, err, "Net.dialDNS."+TagNoDNSServers)
 }
 
-// TestDNSServerSelection: the Dial function of the resolver starts with the server that
-// worked last, leaves one whose read fails for the next, and goes on to the next server
-// when a stream connection is refused. (gVisor sends no ICMP error for a closed UDP
-// port, so a dead server shows as a timeout; the test makes a read fail by a deadline
-// that has passed.)
+// TestDNSServerSelection: the Dial function of the resolver starts with the first
+// server, tries one whose read fails after the others for a while, and goes on to the
+// next server when a stream connection is refused. (gVisor sends no ICMP error for a
+// closed UDP port, so a dead server shows as a timeout; the test makes a read fail by
+// a deadline that has passed.)
 func TestDNSServerSelection(t *testing.T) {
 	na, nb, _, _ := newNetsDNS(t, true, []string{"DNS 10.8.0.3", "DNS6 fd00:8::3"})
 	z := zone{"web.vpn.test": {netip.MustParseAddr("10.8.0.3")}}
@@ -191,6 +191,7 @@ func TestDNSServerSelection(t *testing.T) {
 		serveDNS(pc, z)
 	}
 	remote := func(c net.Conn) string { return c.RemoteAddr().String() }
+	down := func(i int) bool { return na.dnsDown[i].Load() > time.Now().UnixNano() }
 
 	c, err := na.dialDNS(t.Context(), "udp", "ignored:53")
 	if err != nil {
@@ -202,7 +203,7 @@ func TestDNSServerSelection(t *testing.T) {
 	if got := remote(c); got != "10.8.0.3:53" {
 		t.Errorf("the first server is %s", got)
 	}
-	// The server does not answer: its place goes to the next one.
+	// The server does not answer: it is tried after the other for a while.
 	if err := c.SetReadDeadline(time.Unix(1, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -210,8 +211,11 @@ func TestDNSServerSelection(t *testing.T) {
 		t.Fatal("Read with a deadline in the past succeeded")
 	}
 	closeOrFail(t, c)
-	if got := na.dnsStart.Load(); got != 1 {
-		t.Errorf("dnsStart = %d after a failed read, want 1", got)
+	if !down(0) || down(1) {
+		t.Errorf("after a failed read of the first server: down = %v, %v; want true, false", down(0), down(1))
+	}
+	if got := na.dnsOrder(2); !slices.Equal(got, []int{1, 0}) {
+		t.Errorf("order = %v, want the second server first", got)
 	}
 	c, err = na.dialDNS(t.Context(), "udp", "ignored:53")
 	if err != nil {
@@ -220,7 +224,7 @@ func TestDNSServerSelection(t *testing.T) {
 	if got := remote(c); got != "[fd00:8::3]:53" {
 		t.Errorf("after a failure the server is %s, want the second", got)
 	}
-	// It answers: it stays the first.
+	// It answers: it is good.
 	query := []byte{0, 7, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, 'w', 'e', 'b', 3, 'v', 'p', 'n', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1}
 	if _, err := c.Write(query); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -229,11 +233,11 @@ func TestDNSServerSelection(t *testing.T) {
 	if size, err := c.Read(reply); err != nil || size < len(query) || reply[0] != 0 || reply[1] != 7 {
 		t.Fatalf("Read = %d bytes, %v", size, err)
 	}
-	if got := na.dnsStart.Load(); got != 1 {
-		t.Errorf("dnsStart = %d after an answer, want 1", got)
+	if down(1) {
+		t.Error("a server that answered is marked as failed")
 	}
-	// A failure of the second one wraps around to the first; a failure of a server that
-	// is not the first of the next lookup changes nothing.
+	// A failure of the second one too: both have failed, and they are tried in the
+	// order of the list.
 	if err := c.SetReadDeadline(time.Unix(1, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -241,19 +245,26 @@ func TestDNSServerSelection(t *testing.T) {
 		t.Fatal("Read with a deadline in the past succeeded")
 	}
 	closeOrFail(t, c)
-	if got := na.dnsStart.Load(); got != 0 {
-		t.Errorf("dnsStart = %d after the second server failed, want 0", got)
+	if got := na.dnsOrder(2); !down(1) || !slices.Equal(got, []int{0, 1}) {
+		t.Errorf("with both failed: down(1) = %v, order = %v; want true and the order of the list", down(1), got)
 	}
-	na.dnsStart.Store(1)
-	old := &dnsConn{n: na, index: 0, count: 2}
-	old.note(os.ErrDeadlineExceeded)
-	if got := na.dnsStart.Load(); got != 1 {
-		t.Errorf("a failure of a server that is not the current one moved dnsStart to %d", got)
+	// When the time is over the first server has its place again, though the second is
+	// good: the first is the one that the VPN means to be asked.
+	na.dnsDown[0].Store(time.Now().Add(-time.Second).UnixNano())
+	na.dnsDown[1].Store(0)
+	if got := na.dnsOrder(2); !slices.Equal(got, []int{0, 1}) {
+		t.Errorf("after the cool-down the order is %v, want the first server first", got)
+	}
+	// An answer clears the mark, and a note for a server that is not there is ignored.
+	na.noteDNS(0, os.ErrDeadlineExceeded)
+	na.noteDNS(0, nil)
+	na.noteDNS(7, os.ErrDeadlineExceeded)
+	if down(0) {
+		t.Error("an answer did not clear the mark of the server")
 	}
 
 	// A stream: the first server refuses the connection (nothing listens on its TCP port 53),
 	// and the Dial function goes on to the second.
-	na.dnsStart.Store(0)
 	l, err := nb.Listen("tcp6", "[fd00:8::3]:53")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -270,6 +281,9 @@ func TestDNSServerSelection(t *testing.T) {
 	}
 	if got := remote(c); got != "[fd00:8::3]:53" {
 		t.Errorf("the server of the stream is %s, want the one that listens", got)
+	}
+	if !down(0) {
+		t.Error("the server that refused the stream is not marked as failed")
 	}
 }
 

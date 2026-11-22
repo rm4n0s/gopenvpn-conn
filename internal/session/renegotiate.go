@@ -68,7 +68,6 @@ func (s *Session) keyMade(ks *keyState, now time.Time) {
 	if after := s.opts.RenegotiateAfter; after > 0 {
 		ks.mustDie = now.Add(after + s.transitionWindow())
 	}
-	s.retryAt = time.Time{}
 	s.dirty = true
 }
 
@@ -77,13 +76,6 @@ func (s *Session) transitionWindow() time.Duration {
 		return w
 	}
 	return DefaultTransitionWindow
-}
-
-func (s *Session) retryAfter() time.Duration {
-	if r := s.opts.RenegotiateRetry; r > 0 {
-		return r
-	}
-	return DefaultRenegotiateRetry
 }
 
 // promoteDelay is how long a new key waits before it is sealed with.
@@ -125,9 +117,13 @@ func (s *Session) renegTick() bool {
 	now := time.Now()
 	p := s.primary
 	if p.established.IsZero() && !now.Before(s.attemptEnd) {
-		s.log.Warn("a renegotiation did not finish in time", "key_id", p.id)
-		s.abortAttempt(now)
-		p = s.primary
+		// The server has thrown its side of the session away by now, or will, and takes
+		// no other soft reset of it (ssl.c tls_multi_process: move_session to the lame
+		// duck; tls_pre_decrypt: "stale session-id", "key IDs out of sync"): a retry in
+		// this session cannot work, so the session ends and the caller dials again.
+		s.fail(errors.New(TagRenegotiationFailed, "a renegotiation did not finish in time",
+			"key_id", p.id, "timeout", s.opts.HandshakeTimeout.String()))
+		return false
 	}
 	if l := s.lame; l != nil && !l.mustDie.IsZero() && !now.Before(l.mustDie) {
 		if p.established.IsZero() {
@@ -140,7 +136,7 @@ func (s *Session) renegTick() bool {
 		return s.expired(p)
 	}
 	if !p.established.IsZero() {
-		if at, due := s.dueAt(); due && !now.Before(at) && !now.Before(s.retryAt) {
+		if at, due := s.dueAt(); due && !now.Before(at) {
 			id := s.nextID
 			for s.keys[id] != nil {
 				id = id%datachan.MaxKeyID + 1
@@ -181,7 +177,7 @@ func (s *Session) renegWait() (time.Time, bool) {
 		add(s.attemptEnd)
 	} else {
 		if due, ok := s.dueAt(); ok {
-			add(laterOf(due, s.retryAt))
+			add(due)
 		}
 		if !p.mustDie.IsZero() {
 			add(p.mustDie)
@@ -194,13 +190,6 @@ func (s *Session) renegWait() (time.Time, bool) {
 		add(s.sendAt)
 	}
 	return at, found
-}
-
-func laterOf(a, b time.Time) time.Time {
-	if b.After(a) {
-		return b
-	}
-	return a
 }
 
 // beginKey makes the control state of a new key id the newest key, and starts its TLS
@@ -248,19 +237,6 @@ func (s *Session) acceptSoftReset(id uint8) *keyState {
 	return ks
 }
 
-// abortAttempt gives up the renegotiation that is under way: its control state goes,
-// and the key before it is the newest again, to be tried again after a while.
-//
-// Deviation: OpenVPN throws the whole TLS session away after a failed soft reset
-// (SPEC §20 V11); here the session and the old key go on.
-func (s *Session) abortAttempt(now time.Time) {
-	failed := s.primary
-	s.retire(failed)
-	s.primary, s.lame = s.lame, nil
-	s.retryAt = now.Add(s.retryAfter())
-	s.dirty = true
-}
-
 // dropKey throws away a key that is past its end: the data key and the control state.
 func (s *Session) dropKey(ks *keyState) {
 	s.retire(ks)
@@ -279,15 +255,17 @@ func (s *Session) onKeyEvent(ev keyEvent) {
 	}
 	now := time.Now()
 	if ev.err != nil {
+		// The session ends with what made the renegotiation fail: see renegTick for
+		// why it is not tried again.
 		s.log.Warn("a renegotiation failed", "key_id", ks.id, "err", ev.err)
-		s.abortAttempt(now)
+		s.fail(ev.err)
 		return
 	}
 	d := s.data.Load()
 	dk, err := s.makeKey(d, ks.id, &ev.state)
 	if err != nil {
 		s.log.Warn("a renegotiation failed", "key_id", ks.id, "err", err)
-		s.abortAttempt(now)
+		s.fail(err)
 		return
 	}
 	ks.dk, ks.tlsConn = dk, ev.conn

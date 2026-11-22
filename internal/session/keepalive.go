@@ -35,26 +35,33 @@ func (s *Session) startKeepalive() {
 	}
 	s.lastRecv = time.Now()
 	s.touchSent()
+	s.kaTimeoutNs.Store(int64(s.kaTimeout))
 	s.kaOn = s.kaInterval > 0 || s.kaTimeout > 0
 }
 
 // keepaliveWait is how long until the next thing the keepalive has to do: send a
-// ping or give up. It reports false when the keepalive is off.
+// ping or give up. It reports false when the keepalive is off. A ping that is
+// overdue is due now: it must not wait for the timeout.
 func (s *Session) keepaliveWait() (time.Duration, bool) {
 	if !s.kaOn {
 		return 0, false
 	}
-	wait := time.Duration(-1)
+	var wait time.Duration
+	have := false
 	if s.kaInterval > 0 {
-		wait = s.kaInterval - s.sinceSent()
+		wait, have = s.kaInterval-s.sinceSent(), true
 	}
 	if s.kaTimeout > 0 {
-		if left := s.kaTimeout - time.Since(s.lastRecv); wait < 0 || left < wait {
+		if left := s.kaTimeout - time.Since(s.lastRecv); !have || left < wait {
 			wait = left
 		}
 	}
 	return max(0, wait), true
 }
+
+// kaGrace is how long past the timeout the loop still looks at the packets that wait
+// before it gives the server up.
+const kaGrace = time.Second
 
 // keepaliveTick does what is due: it ends the session when nothing authentic came
 // for the timeout, and sends a ping when nothing went out for the interval. It
@@ -63,19 +70,43 @@ func (s *Session) keepaliveWait() (time.Duration, bool) {
 // OpenVPN: ping.h check_ping_restart, ping.c check_ping_send_dowork.
 func (s *Session) keepaliveTick() bool {
 	if s.kaTimeout > 0 && time.Since(s.lastRecv) >= s.kaTimeout {
+		if len(s.in) > 0 && time.Since(s.lastRecv) < s.kaTimeout+kaGrace {
+			// Packets wait to be looked at: they may be the server's, read while the
+			// loop was busy. Not for long: packets that do not authenticate must not put
+			// the timeout off.
+			return true
+		}
 		s.fail(errors.New(TagPingTimeout, "nothing came from the server in time", "timeout", s.kaTimeout.String()))
 		return false
 	}
 	if s.kaInterval > 0 && s.sinceSent() >= s.kaInterval {
-		d := s.data.Load()
-		if err := s.lockWrite(d, false); err != nil {
-			return false // the session has ended
-		}
-		err := s.writeLocked(d, pingString, false)
+		return s.sendPing()
+	}
+	return true
+}
+
+// sendPing seals a ping and gives it to the writer of the link. When a Write of the
+// connection has the data path, a packet of its own is going out, or waits for the
+// link as the ping would: the ping is left for the next interval. It reports false
+// when the session has failed.
+func (s *Session) sendPing() bool {
+	d := s.data.Load()
+	s.touchSent() // the try counts: the next one is an interval from now
+	select {
+	case d.sem <- struct{}{}:
+	default:
+		return true
+	}
+	packet, k, err := s.sealLocked(d, pingString)
+	if err != nil {
 		d.unlockWrite()
-		if err != nil {
-			return false
-		}
+		return false
+	}
+	out := append([]byte(nil), packet...)
+	d.unlockWrite()
+	s.queueForLink(out)
+	if k.ch.NeedsRenegotiation() {
+		s.requestRenegotiation(k.id)
 	}
 	return true
 }

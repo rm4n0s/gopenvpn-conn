@@ -23,13 +23,19 @@ import (
 // notBefore for a day, and returns it as a connection state shows it.
 func selfSigned(t *testing.T, subject pkix.Name, usages []x509.ExtKeyUsage, notBefore time.Time) (tls.ConnectionState, *x509.Certificate) {
 	t.Helper()
+	return selfSignedKU(t, subject, x509.KeyUsageDigitalSignature, usages, notBefore)
+}
+
+// selfSignedKU is selfSigned with the key usage; 0 leaves the extension out.
+func selfSignedKU(t *testing.T, subject pkix.Name, ku x509.KeyUsage, usages []x509.ExtKeyUsage, notBefore time.Time) (tls.ConnectionState, *x509.Certificate) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1), Subject: subject, NotBefore: notBefore, NotAfter: notBefore.Add(24 * time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: usages, BasicConstraintsValid: true,
+		KeyUsage: ku, ExtKeyUsage: usages, BasicConstraintsValid: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -194,14 +200,43 @@ func TestVerifyServerFingerprints(t *testing.T) {
 		if err := verifyServer(o, client); err == nil {
 			t.Error("a client certificate was taken for a server's")
 		}
-		// No extended key usage at all, and any usage, pass as they do in crypto/x509.
-		none, noneCert := selfSigned(t, pkix.Name{CommonName: "none"}, nil, now)
-		if err := verifyServer(&TLSOptions{PeerFingerprints: [][sha256.Size]byte{fingerprint(noneCert)}, RemoteCertTLSServer: true}, none); err != nil {
-			t.Errorf("no extended key usage: %v", err)
+		// remote-cert-tls server wants the key usage extension and the usage of a TLS
+		// server by name, as OpenVPN does: no extended key usage, "any", and no key usage
+		// do not pass, though crypto/x509 takes the first two for every use.
+		rows := []struct {
+			name string
+			ku   x509.KeyUsage
+			eku  []x509.ExtKeyUsage
+			ok   bool
+		}{
+			{"key usage and serverAuth", x509.KeyUsageDigitalSignature, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, true},
+			{"serverAuth among others", x509.KeyUsageDigitalSignature, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}, true},
+			{"no extended key usage", x509.KeyUsageDigitalSignature, nil, false},
+			{"any usage", x509.KeyUsageDigitalSignature, []x509.ExtKeyUsage{x509.ExtKeyUsageAny}, false},
+			{"serverAuth and no key usage", 0, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, false},
+			{"nothing at all", 0, nil, false},
 		}
-		anyUse, anyCert := selfSigned(t, pkix.Name{CommonName: "any"}, []x509.ExtKeyUsage{x509.ExtKeyUsageAny}, now)
-		if err := verifyServer(&TLSOptions{PeerFingerprints: [][sha256.Size]byte{fingerprint(anyCert)}, RemoteCertTLSServer: true}, anyUse); err != nil {
-			t.Errorf("any usage: %v", err)
+		for _, row := range rows {
+			cs, cert := selfSignedKU(t, pkix.Name{CommonName: "server"}, row.ku, row.eku, now)
+			pinned := &TLSOptions{PeerFingerprints: [][sha256.Size]byte{fingerprint(cert)}, RemoteCertTLSServer: true}
+			pool := x509.NewCertPool()
+			pool.AddCert(cert)
+			chained := &TLSOptions{RootCAs: pool, RemoteCertTLSServer: true}
+			for kind, o := range map[string]*TLSOptions{"pinned": pinned, "with a CA": chained} {
+				err := verifyServer(o, cs)
+				switch {
+				case row.ok && err != nil:
+					t.Errorf("%s, %s: %v", row.name, kind, err)
+				case !row.ok && err == nil:
+					t.Errorf("%s, %s: accepted as a server's certificate", row.name, kind)
+				case !row.ok:
+					wantTLSRoute(t, err, TagServerCertificateUsage, "verifyServer->checkServerUsage.ServerCertificateUsage")
+				}
+			}
+			// Without the option none of it is asked for.
+			if err := verifyServer(&TLSOptions{PeerFingerprints: [][sha256.Size]byte{fingerprint(cert)}}, cs); err != nil {
+				t.Errorf("%s, without remote-cert-tls: %v", row.name, err)
+			}
 		}
 	})
 	t.Run("no certificate at all", func(t *testing.T) {

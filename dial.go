@@ -5,6 +5,7 @@ package openvpn
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/rm4n0s/errors"
 )
@@ -25,7 +26,8 @@ const (
 // "tcp", "tcp4" or "tcp6". A nil config is the zero Config.
 //
 // ctx bounds the connecting and the handshake; it does not bound the life of
-// the Conn that is returned.
+// the Conn that is returned. Config.ServerPollTimeout bounds the connecting and the
+// wait for the server's first packet, and Config.HandshakeTimeout the handshake.
 func Dial(ctx context.Context, network, address string, config *Config) (*Conn, error) {
 	d := Dialer{Config: config}
 	return d.Dial(ctx, network, address)
@@ -62,11 +64,24 @@ func (d *Dialer) Dial(ctx context.Context, network, address string) (*Conn, erro
 		}
 		dial = netDialer.DialContext
 	}
-	link, err := dial(ctx, network, address)
+	// Config.ServerPollTimeout bounds the making of the link and, with what is left of
+	// it, the wait for the first packet of the server; it does not bound the handshake.
+	var poll time.Duration
+	linkCtx, cancel := ctx, context.CancelFunc(func() {})
+	start := time.Now()
+	if d.Config != nil && d.Config.ServerPollTimeout > 0 {
+		poll = d.Config.ServerPollTimeout
+		linkCtx, cancel = context.WithTimeout(ctx, poll)
+	}
+	link, err := dial(linkCtx, network, address)
+	cancel()
 	if err != nil {
 		return nil, errors.NewErr(TagDialFailed, err).SetMetadata("network", network, "address", address)
 	}
-	conn := newConn(link, stream, d.Config)
+	if poll > 0 {
+		poll = max(poll-time.Since(start), time.Millisecond)
+	}
+	conn := newConn(link, stream, d.Config, poll)
 	if err := conn.HandshakeContext(ctx); err != nil {
 		// The session has closed the link already; Close collects the rest.
 		if cerr := conn.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) && d.Config != nil && d.Config.Logger != nil {

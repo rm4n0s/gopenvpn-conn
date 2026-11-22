@@ -46,6 +46,11 @@ type builder struct {
 	dir           string
 	handlers      map[string]spec
 	ignoreUnknown []string
+	// forwardCompatible: setenv FORWARD_COMPATIBLE 1 came, after which an option that
+	// is not known is left out and not an error.
+	//
+	// OpenVPN: options.c msglevel_forward_compatible.
+	forwardCompatible bool
 
 	remotes        []rawRemote
 	defPort        string
@@ -101,7 +106,7 @@ func handlers() map[string]spec {
 		"remote-cert-tls": {1, 1, (*builder).hRemoteCertTLS}, "verify-x509-name": {1, 2, (*builder).hVerifyName},
 		"peer-fingerprint": {1, 64, (*builder).hFingerprint}, "tls-version-min": {1, 2, (*builder).hTLSVersionMin},
 		"tls-groups": {1, 1, (*builder).hTLSGroups},
-		"reneg-sec":  {1, 1, (*builder).hRenegSec}, "hand-window": {1, 1, (*builder).hHandWindow}, "tls-timeout": {1, 1, (*builder).hTLSTimeout},
+		"reneg-sec":  {1, 2, (*builder).hRenegSec}, "hand-window": {1, 1, (*builder).hHandWindow}, "tls-timeout": {1, 1, (*builder).hTLSTimeout},
 		"ping": {1, 1, (*builder).hPing}, "ping-restart": {1, 1, (*builder).hPingRestart}, "ping-exit": {1, 1, (*builder).hPingExit},
 		"keepalive": {2, 2, (*builder).hKeepalive}, "tun-mtu": {1, 1, (*builder).hTunMTU},
 		"explicit-exit-notify": {0, 1, (*builder).hExplicitExitNotify},
@@ -136,6 +141,16 @@ var ignoredOptions = map[string]bool{
 	"local": true, "lport": true, "dev-node": true, "ecdh-curve": true, "dh": true, "topology": true,
 	"inactive": true, "machine-readable-output": true, "mlock": true, "ifconfig": true, "txqueuelen": true,
 	"show-net-up": true, "tcp-queue-limit": true, "opt-verify": true, "compat-mode": true, "tls-exit": true,
+	// Options that OpenVPN 2.7 takes and that change nothing here: they are for the
+	// host's routes and device (block-ipv6, redirect-private, route-metric,
+	// route-gateway, tun-ipv6, mtu-disc), for the process (status), for the check of
+	// the options of the peer (disable-occ), for the profile of OpenSSL's certificate
+	// checks (tls-cert-profile: crypto/tls has its own rules), or for a server that
+	// does not negotiate the cipher, which this library does not talk to
+	// (data-ciphers-fallback: such a server fails the negotiation with its own error).
+	"tun-ipv6": true, "block-ipv6": true, "disable-occ": true, "redirect-private": true,
+	"route-metric": true, "route-gateway": true, "mtu-disc": true, "status": true, "status-version": true,
+	"tls-cert-profile": true, "data-ciphers-fallback": true,
 }
 
 // refusedOptions are options that this version cannot honor and that would be unsafe
@@ -198,7 +213,7 @@ func (b *builder) apply(l line, inConn bool) error {
 	}
 	sp, ok := b.handlers[l.name]
 	if !ok {
-		if slices.Contains(b.ignoreUnknown, l.name) {
+		if b.forwardCompatible || slices.Contains(b.ignoreUnknown, l.name) {
 			b.ignore(l.name)
 			return nil
 		}
@@ -467,10 +482,23 @@ func (b *builder) hAuthNoCache(line) error { b.cfg.AuthNoCache = true; return ni
 // aeadCiphers are the data ciphers of the library, which are all AEAD.
 var aeadCiphers = []string{"AES-128-GCM", "AES-192-GCM", "AES-256-GCM", "CHACHA20-POLY1305"}
 
+// hDataCiphers takes the list of data-ciphers. "DEFAULT" stands for OpenVPN's default
+// list, and a name that starts with "?" is one that OpenVPN leaves out when its
+// library does not have it: both are in profiles that OpenVPN 2.7 reads.
+//
+// OpenVPN: ssl_ncp.c mutate_ncp_cipher_list.
 func (b *builder) hDataCiphers(l line) error {
 	b.haveDataCiphers = true
+	var names []string
 	for _, name := range splitList(l.args[0]) {
-		name = strings.ToUpper(name)
+		name = strings.ToUpper(strings.TrimPrefix(name, "?"))
+		if name == "DEFAULT" {
+			names = append(names, defaultDataCiphers...)
+			continue
+		}
+		names = append(names, name)
+	}
+	for _, name := range names {
 		if slices.Contains(aeadCiphers, name) {
 			if !slices.Contains(b.dataCiphers, name) {
 				b.dataCiphers = append(b.dataCiphers, name)
@@ -548,7 +576,9 @@ func (b *builder) hTLSVersionMin(l line) error {
 	case "1.3":
 		b.minVersion = tls.VersionTLS13
 	case "1.0", "1.1":
-		return errors.New(TagUnsupportedOption, "the profile has an option that is not supported", "option", l.name, "line", l.lineNo, "reason", "TLS below 1.2 is not supported")
+		// A lowest version, not a required one: the library starts at TLS 1.2, which
+		// is above it, as OpenVPN's build with mbed TLS does.
+		b.ignore("tls-version-min " + l.args[0] + ": the lowest version is 1.2")
 	default:
 		return errors.New(TagBadOption, "the version is 1.2 or 1.3", "option", l.name, "line", l.lineNo, "reason", "bad version")
 	}
@@ -581,8 +611,14 @@ func (b *builder) hTLSGroups(l line) error {
 	return nil
 }
 
+// hRenegSec takes reneg-sec max [min]. OpenVPN's client takes a random time between
+// min and max when there is a min; this one takes max.
 func (b *builder) hRenegSec(l line) error {
 	d, ok := seconds(l.args[0])
+	if ok && len(l.args) == 2 {
+		_, ok = seconds(l.args[1])
+		b.ignore("reneg-sec: the second number")
+	}
 	if !ok {
 		return errors.New(TagBadOption, "the time is not a number of seconds", "option", l.name, "line", l.lineNo, "reason", "bad number")
 	}
@@ -665,10 +701,13 @@ func (b *builder) hTunMTU(l line) error {
 func (b *builder) hExplicitExitNotify(l line) error {
 	if len(l.args) == 1 {
 		n, err := strconv.ParseUint(l.args[0], 10, 16)
-		if err != nil || n == 0 {
-			return errors.New(TagBadOption, "the number of tries is not a number above 0", "option", l.name, "line", l.lineNo, "reason", "bad number")
+		if err != nil {
+			return errors.New(TagBadOption, "the number of tries is not a number", "option", l.name, "line", l.lineNo, "reason", "bad number")
 		}
-		if n > 1 {
+		switch {
+		case n == 0:
+			b.ignore("explicit-exit-notify 0: Close tells the server all the same")
+		case n > 1:
 			b.ignore("explicit-exit-notify: tries beyond the first")
 		}
 	}
@@ -690,6 +729,9 @@ func (b *builder) hSetenv(l line) error {
 			value = l.args[1]
 		}
 		b.cfg.PeerInfo[name] = value
+		return nil
+	case name == "FORWARD_COMPATIBLE" && len(l.args) > 1 && l.args[1] == "1":
+		b.forwardCompatible = true
 		return nil
 	case name == "opt" && len(l.args) > 1:
 		inner := line{name: l.args[1], args: l.args[2:], lineNo: l.lineNo}
@@ -793,6 +835,7 @@ func (b *builder) finish() (*Profile, error) {
 		return nil, err
 	}
 	p.Config = &b.cfg
+	p.Ignored = b.ignored // what the making of the Config left out is in it too
 	return p, nil
 }
 
@@ -870,9 +913,15 @@ func (b *builder) makeCiphers() error {
 		}
 	case b.cipher != "":
 		if !slices.Contains(aeadCiphers, b.cipher) {
-			return errors.New(TagUnsupportedOption, "the profile has an option that is not supported", "option", "cipher", "reason", "a cipher that is not AEAD, and the profile has no data-ciphers")
+			// OpenVPN: options.c options_postprocess_cipher ("OpenVPN ignores --cipher
+			// for cipher negotiations"): the offer is the default one. Most profiles of
+			// providers still have cipher AES-256-CBC, for clients that are older than
+			// the negotiation; a server that has only that cipher fails the negotiation
+			// with its own error.
+			b.ignore("cipher " + b.cipher + ": not AEAD; the default ciphers are offered")
+			return nil
 		}
-		offer := []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}
+		offer := slices.Clone(defaultDataCiphers)
 		if !slices.Contains(offer, b.cipher) {
 			offer = append(offer, b.cipher)
 		}
@@ -880,3 +929,7 @@ func (b *builder) makeCiphers() error {
 	}
 	return nil
 }
+
+// defaultDataCiphers is the offer of data ciphers when the profile names none, and
+// what "DEFAULT" in data-ciphers stands for.
+var defaultDataCiphers = []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}

@@ -76,7 +76,29 @@ type Pushed struct {
 	HasReneg        bool
 	ExitNotify      int // explicit-exit-notify: the number of tries, 0 when not pushed
 
+	// Skipped are the pushed options that could not be read and were left out,
+	// with what was wrong with each: the connection goes on without them.
+	Skipped []SkippedOption
+
 	ifconfig []string
+}
+
+// SkippedOption is a pushed option that was left out, and why.
+type SkippedOption struct {
+	Option  string // the name of the option
+	Problem string // what was wrong, in words that carry no value of the option
+}
+
+// essential are the options that the tunnel cannot do without: the addresses, and
+// what the packets of the data channel are made with. One of these that cannot be
+// read ends the handshake. Any other option that cannot be read is skipped, as
+// OpenVPN does with every one (its errors of pushed options are not fatal), because
+// a route or a DNS server less is not a reason to have no tunnel.
+//
+// OpenVPN: options_parse.c apply_push_options (D_PUSH_ERRORS is M_NONFATAL).
+var essential = []string{
+	"topology", "ifconfig", "ifconfig-ipv6", "tun-mtu", "peer-id", "cipher", "key-derivation",
+	"auth-token", "auth-token-user",
 }
 
 // aead is the data ciphers that are supported.
@@ -133,6 +155,10 @@ func (p *Pushed) apply(name string, args, offered []string) error {
 	out, detail := p.understand(name, args, offered)
 	switch out {
 	case malformed:
+		if !slices.Contains(essential, name) {
+			p.Skipped = append(p.Skipped, SkippedOption{Option: name, Problem: detail})
+			return nil
+		}
 		return errors.New(tagBadPushedOption, detail, "option", name)
 	case unsupported:
 		return errors.New(TagUnsupportedPushedOption, "the server pushed an option that this client does not implement", "option", name, "detail", detail)
@@ -248,7 +274,7 @@ func (p *Pushed) understand(name string, args, offered []string) (out outcome, d
 		n := 1
 		if len(args) > 0 {
 			var ok bool
-			if n, ok = atoiRange(args, 1, 1<<16); !ok {
+			if n, ok = atoiRange(args, 0, 1<<16); !ok {
 				return malformed, "the number of tries is not a number"
 			}
 		}
@@ -379,9 +405,15 @@ func parseRoute(args []string) (Route, string) {
 		return Route{}, "route takes one to four words"
 	}
 	network, bits := netip.IPv4Unspecified(), 32
-	if args[0] == "default" {
+	switch args[0] {
+	case "default":
 		bits = 0
-	} else {
+	case "vpn_gateway", "net_gateway", "remote_host":
+		// OpenVPN: route.c get_special_addr. Such a route is one of the host's own
+		// (the usual one sends the packets for the VPN server past the VPN), and the
+		// library, which changes no routes, has nothing to report for it.
+		return Route{}, "the network is a keyword for an address of the host, which this library does not know"
+	default:
 		var err error
 		if network, err = netip.ParseAddr(args[0]); err != nil || !network.Is4() {
 			return Route{}, "the network is not an IPv4 address"

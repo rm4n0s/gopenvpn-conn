@@ -31,7 +31,7 @@ This repository is **GPL-2.0-only** (the owner's decision, 2026-11-21): `LICENSE
 - Test the cgo-free path: `CGO_ENABLED=0 go test ./...`
 - Test one package: `go test ./internal/wire -run TestName -v`
 - Tests against the real OpenVPN server (from step 1.1): `scripts/vpn-ns.sh -- go test -race -tags gopenvpn_server ./...` (a private user and network namespace, no root; the tests start and stop `openvpn` themselves)
-- Soak tests (not in `scripts/check.sh`; run by hand when a change touches the session, the reliability layer or `vpnnet`; the hour one takes an hour, `GOPENVPN_SOAK_DURATION=2m` shortens it): `scripts/vpn-ns.sh -- go test -tags 'gopenvpn_server gopenvpn_soak' -run Soak -timeout 3h -v . ./vpnnet` (the faults are `tc ... netem` on the loopback of the private namespace only)
+- Soak tests (not in `scripts/check.sh`; run by hand when a change touches the session, the reliability layer or `vpnnet`; the hour one takes an hour, `GOPENVPN_SOAK_DURATION=2m` shortens it): `scripts/vpn-ns.sh -- go test -tags 'gopenvpn_server gopenvpn_soak' -run Soak -timeout 3h -v -p 1 . ./vpnnet` (the faults are `tc ... netem` on the loopback of the private namespace only; `-p 1` because the two packages share that loopback: at the same time, the second cannot set its faults and its test is skipped)
 - Fuzz one target: `go test ./internal/wire -run '^$' -fuzz FuzzParseControl -fuzztime 60s`
 - Other systems: `GOOS=windows GOARCH=amd64 go build ./... && GOOS=windows GOARCH=amd64 go vet ./...`, the same for `windows/arm64`, `darwin/amd64` and `darwin/arm64`; from step 4.1 `scripts/test-windows.sh` (the unit tests under Wine)
 - Vet: `go vet ./...`
