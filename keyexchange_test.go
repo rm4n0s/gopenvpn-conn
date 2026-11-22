@@ -74,7 +74,7 @@ func TestKeyExchangeMessage(t *testing.T) {
 				}
 				info := peerInfoLines(kx.PeerInfo)
 				for name, want := range map[string]string{
-					"IV_TCPNL": "1", "IV_NCP": "2", "IV_MTU": "1600", "IV_PROTO": "1438",
+					"IV_TCPNL": "1", "IV_NCP": "2", "IV_MTU": "1600", "IV_PROTO": "1950",
 					"IV_CIPHERS": "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
 				} {
 					if info[name] != want {
@@ -400,9 +400,9 @@ func TestIVProtoBitsOfTheTestKnobs(t *testing.T) {
 		cfg  Config
 		want string
 	}{
-		{"all", Config{}, "IV_PROTO=1438\n"},
-		{"no epoch (bit 10)", Config{noEpoch: true}, "IV_PROTO=414\n"},
-		{"no cc-exit (bit 7)", Config{noCCExit: true}, "IV_PROTO=1310\n"},
+		{"all", Config{}, "IV_PROTO=1950\n"},
+		{"no epoch (bit 10)", Config{noEpoch: true}, "IV_PROTO=926\n"},
+		{"no cc-exit (bit 7)", Config{noCCExit: true}, "IV_PROTO=1822\n"},
 	} {
 		_, peerInfo, _ := keyExchangeStrings(&tt.cfg, &net.UDPConn{}, false)
 		if !strings.Contains(peerInfo, tt.want) {

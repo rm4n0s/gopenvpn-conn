@@ -16,7 +16,7 @@ import (
 
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
-	"github.com/rm4n0s/gopenvpn-conn/internal/reliable"
+	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
 	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
 )
 
@@ -37,6 +37,14 @@ const pushRequestInterval = 5 * time.Second
 // DefaultRetransmitTimeout is the first wait before a control packet that is not
 // acknowledged is sent again: OpenVPN's --tls-timeout.
 const DefaultRetransmitTimeout = 2 * time.Second
+
+// DefaultTransitionWindow is how long an old key stays valid after the renegotiation
+// began: OpenVPN's --tran-window.
+const DefaultTransitionWindow = time.Hour
+
+// DefaultRenegotiateRetry is the wait before a renegotiation that failed is tried
+// again.
+const DefaultRenegotiateRetry = 5 * time.Second
 
 // maxPacket is the size of the buffer that reads the link: the largest UDP
 // datagram and the largest TCP frame.
@@ -84,9 +92,27 @@ type Options struct {
 	// the idle time after which a ping is sent, and the silence after which the
 	// session ends. Zero is off.
 	PingInterval, PingTimeout time.Duration
+	// RenegotiateAfter is how long a key is used before the client makes a new one
+	// (OpenVPN's --reneg-sec). Zero or negative means the client never starts a
+	// renegotiation by time; it still answers the server's, and still starts one
+	// when the data channel asks for it (the packet ids, the AEAD usage limit).
+	RenegotiateAfter time.Duration
 	// EpochUsageLimit replaces the usage limit of the keys of the epoch data
-	// format. Only the tests set it.
-	EpochUsageLimit uint64
+	// format, and UsageLimit the one of the keys of the format with 32-bit packet
+	// ids. Only the tests set them.
+	EpochUsageLimit, UsageLimit uint64
+	// PromoteDelay is how long after a new key is made the client starts to send
+	// with it (the new key is used to open packets at once). Zero means the smaller
+	// of HandshakeTimeout and half of RenegotiateAfter, or HandshakeTimeout when
+	// RenegotiateAfter is not set; for the tests it can be anything, even negative,
+	// which means no delay.
+	PromoteDelay time.Duration
+	// TransitionWindow is how long an old key stays valid after the renegotiation
+	// began (OpenVPN's --tran-window); zero means DefaultTransitionWindow.
+	TransitionWindow time.Duration
+	// RenegotiateRetry is how long to wait before a renegotiation that failed is
+	// tried again; zero means DefaultRenegotiateRetry.
+	RenegotiateRetry time.Duration
 	// ResetOnly makes the handshake end with the exchange of resets, with no
 	// TLS: for the tests of that exchange.
 	ResetOnly bool
@@ -113,52 +139,58 @@ type Session struct {
 	ready    chan struct{} // closed when the handshake is complete
 	wg       sync.WaitGroup
 
-	in       chan []byte // from the reader to the loop
-	readErr  chan error
-	out      chan []byte   // from the TLS side to the loop: what crypto/tls wrote
-	adapter  *controlConn  // the net.Conn that crypto/tls runs over
-	tlsReady chan struct{} // closed when the TLS handshake is complete
-	tlsConn  *tls.Conn     // set before tlsReady is closed
-	tlsCfg   *tls.Config
-	ctx      context.Context // ends with the session
-	cancel   context.CancelFunc
-	serverKX *ctrlmsg.ServerKeyExchange // set before tlsReady is closed
-	pushed   *ctrlmsg.Pushed            // set before tlsReady is closed
-	pushDone chan struct{}              // closed when the push reply is complete
-	extend   chan struct{}              // from the control reader to the loop: extendAt has a later end for the handshake
-	extendAt time.Time                  // the latest end that AUTH_PENDING asked for; guarded by mu
-	began    time.Time                  // when the handshake began
-	data     atomic.Pointer[dataPath]   // the data channel, set before tlsReady is closed
-	closing  atomic.Bool                // Close was called
-	ccExit   bool                       // the server pushed cc-exit; set before tlsReady is closed
-	exitSent atomic.Bool                // the EXIT message is written: the loop watches for its acknowledgement
-	wake     chan struct{}              // wakes the loop to look at what Close changed
-	drained  chan struct{}              // closed by the loop when everything it sent is acknowledged, after EXIT
-	rdl, wdl *deadline                  // the read and write deadlines of the connection
-	linkMu   sync.Mutex                 // one writer of the link at a time
-	base     time.Time                  // the zero of sentAt
-	sentAt   atomic.Int64               // when a packet last went to the link, as time since base
-	recv     chan []byte                // decrypted IP packets for Read
-	budget   int                        // bytes of TLS in a control packet
-	wkcLen   int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
+	in        chan []byte // from the reader to the loop
+	readErr   chan error
+	out       chan outMsg   // from the TLS sessions to the loop: what crypto/tls wrote
+	events    chan keyEvent // from the TLS sessions of the renegotiations to the loop
+	ks0       *keyState     // the control channel of key id 0
+	tlsReady  chan struct{} // closed when the TLS handshake is complete
+	tlsConn   *tls.Conn     // the TLS session of key id 0; set before tlsReady is closed
+	tlsCfg    *tls.Config
+	ctx       context.Context // ends with the session
+	cancel    context.CancelFunc
+	serverKX  *ctrlmsg.ServerKeyExchange // set before tlsReady is closed
+	pushed    *ctrlmsg.Pushed            // set before tlsReady is closed
+	pushDone  chan struct{}              // closed when the push reply is complete
+	dyn       ctrlwrap.Wrapper           // the protection of the renegotiations (dynamic tls-crypt), or nil; set before tlsReady is closed
+	user      string                     // the credentials of the key exchange of key id 0, kept for the renegotiations, as OpenVPN keeps them
+	pass      string                     // a secret: never logged
+	token     string                     // the auth token that the server pushed, the password of a renegotiation; guarded by mu; a secret
+	tokenUser string                     // its user name, base64, or ""; guarded by mu
+	ctlTLS    atomic.Pointer[tls.Conn]   // the TLS session of the newest key: what EXIT is written to
+	needKey   atomic.Int32               // 1 + the key id whose data channel asked for a renegotiation, or 0
+	extend    chan struct{}              // from the control reader to the loop: extendAt has a later end for the handshake
+	extendAt  time.Time                  // the latest end that AUTH_PENDING asked for; guarded by mu
+	began     time.Time                  // when the handshake began
+	data      atomic.Pointer[dataPath]   // the data channel, set before tlsReady is closed
+	closing   atomic.Bool                // Close was called
+	ccExit    bool                       // the server pushed cc-exit; set before tlsReady is closed
+	exitSent  atomic.Bool                // the EXIT message is written: the loop watches for its acknowledgement
+	wake      chan struct{}              // wakes the loop to look at what Close changed
+	drained   chan struct{}              // closed by the loop when everything it sent is acknowledged, after EXIT
+	rdl, wdl  *deadline                  // the read and write deadlines of the connection
+	linkMu    sync.Mutex                 // one writer of the link at a time
+	base      time.Time                  // the zero of sentAt
+	sentAt    atomic.Int64               // when a packet last went to the link, as time since base
+	recv      chan []byte                // decrypted IP packets for Read
+	wkcLen    int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
 	// Owned by the loop goroutine.
-	sender          *reliable.Sender
-	receiver        reliable.Receiver
-	remote          wire.SessionID // the server's
-	haveRemote      bool
-	serverResetSeen bool
-	wkcAsked        bool      // the server's reset asked for the wrapped key again
-	wkcSent         bool      // the first packet after the reset went out as CONTROL_WKC_V1
-	wkcQueued       bool      // ResetOnly: the empty CONTROL_WKC_V1 is queued
-	lastRecv        time.Time // when something authentic last came from the server
-	kaInterval      time.Duration
-	kaTimeout       time.Duration
-	kaOn            bool   // the keepalive runs: the handshake is complete
-	drainedClosed   bool   // drained is closed
-	pending         []byte // what crypto/tls wrote, not yet in packets
-	thirdSent       bool   // an acknowledgement of the server's reset went out
-	body, packet    []byte
+	keys          [datachan.MaxKeyID + 1]*keyState // the control channels, by key id
+	primary, lame *keyState                        // the newest key (still being made, or made) and the one before it
+	dirty         bool                             // the keys changed: the table is to be published again
+	nextID        uint8                            // the key id of the next renegotiation
+	attemptEnd    time.Time                        // when a renegotiation that is not done is given up
+	retryAt       time.Time                        // no renegotiation starts before this
+	sendAt        time.Time                        // when the newest key is to be sent with, zero if it is
+	remote        wire.SessionID                   // the server's
+	haveRemote    bool
+	lastRecv      time.Time // when something authentic last came from the server
+	kaInterval    time.Duration
+	kaTimeout     time.Duration
+	kaOn          bool // the keepalive runs: the handshake is complete
+	drainedClosed bool // drained is closed
+	body, packet  []byte
 }
 
 // New makes a Session. It starts nothing: the first Handshake does. It panics
@@ -186,7 +218,6 @@ func New(opts Options) *Session {
 		in:      make(chan []byte, inQueue),
 		readErr: make(chan error, 1),
 		recv:    make(chan []byte, recvQueue),
-		sender:  reliable.NewSender(opts.RetransmitTimeout),
 		base:    time.Now(),
 		rdl:     newDeadline(),
 		drained: make(chan struct{}),
@@ -200,9 +231,6 @@ func New(opts Options) *Session {
 		s.resetOp = wire.HardResetClientV3
 		s.wkcLen = w.WKcLen()
 	}
-	if opts.Wrapper != nil {
-		s.budget = payloadBudget(opts.Wrapper)
-	}
 	if opts.TLS != nil {
 		s.tlsCfg = opts.TLS.Clone()
 		if s.tlsCfg.MinVersion < tls.VersionTLS12 {
@@ -210,11 +238,16 @@ func New(opts Options) *Session {
 		}
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
-	s.out = make(chan []byte)
+	s.out = make(chan outMsg)
+	s.events = make(chan keyEvent)
+	s.nextID = 1
 	s.tlsReady = make(chan struct{})
 	s.pushDone = make(chan struct{})
 	s.extend = make(chan struct{}, 1)
-	s.adapter = newControlConn(s)
+	if opts.Wrapper != nil {
+		s.ks0 = s.newKeyState(0, opts.Wrapper)
+		s.keys[0], s.primary = s.ks0, s.ks0
+	}
 	if opts.Err != nil {
 		s.err = opts.Err
 		close(s.done)
@@ -277,7 +310,7 @@ func (s *Session) start() {
 	go s.loop()
 	if !s.opts.ResetOnly {
 		s.wg.Add(1)
-		go s.tlsMain()
+		go s.tlsMain(s.ks0)
 	}
 }
 
@@ -458,6 +491,9 @@ const (
 	// after the key exchange (the server ended the TLS session, or the
 	// connection broke). Metadata: "op" ("read" or "write").
 	TagControlChannelFailed = "ControlChannelFailed"
+	// TagRenegotiationFailed: the key that is in use reached the end of its life and
+	// no new one was made: every attempt failed or timed out. Metadata: "key_id".
+	TagRenegotiationFailed = "RenegotiationFailed"
 	// TagCredentialsFailed: the function that gives the user name and password
 	// returned an error. The cause can be found with errors.Is.
 	TagCredentialsFailed = "CredentialsFailed"

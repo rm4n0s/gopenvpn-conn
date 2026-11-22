@@ -14,6 +14,7 @@ import (
 
 	"github.com/rm4n0s/errors"
 
+	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
 	"github.com/rm4n0s/gopenvpn-conn/internal/keys"
 )
@@ -21,6 +22,7 @@ import (
 // serverData is the data channel of the server: the keys of the TLS exporter,
 // used the other way round from the client.
 type serverData struct {
+	id   uint8
 	ch   datachan.Channel
 	rbuf []byte     // the loop goroutine only
 	mu   sync.Mutex // Seal: SendData and the echo run apart
@@ -28,7 +30,7 @@ type serverData struct {
 
 // setupData makes the data channel from the TLS session, once the key exchange is
 // done. A failure fails the test: the server of a test has no reason to refuse.
-func (s *Server) setupData(conn *tls.Conn) {
+func (s *Server) setupData(conn *tls.Conn, ks *serverKS) {
 	cipher, ok := datachan.LookupCipher(s.dataCipher())
 	if !ok {
 		s.tb.Errorf("vpntest server: no data cipher %q", s.opts.DataCipher)
@@ -45,7 +47,10 @@ func (s *Server) setupData(conn *tls.Conn) {
 		s.tb.Errorf("vpntest server: %v", err)
 		return
 	}
-	header := datachan.Header{HasPeerID: !s.opts.DataV1}
+	if ks.id == 0 && s.opts.DynamicTLSCrypt {
+		s.setupDynamic(&state)
+	}
+	header := datachan.Header{HasPeerID: !s.opts.DataV1, KeyID: ks.id}
 	var ch datachan.Channel
 	if s.opts.Epoch {
 		ch, err = datachan.NewEpochChannel(cipher, &dk.ServerToClient, &dk.ClientToServer, header,
@@ -58,8 +63,44 @@ func (s *Server) setupData(conn *tls.Conn) {
 		return
 	}
 	s.mu.Lock()
-	s.data = &serverData{ch: ch}
+	ks.data, ks.established = &serverData{id: ks.id, ch: ch}, time.Now()
+	s.order = append(s.order, ks)
+	s.history = append(s.history, ks.id)
 	s.mu.Unlock()
+}
+
+// setupDynamic makes the protection of the renegotiations from the TLS session of
+// the first key, the way the client does, with the server's side of the keys.
+func (s *Server) setupDynamic(state *tls.ConnectionState) {
+	material, err := state.ExportKeyingMaterial(ctrlwrap.DynamicLabel, nil, keys.StaticKeySize)
+	if err != nil {
+		s.tb.Errorf("vpntest server: exporting the dynamic tls-crypt key: %v", err)
+		return
+	}
+	w, err := ctrlwrap.NewDynamic(material, s.opts.StaticKey, true, time.Now)
+	if err != nil {
+		s.tb.Errorf("vpntest server: %v", err)
+		return
+	}
+	s.mu.Lock()
+	s.dyn = w
+	s.mu.Unlock()
+}
+
+// sendKey is the data channel the server seals with: the newest key once its delay has
+// passed, else the one before it.
+func (s *Server) sendKey() *serverData {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(s.order)
+	if n == 0 {
+		return nil
+	}
+	newest := s.order[n-1]
+	if n > 1 && time.Since(newest.established) < s.opts.SwitchDelay {
+		return s.order[n-2].data
+	}
+	return newest.data
 }
 
 func (s *Server) dataCipher() string {
@@ -72,9 +113,12 @@ func (s *Server) dataCipher() string {
 // handleData opens a data packet of the client (in the loop goroutine), keeps its
 // IP packet for DataReceived and echoes it when the options say so.
 func (s *Server) handleData(raw []byte) {
-	s.mu.Lock()
-	d := s.data
-	s.mu.Unlock()
+	var d *serverData
+	if ks := s.getKS(raw[0] & 0x07); ks != nil {
+		s.mu.Lock()
+		d = ks.data
+		s.mu.Unlock()
+	}
 	if d == nil {
 		s.mu.Lock()
 		s.dataDropped++
@@ -116,11 +160,32 @@ func (s *Server) handleData(raw []byte) {
 // It returns the data packet as it went on the link (without the TCP frame), for
 // a test that sends it again.
 func (s *Server) SendData(payload []byte) ([]byte, error) {
-	s.mu.Lock()
-	d := s.data
-	s.mu.Unlock()
+	d := s.sendKey()
 	if d == nil {
 		s.tb.Error("vpntest server: SendData before the key exchange is done")
+		return nil, nil
+	}
+	d.mu.Lock()
+	packet, err := d.ch.Seal(nil, payload)
+	d.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return packet, s.SendPacket(packet)
+}
+
+// SendDataWithKey is SendData with the key of a key id that the server holds, not the
+// one that it seals with now: for the tests of the old key. It fails the test when the
+// server has no such key.
+func (s *Server) SendDataWithKey(id uint8, payload []byte) ([]byte, error) {
+	var d *serverData
+	if ks := s.getKS(id); ks != nil {
+		s.mu.Lock()
+		d = ks.data
+		s.mu.Unlock()
+	}
+	if d == nil {
+		s.tb.Errorf("vpntest server: no key with the key id %d", id)
 		return nil, nil
 	}
 	d.mu.Lock()

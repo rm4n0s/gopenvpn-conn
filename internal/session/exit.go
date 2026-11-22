@@ -37,7 +37,7 @@ var occExit = []byte{
 func (s *Session) goodbye() {
 	switch {
 	case s.ccExit:
-		conn := s.tlsConn
+		conn := s.ctlTLS.Load()
 		if _, err := conn.Write(ctrlmsg.AppendMessage(nil, ctrlmsg.Exit)); err != nil {
 			s.log.Debug("could not send EXIT", "err", err)
 			return

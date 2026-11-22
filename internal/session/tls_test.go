@@ -39,6 +39,7 @@ type tlsOptions struct {
 	mtu          int
 	ping         [2]time.Duration // PingInterval and PingTimeout
 	wrapLink     func(net.Conn) net.Conn
+	tweak        func(*Options) // changes the options of the session before it is made
 }
 
 func newTLSRig(t *testing.T, o tlsOptions) *tlsRig {
@@ -88,11 +89,15 @@ func newTLSRig(t *testing.T, o tlsOptions) *tlsRig {
 	if o.wrapLink != nil {
 		link = o.wrapLink(link)
 	}
-	s := New(Options{
+	opts := Options{
 		Link: link, Stream: o.transport.stream, Wrapper: o.wrap.client(t),
 		HandshakeTimeout: timeout, TLS: client, Ciphers: o.ciphers, MTU: o.mtu,
 		PingInterval: o.ping[0], PingTimeout: o.ping[1],
-	})
+	}
+	if o.tweak != nil {
+		o.tweak(&opts)
+	}
+	s := New(opts)
 	closeAtEnd(t, s)
 	return &tlsRig{rig: &rig{session: s, server: srv, client: link, peer: peer}, pki: pki}
 }
@@ -470,9 +475,9 @@ func TestInboundTLSBytesAreBounded(t *testing.T) {
 	s := New(Options{Link: client, Wrapper: ctrlwrap.NewPlain(), HandshakeTimeout: time.Minute, TLS: &tls.Config{}})
 	closeAtEnd(t, s)
 	sid := wire.RandomSessionID()
-	s.remote, s.haveRemote, s.serverResetSeen = sid, true, true
-	s.receiver.Receive(0, nil) // the reset
-	s.receiver.Acks(wire.MaxAcks)
+	s.remote, s.haveRemote, s.ks0.peerReset = sid, true, true
+	s.ks0.receiver.Receive(0, nil) // the reset
+	s.ks0.receiver.Acks(wire.MaxAcks)
 
 	packet := func(id uint32) []byte {
 		raw, err := wire.AppendControl(nil, &wire.Control{Opcode: wire.ControlV1, SessionID: sid, PacketID: id, Payload: []byte("tls bytes")})
@@ -481,19 +486,19 @@ func TestInboundTLSBytesAreBounded(t *testing.T) {
 		}
 		return raw
 	}
-	s.adapter.push(make([]byte, inboundLimit))
+	s.ks0.adapter.push(make([]byte, inboundLimit))
 	s.handle(packet(1))
-	if s.receiver.HasPendingAcks() || s.Dropped() != 1 {
-		t.Fatalf("a packet was taken with %d bytes waiting (dropped %d)", s.adapter.queued(), s.Dropped())
+	if s.ks0.receiver.HasPendingAcks() || s.Dropped() != 1 {
+		t.Fatalf("a packet was taken with %d bytes waiting (dropped %d)", s.ks0.adapter.queued(), s.Dropped())
 	}
 	// TLS reads: the same packet is taken, and acknowledged.
 	buf := make([]byte, inboundLimit)
-	if n, err := s.adapter.Read(buf); err != nil || n != inboundLimit {
+	if n, err := s.ks0.adapter.Read(buf); err != nil || n != inboundLimit {
 		t.Fatalf("Read = %d, %v", n, err)
 	}
 	s.handle(packet(1))
-	if !s.receiver.HasPendingAcks() || s.adapter.queued() != len("tls bytes") {
-		t.Errorf("the packet was not taken: acks %v, queued %d", s.receiver.HasPendingAcks(), s.adapter.queued())
+	if !s.ks0.receiver.HasPendingAcks() || s.ks0.adapter.queued() != len("tls bytes") {
+		t.Errorf("the packet was not taken: acks %v, queued %d", s.ks0.receiver.HasPendingAcks(), s.ks0.adapter.queued())
 	}
 }
 

@@ -109,8 +109,11 @@ func (s *Session) loop() {
 	keepalive := time.NewTimer(time.Hour)
 	keepalive.Stop()
 	defer keepalive.Stop()
+	reneg := time.NewTimer(time.Hour)
+	reneg.Stop()
+	defer reneg.Stop()
 
-	if _, err := s.sender.Queue(s.resetOp, nil); err != nil {
+	if _, err := s.ks0.sender.Queue(s.ks0.resetOp, nil); err != nil {
 		s.fail(err)
 		return
 	}
@@ -120,32 +123,21 @@ func (s *Session) loop() {
 		tlsReady = nil
 	}
 	for {
-		// What crypto/tls has written is taken once the server's reset is in,
-		// and only when the bytes of the last write are all in packets.
-		var outbound <-chan []byte
-		if !s.opts.ResetOnly && s.serverResetSeen && len(s.pending) == 0 {
-			outbound = s.out
-		}
-		select {
-		case msg := <-outbound:
-			s.pending = msg
-		default:
+		if complete && !s.opts.ResetOnly && !s.renegTick() {
+			return
 		}
 		if err := s.flush(); err != nil {
 			s.fail(err)
 			return
 		}
-		if len(s.pending) > 0 {
-			outbound = nil // the bytes that are waiting go first: take no more
-		}
-		if !s.drainedClosed && s.exitSent.Load() && len(s.pending) == 0 && s.sender.Len() == 0 {
+		if !s.drainedClosed && s.exitSent.Load() && s.settled() {
 			s.drainedClosed = true // EXIT, and all that came before it, is acknowledged
 			close(s.drained)
 		}
 		if !complete {
 			switch {
 			case s.opts.ResetOnly:
-				complete = s.serverResetSeen && s.thirdSent && s.sender.Len() == 0
+				complete = s.ks0.peerReset && s.ks0.thirdSent && s.ks0.sender.Len() == 0
 			default:
 				complete = tlsReady == nil
 			}
@@ -153,11 +145,12 @@ func (s *Session) loop() {
 				handshake.Stop()
 				if !s.opts.ResetOnly {
 					s.startKeepalive()
+					s.startRenegotiation()
 				}
 				close(s.ready)
 			}
 		}
-		if at, ok := s.sender.NextDeadline(); ok {
+		if at, ok := s.nextRetransmit(); ok {
 			retransmit.Reset(max(0, time.Until(at)))
 		} else {
 			retransmit.Stop()
@@ -167,13 +160,20 @@ func (s *Session) loop() {
 		} else {
 			keepalive.Stop()
 		}
+		if at, ok := s.renegWait(); ok && complete && !s.opts.ResetOnly {
+			reneg.Reset(max(0, time.Until(at)))
+		} else {
+			reneg.Stop()
+		}
 		select {
 		case <-s.done:
 			return
 		case pkt := <-s.in:
 			s.handle(pkt)
-		case msg := <-outbound:
-			s.pending = msg
+		case m := <-s.out:
+			s.take(m)
+		case ev := <-s.events:
+			s.onKeyEvent(ev)
 		case <-tlsReady:
 			tlsReady = nil
 		case <-s.extend:
@@ -192,6 +192,7 @@ func (s *Session) loop() {
 				"timeout", s.opts.HandshakeTimeout.String()))
 			return
 		case <-retransmit.C:
+		case <-reneg.C:
 		case <-s.wake:
 		case <-keepalive.C:
 			if !s.keepaliveTick() {
@@ -210,23 +211,72 @@ func (s *Session) closeLink() {
 	}
 }
 
-// flush sends the packets that are due, with the acknowledgements that wait
-// on them, and an ACK_V1 when acknowledgements still wait.
-func (s *Session) flush() error {
-	if err := s.fillSender(); err != nil {
-		return err
+// take keeps what crypto/tls wrote to the conn of a key state, until it is in packets.
+// A key state that is gone gets nothing.
+func (s *Session) take(m outMsg) {
+	if m.ks.closing.Load() || s.keys[m.ks.id] != m.ks {
+		return
 	}
-	for _, o := range s.sender.Due(time.Now()) {
-		c := wire.Control{Opcode: o.Opcode, SessionID: s.sid, PacketID: o.ID, Payload: o.Payload}
-		s.addAcks(&c)
-		if err := s.send(&c); err != nil {
+	m.ks.pending, m.ks.holding = m.data, true
+}
+
+// settled reports whether everything that the control channels have to send is sent
+// and acknowledged.
+func (s *Session) settled() bool {
+	for _, ks := range s.keys {
+		if ks != nil && (len(ks.pending) > 0 || ks.sender.Len() > 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// nextRetransmit is the earliest time that a control packet of any key state is to be
+// sent again.
+func (s *Session) nextRetransmit() (time.Time, bool) {
+	var first time.Time
+	found := false
+	for _, ks := range s.keys {
+		if ks == nil {
+			continue
+		}
+		if at, ok := ks.sender.NextDeadline(); ok && (!found || at.Before(first)) {
+			first, found = at, true
+		}
+	}
+	return first, found
+}
+
+// flush sends the packets that are due for each key state, with the acknowledgements
+// that wait on them, and an ACK_V1 when acknowledgements still wait.
+func (s *Session) flush() error {
+	for _, ks := range s.keys {
+		if ks == nil {
+			continue
+		}
+		if err := s.flushKey(ks); err != nil {
 			return err
 		}
 	}
-	if s.receiver.HasPendingAcks() {
-		c := wire.Control{Opcode: wire.AckV1, SessionID: s.sid}
-		s.addAcks(&c)
-		if err := s.send(&c); err != nil {
+	return nil
+}
+
+func (s *Session) flushKey(ks *keyState) error {
+	if err := s.fillSender(ks); err != nil {
+		return err
+	}
+	ks.giveBack()
+	for _, o := range ks.sender.Due(time.Now()) {
+		c := wire.Control{Opcode: o.Opcode, KeyID: ks.id, SessionID: s.sid, PacketID: o.ID, Payload: o.Payload}
+		s.addAcks(ks, &c)
+		if err := s.send(ks, &c); err != nil {
+			return err
+		}
+	}
+	if ks.receiver.HasPendingAcks() {
+		c := wire.Control{Opcode: wire.AckV1, KeyID: ks.id, SessionID: s.sid}
+		s.addAcks(ks, &c)
+		if err := s.send(ks, &c); err != nil {
 			return err
 		}
 	}
@@ -234,44 +284,48 @@ func (s *Session) flush() error {
 }
 
 // fillSender cuts what crypto/tls wrote into control packets, as many as the
-// send window has room for. The first packet after the reset is a
-// CONTROL_WKC_V1, with less room, when the server asked for the wrapped key.
+// send window has room for, once the peer's reset is in. The first packet after the
+// reset of key id 0 is a CONTROL_WKC_V1, with less room, when the server asked for
+// the wrapped key.
 //
 // OpenVPN: ssl.c write_outgoing_tls_ciphertext.
-func (s *Session) fillSender() error {
-	for len(s.pending) > 0 && s.sender.CanSend() {
-		op, room := wire.ControlV1, s.budget
-		if s.wkcAsked && !s.wkcSent {
+func (s *Session) fillSender(ks *keyState) error {
+	if !ks.peerReset {
+		return nil
+	}
+	for len(ks.pending) > 0 && ks.sender.CanSend() {
+		op, room := wire.ControlV1, ks.budget
+		if ks.wkcAsked && !ks.wkcSent {
 			op, room = wire.ControlWKCV1, max(minPayload, room-s.wkcLen)
-			s.wkcSent = true
+			ks.wkcSent = true
 		}
-		n := min(room, len(s.pending))
-		if _, err := s.sender.Queue(op, s.pending[:n:n]); err != nil {
+		n := min(room, len(ks.pending))
+		if _, err := ks.sender.Queue(op, ks.pending[:n:n]); err != nil {
 			return err
 		}
-		s.pending = s.pending[n:]
+		ks.pending = ks.pending[n:]
 	}
 	return nil
 }
 
 // addAcks puts the acknowledgements that fit into a packet on it.
-func (s *Session) addAcks(c *wire.Control) {
+func (s *Session) addAcks(ks *keyState, c *wire.Control) {
 	if !s.haveRemote {
 		return
 	}
-	if acks := s.receiver.Acks(wire.MaxAcks); len(acks) > 0 {
+	if acks := ks.receiver.Acks(wire.MaxAcks); len(acks) > 0 {
 		c.Acks = acks
 		c.RemoteSessionID = s.remote
 	}
 }
 
 // send protects a control packet and writes it to the link.
-func (s *Session) send(c *wire.Control) error {
+func (s *Session) send(ks *keyState, c *wire.Control) error {
 	var err error
 	if s.body, err = wire.AppendControlBody(s.body[:0], c); err != nil {
 		return err
 	}
-	if s.packet, err = s.opts.Wrapper.Wrap(s.packet[:0], wire.FirstByte(c.Opcode, c.KeyID), c.SessionID, s.body); err != nil {
+	if s.packet, err = ks.wrap.Wrap(s.packet[:0], wire.FirstByte(c.Opcode, c.KeyID), c.SessionID, s.body); err != nil {
 		return err
 	}
 	out := s.packet
@@ -284,8 +338,8 @@ func (s *Session) send(c *wire.Control) error {
 		return errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
 	}
 	s.touchSent()
-	if s.serverResetSeen && len(c.Acks) > 0 {
-		s.thirdSent = true
+	if ks.peerReset && len(c.Acks) > 0 {
+		ks.thirdSent = true
 	}
 	return nil
 }
@@ -305,17 +359,25 @@ func (s *Session) handle(raw []byte) {
 		return
 	}
 	op, keyID := wire.SplitFirstByte(raw[0])
-	if !op.IsControl() || keyID != 0 {
-		s.drop("not a control packet of key 0", nil)
+	if !op.IsControl() {
+		s.drop("not a control packet", nil)
 		return
 	}
-	switch op {
-	case wire.HardResetServerV2, wire.ControlV1, wire.AckV1:
+	switch {
+	case op == wire.HardResetServerV2 && keyID == 0:
+	case op == wire.SoftResetV1 && keyID != 0:
+	case op == wire.ControlV1 || op == wire.AckV1:
 	default:
-		s.drop("an opcode that only a client sends", nil)
+		s.drop("an opcode that only a client sends, or a reset of the wrong key id", nil)
 		return
 	}
-	body, err := s.opts.Wrapper.Unwrap(raw)
+	ks := s.keys[keyID]
+	if ks == nil && op != wire.SoftResetV1 {
+		s.drop("a control packet of a key id that has no key state", nil)
+		return
+	}
+	wrap := s.wrapperFor(keyID)
+	body, err := wrap.Unwrap(raw)
 	if err != nil {
 		s.drop("the protection does not check", err)
 		return
@@ -341,17 +403,24 @@ func (s *Session) handle(raw []byte) {
 		s.drop("acknowledges another session", nil)
 		return
 	}
-	resend := false
-	if op == wire.HardResetServerV2 {
-		if c.PacketID != 0 {
-			s.drop("a reset with an id that is not 0", nil)
+	isReset := op == wire.HardResetServerV2 || op == wire.SoftResetV1
+	if isReset && c.PacketID != 0 {
+		s.drop("a reset with an id that is not 0", nil)
+		return
+	}
+	if ks == nil {
+		// The server asks for a renegotiation: a soft reset of a key id that is free,
+		// once the key in use is complete. It is authentic here, so it is answered.
+		if ks = s.acceptSoftReset(keyID); ks == nil {
+			s.drop("a soft reset that is not accepted now", nil)
 			return
 		}
-		if !s.serverResetSeen && s.resetOp == wire.HardResetClientV3 {
-			if resend, err = wire.ParseEarlyNegotiation(c.Payload); err != nil {
-				s.drop("the payload of the reset does not parse", err)
-				return
-			}
+	}
+	resend := false
+	if op == wire.HardResetServerV2 && !ks.peerReset && s.resetOp == wire.HardResetClientV3 {
+		if resend, err = wire.ParseEarlyNegotiation(c.Payload); err != nil {
+			s.drop("the payload of the reset does not parse", err)
+			return
 		}
 	}
 
@@ -361,33 +430,33 @@ func (s *Session) handle(raw []byte) {
 		s.remote, s.haveRemote = c.SessionID, true
 	}
 	for _, id := range c.Acks {
-		s.sender.Ack(id)
+		ks.sender.Ack(id)
 	}
 	if op == wire.AckV1 {
 		return
 	}
-	if !s.opts.ResetOnly && s.adapter.queued() >= inboundLimit {
+	if !s.opts.ResetOnly && ks.adapter.queued() >= inboundLimit {
 		// Not acknowledged, so the server sends it again when TLS has caught
 		// up. Its acknowledgements were taken above.
 		s.drop("the TLS side has not read what is waiting", nil)
 		return
 	}
-	payloads, ack := s.receiver.Receive(c.PacketID, c.Payload)
+	payloads, ack := ks.receiver.Receive(c.PacketID, c.Payload)
 	if !ack {
 		s.drop("not accepted by the reliability layer", nil)
 		return
 	}
-	if op == wire.HardResetServerV2 && !s.serverResetSeen {
-		s.serverResetSeen = true
-		s.wkcAsked = resend
+	if isReset && !ks.peerReset {
+		ks.peerReset = true
+		ks.wkcAsked = resend
 		if len(payloads) > 0 {
 			payloads = payloads[1:] // the payload of the reset is the TLVs, not TLS
 		}
-		if resend && s.opts.ResetOnly && !s.wkcQueued {
+		if resend && s.opts.ResetOnly && !ks.wkcQueued {
 			// The server asks for the wrapped key again, and there is no TLS
 			// to send it with: an empty packet carries it, and the acknowledgement.
-			s.wkcQueued = true
-			if _, err := s.sender.Queue(wire.ControlWKCV1, nil); err != nil {
+			ks.wkcQueued = true
+			if _, err := ks.sender.Queue(wire.ControlWKCV1, nil); err != nil {
 				s.fail(err)
 				return
 			}
@@ -398,27 +467,52 @@ func (s *Session) handle(raw []byte) {
 			s.drop("TLS bytes, and no TLS in this mode", nil)
 			continue
 		}
-		s.adapter.push(p)
+		ks.adapter.push(p)
 	}
 }
 
-// tlsMain runs the TLS handshake over the control channel. It is a goroutine
-// of the session: it ends when the handshake does, and when the session ends
-// (the conn that crypto/tls reads and writes then fails).
-func (s *Session) tlsMain() {
+// tlsMain runs the TLS handshake over the control channel of a key state, and then
+// reads its control messages. It is a goroutine of the session: it ends when the
+// session does, and when its key state is thrown away (the conn that crypto/tls
+// reads and writes then fails). A failure of key id 0 ends the session; a failure
+// of a renegotiation is told to the loop, which tries again later.
+func (s *Session) tlsMain(ks *keyState) {
 	defer s.wg.Done()
-	conn := tls.Client(s.adapter, s.tlsCfg)
+	conn := tls.Client(ks.adapter, s.tlsCfg)
 	if err := conn.Handshake(); err != nil {
-		s.fail(errors.NewErr(TagTLSHandshakeFailed, err))
+		s.keyFailed(ks, errors.NewErr(TagTLSHandshakeFailed, err))
 		return
 	}
-	kx, err := s.keyExchange(conn)
+	kx, err := s.keyExchange(ks, conn)
 	if err != nil {
+		s.keyFailed(ks, err)
+		return
+	}
+	if ks.id == 0 {
+		s.tlsConn, s.serverKX = conn, kx
+		ks.tlsConn = conn
+		s.ctlTLS.Store(conn)
+	} else {
+		select {
+		case s.events <- keyEvent{ks: ks, conn: conn, state: conn.ConnectionState()}:
+		case <-s.done:
+			return
+		}
+	}
+	s.controlLoop(ks, conn)
+}
+
+// keyFailed ends the session for a failure of key id 0, and tells the loop about the
+// failure of a renegotiation.
+func (s *Session) keyFailed(ks *keyState, err error) {
+	if ks.id == 0 {
 		s.fail(err)
 		return
 	}
-	s.tlsConn, s.serverKX = conn, kx
-	s.controlLoop(conn)
+	select {
+	case s.events <- keyEvent{ks: ks, err: err}:
+	case <-s.done:
+	}
 }
 
 // controlLoop reads the control messages that the server sends in TLS, for as
@@ -427,11 +521,13 @@ func (s *Session) tlsMain() {
 // understood are ignored and logged by name only.
 //
 // OpenVPN: push.c send_push_request, incoming_push_message.
-func (s *Session) controlLoop(conn *tls.Conn) {
-	s.wg.Add(1)
-	go s.pushRequests(conn)
+func (s *Session) controlLoop(ks *keyState, conn *tls.Conn) {
 	var pushed ctrlmsg.Pushed
-	ready := false
+	ready := ks.id != 0 // the push is of the first key only
+	if !ready {
+		s.wg.Add(1)
+		go s.pushRequests(conn)
+	}
 	buf := make([]byte, 1<<15)
 	var stream []byte // bytes read that do not make a whole message yet
 	for {
@@ -440,7 +536,13 @@ func (s *Session) controlLoop(conn *tls.Conn) {
 			select {
 			case <-s.done: // the session ended: this is how the read stops
 			default:
-				s.fail(errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "read"))
+				switch {
+				case ks.closing.Load(): // the key was thrown away: this is how the read stops
+				case s.ctlTLS.Load() == conn:
+					s.fail(errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "read"))
+				default:
+					s.log.Debug("the control channel of an old key ended", "key_id", ks.id, "err", err)
+				}
 			}
 			return
 		}
@@ -495,7 +597,11 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 		}
 		return true
 	}
-	if !ctrlmsg.IsPushReply(text) || *ready {
+	if ctrlmsg.IsPushReply(text) && *ready {
+		s.pushUpdate(text)
+		return false
+	}
+	if !ctrlmsg.IsPushReply(text) {
 		s.log.Debug("ignored a control message", "name", ctrlmsg.Name(text))
 		return false
 	}
@@ -523,6 +629,7 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 		s.fail(err)
 		return true
 	}
+	s.keepToken(pushed.AuthToken, pushed.AuthTokenUser)
 	s.pushed, *ready = pushed, true
 	close(s.pushDone)
 	close(s.tlsReady)
@@ -585,13 +692,16 @@ func (s *Session) pushRequests(conn *tls.Conn) {
 // it (SPEC §8.3), so what it gives the library is the server's strings.
 //
 // OpenVPN: ssl.c key_method_2_write, key_method_2_read.
-func (s *Session) keyExchange(conn *tls.Conn) (*ctrlmsg.ServerKeyExchange, error) {
+func (s *Session) keyExchange(ks *keyState, conn *tls.Conn) (*ctrlmsg.ServerKeyExchange, error) {
 	var username, password string
-	if s.opts.Credentials != nil {
+	if ks.id != 0 {
+		username, password = s.renegotiationCredentials()
+	} else if s.opts.Credentials != nil {
 		var err error
 		if username, password, err = s.opts.Credentials(s.ctx); err != nil {
 			return nil, errors.NewErr(TagCredentialsFailed, err)
 		}
+		s.user, s.pass = username, password
 	}
 	msg, err := ctrlmsg.AppendClientKeyExchange(nil, ctrlmsg.NewClientKeyExchange(s.opts.Options, username, password, s.opts.PeerInfo))
 	if err != nil {

@@ -47,15 +47,23 @@ func payloadBudget(w ctrlwrap.Wrapper) int {
 // control packets that arrive in order come out of its Read.
 type controlConn struct {
 	s      *Session
+	ks     *keyState
 	notify chan struct{} // there is something to read, or the conn is closed
+	gone   chan struct{} // closed with the conn
 
 	mu     sync.Mutex
 	buf    []byte
 	closed bool
 }
 
-func newControlConn(s *Session) *controlConn {
-	return &controlConn{s: s, notify: make(chan struct{}, 1)}
+func newControlConn(s *Session, ks *keyState) *controlConn {
+	return &controlConn{s: s, ks: ks, notify: make(chan struct{}, 1), gone: make(chan struct{})}
+}
+
+// outMsg is what crypto/tls wrote to the conn of a key state, on its way to the loop.
+type outMsg struct {
+	ks   *keyState
+	data []byte
 }
 
 // push adds the bytes that came in order. The loop calls it.
@@ -116,15 +124,18 @@ func (c *controlConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	c.mu.Lock()
-	closed := c.closed
-	c.mu.Unlock()
-	if closed {
+	select {
+	case <-c.ks.room: // the bytes of the Write before this one are all in packets
+	case <-c.gone:
+		return 0, net.ErrClosed
+	case <-c.s.done:
 		return 0, net.ErrClosed
 	}
 	select {
-	case c.s.out <- append([]byte(nil), p...):
+	case c.s.out <- outMsg{ks: c.ks, data: append([]byte(nil), p...)}:
 		return len(p), nil
+	case <-c.gone:
+		return 0, net.ErrClosed
 	case <-c.s.done:
 		return 0, net.ErrClosed
 	}
@@ -133,11 +144,19 @@ func (c *controlConn) Write(p []byte) (int, error) {
 // Close ends the use of the conn by crypto/tls (it closes the conn when its
 // context ends and after an alert). The link is the session's: it stays.
 func (c *controlConn) Close() error {
+	c.shut()
+	return nil
+}
+
+// shut closes the conn: reads and writes that wait return net.ErrClosed.
+func (c *controlConn) shut() {
 	c.mu.Lock()
-	c.closed = true
+	if !c.closed {
+		c.closed = true
+		close(c.gone)
+	}
 	c.mu.Unlock()
 	c.wake()
-	return nil
 }
 
 func (c *controlConn) LocalAddr() net.Addr  { return c.s.opts.Link.LocalAddr() }

@@ -49,6 +49,10 @@ var cipherKeyBits = map[string]int{
 // Config.HandshakeTimeout is zero: OpenVPN's --hand-window.
 const DefaultHandshakeTimeout = 60 * time.Second
 
+// DefaultRenegotiateAfter is how long a key is used when Config.RenegotiateAfter is
+// zero: OpenVPN's --reneg-sec.
+const DefaultRenegotiateAfter = time.Hour
+
 // Config is the configuration of a client, as tls.Config is for TLS. The zero
 // value of a field means its default. A Config is not changed by the library
 // and may be shared by connections.
@@ -104,6 +108,14 @@ type Config struct {
 	// server pushes (ping-restart) wins. Zero means no timeout unless the server
 	// pushes one; negative is invalid.
 	PingTimeout time.Duration
+
+	// RenegotiateAfter is how long a key is used before the client makes a new one,
+	// without a break in the traffic (the profile's reneg-sec); zero means
+	// DefaultRenegotiateAfter and a negative value means never. A value that the
+	// server pushes does not change it: the server renegotiates by its own time too,
+	// and whoever is first starts it. Early renegotiations when a key is nearly used up
+	// happen whatever this is.
+	RenegotiateAfter time.Duration
 
 	// Logger gets the events of the connection, with the error of a failure
 	// as the attribute "err". It never gets a key, a password or a packet's

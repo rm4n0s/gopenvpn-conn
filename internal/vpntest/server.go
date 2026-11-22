@@ -18,6 +18,7 @@ import (
 	"github.com/rm4n0s/errors"
 
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
+	"github.com/rm4n0s/gopenvpn-conn/internal/keys"
 	"github.com/rm4n0s/gopenvpn-conn/internal/reliable"
 	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
 )
@@ -88,6 +89,22 @@ type ServerOptions struct {
 	// packets.
 	Epoch           bool
 	EpochUsageLimit uint64
+	// StaticKey is the static key that protects the control channel of the first
+	// session (the key of tls-auth or tls-crypt, Kc of tls-crypt-v2), when
+	// DynamicTLSCrypt is set: the key of the renegotiations is the exporter's key
+	// XORed with it. Nil means none.
+	StaticKey *keys.StaticKey
+	// DynamicTLSCrypt makes the server protect the control packets of the
+	// renegotiations (key ids above 0) with dynamic tls-crypt, made from the TLS
+	// session of the first key; the push reply must have protocol-flags dyn-tls-crypt.
+	DynamicTLSCrypt bool
+	// RejectRenegotiations is how many renegotiations that the client starts the
+	// server ignores (it reads them and answers nothing), so that they fail.
+	RejectRenegotiations int
+	// SwitchDelay is how long after a new key is made the server starts to send with
+	// it; the default is 1 second. The client opens packets of the new key at once,
+	// but only after its own key exchange is done, which the server cannot see.
+	SwitchDelay time.Duration
 	// EchoData makes the server send every IP packet that it receives back.
 	EchoData bool
 	// Fault is how the server misbehaves.
@@ -95,6 +112,29 @@ type ServerOptions struct {
 	// RetransmitTimeout is the first wait before it sends a packet again;
 	// 2 seconds when zero.
 	RetransmitTimeout time.Duration
+}
+
+// serverKS is the control channel of one key id of the server: the same pieces as the
+// session's key state, and a TLS server over it.
+type serverKS struct {
+	id        uint8
+	sender    *reliable.Sender
+	receiver  reliable.Receiver
+	peerReset bool     // the client's reset has come
+	backlog   [][]byte // what TLS wrote, not yet in packets
+	muted     bool     // the server ignores the packets of this key state
+
+	tlsEnd, bridge net.Conn
+	tlsIn          chan []byte
+	data           *serverData // guarded by Server.mu
+	established    time.Time   // guarded by Server.mu
+	closed         bool        // guarded by Server.mu
+}
+
+// chunk is what the TLS server of a key state wrote.
+type chunk struct {
+	ks   *serverKS
+	data []byte
 }
 
 // Server is the server side of a control channel in the same process. It
@@ -110,37 +150,39 @@ type Server struct {
 	received []wire.Control
 	dropped  int
 	client   wire.SessionID
+	closed   bool
 
 	done chan struct{}
 	once sync.Once
 	wg   sync.WaitGroup
 
-	// The TLS side: crypto/tls runs on tlsEnd, and bridge is the other end of
-	// that pipe, which the server's two goroutines carry to and from the packets.
-	tlsEnd, bridge net.Conn
-	tlsOut         chan []byte // what TLS wrote, to be sent
-	tlsIn          chan []byte // what arrived, to be given to TLS
-	tlsDone        chan struct{}
-	kxDone         chan struct{}
-	kx             *ClientKeyExchange
-	pushRequests   int
-	control        *tls.Conn // the TLS session, once the key exchange is done
-	data           *serverData
-	dataIn         [][]byte // the IP packets the server opened, in order
-	dataDropped    int      // the data packets it could not open
-	pings          int      // the keepalive pings it received
-	occExits       int      // the exit messages of the data channel it received
-	exits          int      // the EXIT messages of the control channel it received
-	tlsErr         error
-	tlsState       tls.ConnectionState
-	largest        int // the largest packet that came from the client, as it was on the link
+	// The TLS side: crypto/tls runs on the tlsEnd of each key state, and the other end
+	// of that pipe is carried to and from the packets by two goroutines.
+	chunks       chan chunk
+	cmds         chan func() // run by the loop goroutine
+	tlsDone      chan struct{}
+	kxDone       chan struct{}
+	kxs          []*ClientKeyExchange // the key exchange messages, in order: the first is key id 0's
+	pushRequests int
+	control      *tls.Conn   // the TLS session of the newest key, once its key exchange is done
+	order        []*serverKS // the keys that carry data, oldest first
+	history      []uint8     // the key ids of every key that was made, in order
+	dataIn       [][]byte    // the IP packets the server opened, in order
+	dataDropped  int         // the data packets it could not open
+	pings        int         // the keepalive pings it received
+	occExits     int         // the exit messages of the data channel it received
+	exits        int         // the EXIT messages of the control channel it received
+	tlsErr       error
+	tlsState     tls.ConnectionState
+	largest      int // the largest packet that came from the client, as it was on the link
+	dyn          ctrlwrap.Wrapper
 
 	// Owned by the loop goroutine.
-	sender     *reliable.Sender
-	receiver   reliable.Receiver
+	keysByID   [8]*serverKS
+	nextID     uint8
+	rejected   int
 	remote     wire.SessionID
 	haveRemote bool
-	wrapper    ctrlwrap.Wrapper
 	sendMu     sync.Mutex // Inject writes from the test's goroutine
 }
 
@@ -151,50 +193,126 @@ func NewServer(tb testing.TB, link net.Conn, opts ServerOptions) *Server {
 	if opts.RetransmitTimeout <= 0 {
 		opts.RetransmitTimeout = 2 * time.Second
 	}
+	if opts.SwitchDelay == 0 {
+		opts.SwitchDelay = time.Second
+	}
 	if opts.Wrapper == nil {
 		opts.Wrapper = ctrlwrap.NewPlain()
 	}
 	s := &Server{
-		tb: tb, opts: opts, link: link, sid: wire.RandomSessionID(), wrapper: opts.Wrapper,
-		done: make(chan struct{}), sender: reliable.NewSender(opts.RetransmitTimeout),
+		tb: tb, opts: opts, link: link, sid: wire.RandomSessionID(), nextID: 1,
+		done:   make(chan struct{}),
+		chunks: make(chan chunk),
+		cmds:   make(chan func(), 16),
 	}
+	s.tlsDone = make(chan struct{})
+	s.kxDone = make(chan struct{})
+	ks := s.newKS(0)
 	in := make(chan []byte, 128) // deep enough that two ends writing a pipe do not wait for each other
 	s.wg.Add(2)
 	go s.read(in)
-	go s.loop(in)
-	s.tlsDone = make(chan struct{})
-	s.kxDone = make(chan struct{})
-	if opts.TLS != nil {
-		s.tlsEnd, s.bridge = net.Pipe()
-		s.tlsOut = make(chan []byte)
-		s.tlsIn = make(chan []byte, 1024)
-		s.wg.Add(3)
-		go s.runTLS()
-		go s.bridgeRead()
-		go s.bridgeWrite()
-	}
+	go s.loop(in, ks)
 	tb.Cleanup(s.Close)
 	return s
+}
+
+// newKS makes the control channel of a key id, with its TLS server when the server has
+// TLS, and starts the goroutines of that. It returns nil after Close. The first
+// packet of a key id above 0 is the server's own soft reset.
+func (s *Server) newKS(id uint8) *serverKS {
+	ks := &serverKS{id: id, sender: reliable.NewSender(s.opts.RetransmitTimeout)}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.opts.TLS != nil {
+		ks.tlsEnd, ks.bridge = net.Pipe()
+		ks.tlsIn = make(chan []byte, 1024)
+		s.wg.Add(3)
+	}
+	s.mu.Unlock()
+	if id > 0 {
+		if _, err := ks.sender.Queue(wire.SoftResetV1, nil); err != nil {
+			s.tb.Errorf("vpntest server: %v", err)
+		}
+		s.nextID = id%7 + 1
+	}
+	s.setKS(id, ks)
+	if s.opts.TLS != nil {
+		go s.runTLS(ks)
+		go s.bridgeRead(ks)
+		go s.bridgeWrite(ks)
+	}
+	return ks
+}
+
+// wrapperFor is the protection of the control packets of a key id: the configured one
+// for key id 0 and, with dynamic tls-crypt, the key made from the first TLS session
+// for the others.
+func (s *Server) wrapperFor(id uint8) ctrlwrap.Wrapper {
+	if id > 0 {
+		s.mu.Lock()
+		w := s.dyn
+		s.mu.Unlock()
+		if w != nil {
+			return w
+		}
+	}
+	return s.opts.Wrapper
 }
 
 // Close stops the server and closes the link.
 func (s *Server) Close() {
 	s.once.Do(func() {
 		close(s.done)
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
 		if err := s.link.Close(); err != nil {
 			s.tb.Errorf("vpntest server: closing the link: %v", err)
 		}
-		if s.tlsEnd != nil {
-			// The pipe has no state worth reporting; closing it ends the TLS goroutines.
-			if err := s.tlsEnd.Close(); err != nil {
-				s.tb.Errorf("vpntest server: closing the TLS side: %v", err)
-			}
-			if err := s.bridge.Close(); err != nil {
-				s.tb.Errorf("vpntest server: closing the bridge: %v", err)
-			}
-		}
+		s.closeTLSSides()
 	})
 	s.wg.Wait()
+}
+
+// closeTLSSides closes the pipe of every TLS server; closing it ends the TLS goroutines.
+// The pipe has no state worth reporting.
+func (s *Server) closeTLSSides() {
+	s.mu.Lock()
+	var all []*serverKS
+	for _, ks := range s.allKS() {
+		if !ks.closed {
+			ks.closed = true
+			all = append(all, ks)
+		}
+	}
+	s.mu.Unlock()
+	for _, ks := range all {
+		if ks.tlsEnd == nil {
+			continue
+		}
+		if err := ks.tlsEnd.Close(); err != nil {
+			s.tb.Errorf("vpntest server: closing the TLS side: %v", err)
+		}
+		if err := ks.bridge.Close(); err != nil {
+			s.tb.Errorf("vpntest server: closing the bridge: %v", err)
+		}
+	}
+}
+
+// allKS is every key state that was made and not thrown away. The caller holds s.mu.
+func (s *Server) allKS() []*serverKS {
+	var all []*serverKS
+	seen := map[*serverKS]bool{}
+	for _, ks := range s.keysByID {
+		if ks != nil && !seen[ks] {
+			seen[ks] = true
+			all = append(all, ks)
+		}
+	}
+	return all
 }
 
 // SessionID is the server's session id.
@@ -253,27 +371,22 @@ func (s *Server) read(in chan<- []byte) {
 	}
 }
 
-func (s *Server) loop(in <-chan []byte) {
+func (s *Server) loop(in <-chan []byte, first *serverKS) {
 	defer s.wg.Done()
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 	defer timer.Stop()
 	for {
-		var tlsOut <-chan []byte
-		if s.opts.TLS != nil && s.haveRemote && s.sender.CanSend() {
-			tlsOut = s.tlsOut
-		}
-		select {
-		case chunk := <-tlsOut:
-			s.queueTLS(chunk)
-		default:
-		}
 		s.flush()
-		if !s.sender.CanSend() {
-			tlsOut = nil // the window is full: take no more until it opens
+		var next time.Time
+		found := false
+		for _, ks := range s.liveKS() {
+			if at, ok := ks.sender.NextDeadline(); ok && (!found || at.Before(next)) {
+				next, found = at, true
+			}
 		}
-		if at, ok := s.sender.NextDeadline(); ok {
-			timer.Reset(max(0, time.Until(at)))
+		if found {
+			timer.Reset(max(0, time.Until(next)))
 		} else {
 			timer.Stop()
 		}
@@ -282,17 +395,82 @@ func (s *Server) loop(in <-chan []byte) {
 			return
 		case raw := <-in:
 			s.handle(raw)
-		case chunk := <-tlsOut:
-			s.queueTLS(chunk)
+		case c := <-s.chunks:
+			c.ks.backlog = append(c.ks.backlog, c.data)
+		case f := <-s.cmds:
+			f()
 		case <-timer.C:
 		}
 	}
 }
 
-// queueTLS sends a chunk of what TLS wrote as a control packet.
-func (s *Server) queueTLS(chunk []byte) {
-	if _, err := s.sender.Queue(wire.ControlV1, chunk); err != nil {
-		s.tb.Errorf("vpntest server: %v", err)
+// liveKS is the key states that were made and are not thrown away.
+func (s *Server) liveKS() []*serverKS {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.allKS()
+}
+
+// getKS and setKS are the table of key states, which s.mu guards.
+func (s *Server) getKS(id uint8) *serverKS {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keysByID[id]
+}
+
+func (s *Server) setKS(id uint8, ks *serverKS) {
+	s.mu.Lock()
+	s.keysByID[id] = ks
+	s.mu.Unlock()
+}
+
+// Renegotiate makes the server start a renegotiation, as OpenVPN's server does when its
+// --reneg-sec has passed: a soft reset with the next key id. It returns when the soft
+// reset is queued. After Close it does nothing.
+func (s *Server) Renegotiate() {
+	done := make(chan struct{})
+	f := func() {
+		defer close(done)
+		id := s.nextID
+		if s.getKS(id) != nil {
+			s.tb.Errorf("vpntest server: key id %d is in use", id)
+			return
+		}
+		s.dropOldKey()
+		s.newKS(id)
+	}
+	select {
+	case s.cmds <- f:
+	case <-s.done:
+		return
+	}
+	select {
+	case <-done:
+	case <-s.done:
+	}
+}
+
+// dropOldKey throws away the oldest of two keys that carry data, as OpenVPN frees its
+// lame duck when it starts a new key. The loop goroutine calls it.
+func (s *Server) dropOldKey() {
+	s.mu.Lock()
+	var gone *serverKS
+	if len(s.order) >= 2 {
+		gone, s.order = s.order[0], s.order[1:]
+		gone.data, gone.closed = nil, true
+	}
+	s.mu.Unlock()
+	if gone == nil {
+		return
+	}
+	s.setKS(gone.id, nil)
+	if gone.tlsEnd != nil {
+		if err := gone.tlsEnd.Close(); err != nil {
+			s.tb.Errorf("vpntest server: closing the TLS side: %v", err)
+		}
+		if err := gone.bridge.Close(); err != nil {
+			s.tb.Errorf("vpntest server: closing the bridge: %v", err)
+		}
 	}
 }
 
@@ -312,8 +490,10 @@ func (s *Server) handle(raw []byte) {
 		s.handleData(raw)
 		return
 	}
-	switch op {
-	case wire.HardResetClientV2, wire.HardResetClientV3, wire.ControlV1, wire.ControlWKCV1, wire.AckV1:
+	switch {
+	case (op == wire.HardResetClientV2 || op == wire.HardResetClientV3) && keyID == 0:
+	case op == wire.SoftResetV1 && keyID != 0:
+	case op == wire.ControlV1 || op == wire.ControlWKCV1 || op == wire.AckV1:
 	default:
 		s.drop()
 		return
@@ -326,7 +506,7 @@ func (s *Server) handle(raw []byte) {
 		}
 		packet = packet[:len(packet)-s.opts.WKcLen]
 	}
-	body, err := s.wrapper.Unwrap(packet)
+	body, err := s.wrapperFor(keyID).Unwrap(packet)
 	if err != nil {
 		s.drop()
 		return
@@ -352,11 +532,28 @@ func (s *Server) handle(raw []byte) {
 		s.drop()
 		return
 	}
+	ks := s.getKS(keyID)
+	if ks == nil {
+		if op != wire.SoftResetV1 {
+			s.drop()
+			return
+		}
+		if s.rejected < s.opts.RejectRenegotiations {
+			s.rejected++
+			ks = s.newMutedKS(keyID)
+		} else {
+			s.dropOldKey()
+			ks = s.newKS(keyID)
+		}
+		if ks == nil {
+			return
+		}
+	}
 	s.mu.Lock()
 	s.received = append(s.received, c)
 	s.largest = max(s.largest, len(raw))
 	s.mu.Unlock()
-	if s.opts.Fault == Silent {
+	if s.opts.Fault == Silent || ks.muted {
 		return
 	}
 	first := !s.haveRemote
@@ -367,25 +564,29 @@ func (s *Server) handle(raw []byte) {
 		s.mu.Unlock()
 	}
 	for _, id := range c.Acks {
-		s.sender.Ack(id)
+		ks.sender.Ack(id)
 	}
 	if op == wire.AckV1 {
 		return
 	}
-	payloads, ack := s.receiver.Receive(c.PacketID, c.Payload)
+	payloads, ack := ks.receiver.Receive(c.PacketID, c.Payload)
 	if !ack {
 		s.drop()
 		return
 	}
-	if first && len(payloads) > 0 {
-		payloads = payloads[1:] // the reset has no TLS bytes
+	isReset := op == wire.HardResetClientV2 || op == wire.HardResetClientV3 || op == wire.SoftResetV1
+	if isReset && !ks.peerReset {
+		ks.peerReset = true
+		if len(payloads) > 0 {
+			payloads = payloads[1:] // the reset has no TLS bytes
+		}
 	}
 	if s.opts.TLS != nil {
 		for _, p := range payloads {
 			select {
-			case s.tlsIn <- p:
+			case ks.tlsIn <- p:
 			default:
-				s.tb.Errorf("vpntest server: more than %d payloads wait for TLS", cap(s.tlsIn))
+				s.tb.Errorf("vpntest server: more than %d payloads wait for TLS", cap(ks.tlsIn))
 			}
 		}
 	}
@@ -394,22 +595,42 @@ func (s *Server) handle(raw []byte) {
 		if op == wire.HardResetClientV3 && s.opts.AskForWKc {
 			payload = wire.AppendEarlyNegotiation(nil, true)
 		}
-		if _, err := s.sender.Queue(wire.HardResetServerV2, payload); err != nil {
+		if _, err := ks.sender.Queue(wire.HardResetServerV2, payload); err != nil {
 			s.drop()
 		}
 	}
 }
 
+// newMutedKS makes a key state that the server ignores: the client's renegotiation on
+// it never gets an answer.
+func (s *Server) newMutedKS(id uint8) *serverKS {
+	ks := &serverKS{id: id, sender: reliable.NewSender(s.opts.RetransmitTimeout), muted: true}
+	s.setKS(id, ks)
+	s.nextID = id%7 + 1
+	return ks
+}
+
 func (s *Server) flush() {
-	for _, o := range s.sender.Due(time.Now()) {
-		c := wire.Control{Opcode: o.Opcode, SessionID: s.sid, PacketID: o.ID, Payload: o.Payload}
-		s.addAcks(&c)
-		s.writeOrReport(&c)
-	}
-	if s.receiver.HasPendingAcks() {
-		c := wire.Control{Opcode: wire.AckV1, SessionID: s.sid}
-		s.addAcks(&c)
-		s.writeOrReport(&c)
+	for _, ks := range s.liveKS() {
+		if ks.muted {
+			continue
+		}
+		for len(ks.backlog) > 0 && s.haveRemote && ks.sender.CanSend() {
+			if _, err := ks.sender.Queue(wire.ControlV1, ks.backlog[0]); err != nil {
+				s.tb.Errorf("vpntest server: %v", err)
+			}
+			ks.backlog = ks.backlog[1:]
+		}
+		for _, o := range ks.sender.Due(time.Now()) {
+			c := wire.Control{Opcode: o.Opcode, KeyID: ks.id, SessionID: s.sid, PacketID: o.ID, Payload: o.Payload}
+			s.addAcks(ks, &c)
+			s.writeOrReport(&c)
+		}
+		if ks.receiver.HasPendingAcks() {
+			c := wire.Control{Opcode: wire.AckV1, KeyID: ks.id, SessionID: s.sid}
+			s.addAcks(ks, &c)
+			s.writeOrReport(&c)
+		}
 	}
 }
 
@@ -427,11 +648,11 @@ func (s *Server) writeOrReport(c *wire.Control) {
 	}
 }
 
-func (s *Server) addAcks(c *wire.Control) {
+func (s *Server) addAcks(ks *serverKS, c *wire.Control) {
 	if !s.haveRemote {
 		return
 	}
-	acks := s.receiver.Acks(wire.MaxAcks)
+	acks := ks.receiver.Acks(wire.MaxAcks)
 	if len(acks) == 0 {
 		return
 	}
@@ -449,7 +670,7 @@ func (s *Server) write(c *wire.Control) error {
 	if err != nil {
 		return err
 	}
-	packet, err := s.wrapper.Wrap(nil, wire.FirstByte(c.Opcode, c.KeyID), c.SessionID, body)
+	packet, err := s.wrapperFor(c.KeyID).Wrap(nil, wire.FirstByte(c.Opcode, c.KeyID), c.SessionID, body)
 	if err != nil {
 		return err
 	}
@@ -480,32 +701,34 @@ func (s *Server) LargestPacket() int {
 	return s.largest
 }
 
-// runTLS runs crypto/tls as the server over the control channel.
-func (s *Server) runTLS() {
+// runTLS runs crypto/tls as the server over the control channel of a key state.
+func (s *Server) runTLS(ks *serverKS) {
 	defer s.wg.Done()
-	conn := tls.Server(s.tlsEnd, s.opts.TLS)
+	conn := tls.Server(ks.tlsEnd, s.opts.TLS)
 	err := conn.Handshake()
 	select {
 	case <-s.done:
 		return
 	default:
 	}
-	s.tlsErr = err
-	if err == nil {
-		s.tlsState = conn.ConnectionState()
+	if ks.id == 0 {
+		s.tlsErr = err
+		if err == nil {
+			s.tlsState = conn.ConnectionState()
+		}
+		close(s.tlsDone)
 	}
-	close(s.tlsDone)
 	if err == nil {
-		s.keyExchange(conn)
+		s.keyExchange(ks, conn)
 	}
 }
 
 // keyExchange reads the client's key exchange message, which is one TLS record,
 // keeps it, and answers.
-func (s *Server) keyExchange(conn *tls.Conn) {
+func (s *Server) keyExchange(ks *serverKS, conn *tls.Conn) {
 	kxDone := false
 	finish := func() {
-		if !kxDone {
+		if !kxDone && ks.id == 0 {
 			kxDone = true
 			close(s.kxDone)
 		}
@@ -522,11 +745,15 @@ func (s *Server) keyExchange(conn *tls.Conn) {
 		return
 	}
 	s.mu.Lock()
-	s.kx = kx
+	s.kxs = append(s.kxs, kx)
 	s.mu.Unlock()
 	reply := s.opts.KeyExchangeReply
 	if reply == nil {
 		reply = serverKX("V4,dev-type tun,link-mtu 1541,tun-mtu 1500,proto UDPv4,auth SHA1,keysize 128,key-method 2,tls-server", "IV_VER=vpntest\n")
+	}
+	if ks.id > 0 {
+		// The data keys exist before the client can learn that the exchange is done.
+		s.setupData(conn, ks)
 	}
 	if len(reply) > 0 {
 		if _, err := conn.Write(reply); err != nil {
@@ -534,6 +761,13 @@ func (s *Server) keyExchange(conn *tls.Conn) {
 		}
 	}
 	finish()
+	if ks.id > 0 {
+		s.mu.Lock()
+		s.control = conn
+		s.mu.Unlock()
+		s.serveRenegotiated(conn, make([]byte, 1<<15))
+		return
+	}
 	if s.opts.CloseAfterKeyExchange {
 		if err := conn.Close(); err != nil {
 			s.tb.Logf("vpntest server: closing the TLS session: %v", err)
@@ -543,7 +777,7 @@ func (s *Server) keyExchange(conn *tls.Conn) {
 	if len(reply) == 0 {
 		return // a server that says nothing at all
 	}
-	s.serveControl(conn, make([]byte, 1<<15))
+	s.serveControl(ks, conn, make([]byte, 1<<15))
 }
 
 // DefaultPushReply is what the server pushes when the test does not say.
@@ -559,8 +793,8 @@ func (s *Server) PushRequests() int {
 
 // serveControl sends the push messages when it is time, and counts the requests
 // that come, until the TLS session ends.
-func (s *Server) serveControl(conn *tls.Conn, buf []byte) {
-	s.setupData(conn)
+func (s *Server) serveControl(ks *serverKS, conn *tls.Conn, buf []byte) {
+	s.setupData(conn, ks)
 	s.mu.Lock()
 	s.control = conn
 	s.mu.Unlock()
@@ -613,6 +847,22 @@ func (s *Server) serveControl(conn *tls.Conn, buf []byte) {
 	}
 }
 
+// serveRenegotiated reads the control messages that come in the TLS session of a
+// renegotiated key: only EXIT is counted. There is no push after the first key.
+func (s *Server) serveRenegotiated(conn *tls.Conn, buf []byte) {
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if string(buf[:n]) == "EXIT\x00" {
+			s.mu.Lock()
+			s.exits++
+			s.mu.Unlock()
+		}
+	}
+}
+
 // SendControl sends one control message (with its closing NUL) to the client,
 // at any time after the key exchange. It fails the test when the key exchange is
 // not done or the TLS session is gone.
@@ -646,7 +896,10 @@ type ClientKeyExchange struct {
 func (s *Server) KeyExchange() *ClientKeyExchange {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.kx
+	if len(s.kxs) == 0 {
+		return nil
+	}
+	return s.kxs[0]
 }
 
 // parseClientKX reads the client's message the way the plan describes it: 4 zero
@@ -699,16 +952,16 @@ func serverKX(options, peerInfo string) []byte {
 const serverChunk = 900
 
 // bridgeRead takes what TLS writes and hands it to the loop, a chunk at a time.
-func (s *Server) bridgeRead() {
+func (s *Server) bridgeRead(ks *serverKS) {
 	defer s.wg.Done()
 	buf := make([]byte, serverChunk)
 	for {
-		n, err := s.bridge.Read(buf)
+		n, err := ks.bridge.Read(buf)
 		if err != nil {
 			return
 		}
 		select {
-		case s.tlsOut <- append([]byte(nil), buf[:n]...):
+		case s.chunks <- chunk{ks: ks, data: append([]byte(nil), buf[:n]...)}:
 		case <-s.done:
 			return
 		}
@@ -716,12 +969,12 @@ func (s *Server) bridgeRead() {
 }
 
 // bridgeWrite gives what arrived in order to TLS.
-func (s *Server) bridgeWrite() {
+func (s *Server) bridgeWrite(ks *serverKS) {
 	defer s.wg.Done()
 	for {
 		select {
-		case p := <-s.tlsIn:
-			if _, err := s.bridge.Write(p); err != nil {
+		case p := <-ks.tlsIn:
+			if _, err := ks.bridge.Write(p); err != nil {
 				return
 			}
 		case <-s.done:
@@ -730,15 +983,51 @@ func (s *Server) bridgeWrite() {
 	}
 }
 
-// CloseTLS ends the TLS server inside the server at once, so that the server
-// goes on reading and acknowledging packets and says nothing more. It is for the
-// tests of a server that stops in the middle of a handshake.
+// CloseTLS ends the TLS server of key id 0 inside the server at once, so that the
+// server goes on reading and acknowledging packets and says nothing more. It is for
+// the tests of a server that stops in the middle of a handshake.
 func (s *Server) CloseTLS() error {
-	if s.tlsEnd == nil {
+	ks := s.getKS(0)
+	if ks == nil || ks.tlsEnd == nil {
 		return nil
 	}
-	if err := s.tlsEnd.Close(); err != nil {
+	if err := ks.tlsEnd.Close(); err != nil {
 		return err
 	}
-	return s.bridge.Close()
+	return ks.bridge.Close()
+}
+
+// KeyExchanges is every key exchange message of the client in the order of arrival:
+// the first is the one of the handshake, the others are the renegotiations.
+func (s *Server) KeyExchanges() []*ClientKeyExchange {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*ClientKeyExchange(nil), s.kxs...)
+}
+
+// Renegotiations is how many renegotiations the server has finished the key exchange
+// of.
+func (s *Server) Renegotiations() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return max(0, len(s.kxs)-1)
+}
+
+// KeyHistory is the key id of every key that the server made, in order: 0, then the
+// renegotiations.
+func (s *Server) KeyHistory() []uint8 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]uint8(nil), s.history...)
+}
+
+// KeyIDs is the key ids of the keys that carry data, oldest first.
+func (s *Server) KeyIDs() []uint8 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]uint8, len(s.order))
+	for i, ks := range s.order {
+		ids[i] = ks.id
+	}
+	return ids
 }

@@ -101,6 +101,7 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 		HandshakeTimeout: config.HandshakeTimeout,
 		TLS:              config.TLS, ResetOnly: config.resetOnly, MTU: tunnelMTU(config), EpochUsageLimit: config.epochUsageLimit,
 		PingInterval: config.PingInterval, PingTimeout: config.PingTimeout,
+		RenegotiateAfter: renegotiateAfter(config),
 	}
 	if err := config.validate(); err != nil {
 		opts.Err = err
@@ -128,6 +129,18 @@ func newConn(link net.Conn, stream bool, config *Config) *Conn {
 		}
 	}
 	return &Conn{s: session.New(opts), mtu: tunnelMTU(config)}
+}
+
+// renegotiateAfter is the time after which a key is replaced: the default for zero,
+// none (zero to the session) for a negative value.
+func renegotiateAfter(config *Config) time.Duration {
+	switch {
+	case config.RenegotiateAfter < 0:
+		return 0
+	case config.RenegotiateAfter == 0:
+		return DefaultRenegotiateAfter
+	}
+	return config.RenegotiateAfter
 }
 
 // keyExchangeStrings are the options string and the peer info of the key exchange
@@ -196,7 +209,7 @@ const libraryVersion = "0.2.0"
 // implementedProto is IV_PROTO: the bits of the features that this client has.
 // Each step that adds a feature adds its bit (SPEC §8.2).
 const implementedProto = ctrlmsg.IVProtoDataV2 | ctrlmsg.IVProtoRequestPush | ctrlmsg.IVProtoTLSKeyExport |
-	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp | ctrlmsg.IVProtoDataEpoch | ctrlmsg.IVProtoCCExitNotify
+	ctrlmsg.IVProtoAuthPendingKW | ctrlmsg.IVProtoAuthFailTemp | ctrlmsg.IVProtoDynTLSCrypt | ctrlmsg.IVProtoDataEpoch | ctrlmsg.IVProtoCCExitNotify
 
 // Read returns the next IP packet that the server sent, waiting for it, as one
 // Read of a connected UDP socket does: a buffer that is too small gets the start

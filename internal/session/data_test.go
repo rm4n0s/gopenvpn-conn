@@ -16,6 +16,7 @@ import (
 	"github.com/rm4n0s/errors"
 
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
+	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
 	"github.com/rm4n0s/gopenvpn-conn/internal/vpntest"
 )
@@ -395,6 +396,20 @@ func (f fakeExporter) ExportKeyingMaterial(string, []byte, int) ([]byte, error) 
 	return bytes.Clone(f.material), f.err
 }
 
+// dynamicExporter gives good data keys and, for the label of dynamic tls-crypt, the
+// bytes or the error of the test.
+type dynamicExporter struct {
+	dynamic []byte
+	err     error
+}
+
+func (d dynamicExporter) ExportKeyingMaterial(label string, _ []byte, _ int) ([]byte, error) {
+	if label == ctrlwrap.DynamicLabel {
+		return bytes.Clone(d.dynamic), d.err
+	}
+	return make([]byte, 256), nil
+}
+
 func TestSetupDataRefusals(t *testing.T) {
 	good := fakeExporter{material: make([]byte, 256)}
 	base := func() *ctrlmsg.Pushed {
@@ -416,11 +431,21 @@ func TestSetupDataRefusals(t *testing.T) {
 		{"a cipher that is not here", func() *ctrlmsg.Pushed { p := base(); p.Cipher = "AES-256-CBC"; return p }, good,
 			ctrlmsg.TagCipherNegotiationFailed, "Session.setupData.CipherNegotiationFailed"},
 		{"the export fails", base, fakeExporter{err: net.ErrClosed},
-			TagKeyExportFailed, "Session.setupData.KeyExportFailed"},
+			TagKeyExportFailed, "Session.setupData->Session.makeKey.KeyExportFailed"},
 		{"too little material", base, fakeExporter{material: make([]byte, 255)},
-			"BadDataKeys", "Session.setupData->SplitDataKeys.BadDataKeys"},
+			"BadDataKeys", "Session.setupData->Session.makeKey->SplitDataKeys.BadDataKeys"},
+		{"the export of the dynamic key fails", func() *ctrlmsg.Pushed {
+			p := base()
+			p.ProtocolFlags = []string{"dyn-tls-crypt"}
+			return p
+		}, dynamicExporter{err: net.ErrClosed}, TagKeyExportFailed, "Session.setupData->Session.setupDynamic.KeyExportFailed"},
+		{"a dynamic key of the wrong size", func() *ctrlmsg.Pushed {
+			p := base()
+			p.ProtocolFlags = []string{"dyn-tls-crypt"}
+			return p
+		}, dynamicExporter{dynamic: make([]byte, 100)}, "DynamicTLSCryptKeySize", "Session.setupData->Session.setupDynamic->NewDynamic.DynamicTLSCryptKeySize"},
 		{"a peer id that is too big", func() *ctrlmsg.Pushed { p := base(); p.PeerID = 1 << 24; return p }, good,
-			"DataHeaderInvalid", "Session.setupData->NewChannel->NewSender->Header.validate.DataHeaderInvalid"},
+			"DataHeaderInvalid", "Session.setupData->Session.makeKey->NewChannel->NewSender->Header.validate.DataHeaderInvalid"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -494,7 +519,7 @@ func TestWriteEndsTheSessionWhenThePacketIDsEnd(t *testing.T) {
 		if err := r.session.Handshake(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		r.session.data.Load().ch.(interface{ SetNextID(uint32) }).SetNextID(math.MaxUint32)
+		r.session.data.Load().table.Load().send.ch.(interface{ SetNextID(uint32) }).SetNextID(math.MaxUint32)
 		if _, err := r.session.Write([]byte{0x45, 1}); err != nil { // the last id
 			t.Fatal(err)
 		}

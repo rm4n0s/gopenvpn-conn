@@ -74,12 +74,20 @@ type sealOpener struct {
 	*Receiver
 }
 
+// NeedsRenegotiation is true when either direction of the key wants a new one.
+func (p sealOpener) NeedsRenegotiation() bool {
+	return p.Sender.NeedsRenegotiation() || p.Receiver.NeedsRenegotiation()
+}
+
 // NewChannel makes the Channel of the 32-bit packet id format from the keys of
 // the two directions.
 func NewChannel(c Cipher, send, receive *keys.DirectionKey, h Header, o ReceiverOptions) (Channel, error) {
 	s, err := NewSender(c, send, h)
 	if err != nil {
 		return nil, err
+	}
+	if o.UsageLimit != 0 {
+		s.limit = o.UsageLimit
 	}
 	r, err := NewReceiver(c, receive, h, o)
 	if err != nil {

@@ -104,8 +104,10 @@ type Sender struct {
 	aead   cipher.AEAD
 	iv     [implicitIVSize]byte
 	header Header
-	next   uint32 // the id of the next packet
-	done   bool   // every id was used
+	next   atomic.Uint32 // the id of the next packet
+	done   atomic.Bool   // every id was used
+	blocks atomic.Uint64 // the 16-byte blocks of payload sealed with this key
+	limit  uint64        // the usage limit of the cipher (0: none); see usageLimit
 	nonce  [nonceSize]byte
 }
 
@@ -119,16 +121,21 @@ func NewSender(c Cipher, k *keys.DirectionKey, h Header) (*Sender, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Sender{aead: aead, iv: iv, header: h, next: 1}, nil
+	s := &Sender{aead: aead, iv: iv, header: h, limit: usageLimit(c)}
+	s.next.Store(1)
+	return s, nil
 }
 
 // NeedsRenegotiation reports whether so many packets were sent that a new key
 // is due (RenegotiateAt). The sender goes on until the ids end.
-func (s *Sender) NeedsRenegotiation() bool { return s.done || s.next >= RenegotiateAt }
+func (s *Sender) NeedsRenegotiation() bool {
+	id := uint64(s.next.Load())
+	return s.done.Load() || id >= uint64(RenegotiateAt) || (s.limit > 0 && s.blocks.Load()+id > s.limit/8*7)
+}
 
 // SetNextID makes id the id of the next packet. It is for the tests of the end of
 // the ids, which no real session reaches in a test's time; nothing else calls it.
-func (s *Sender) SetNextID(id uint32) { s.next, s.done = id, false }
+func (s *Sender) SetNextID(id uint32) { s.next.Store(id); s.done.Store(false) }
 
 // Seal appends the packet that carries payload to dst and returns the result:
 // the first byte, the peer id (DATA_V2), the packet id, the tag and the
@@ -143,15 +150,16 @@ func (s *Sender) Seal(dst, payload []byte) ([]byte, error) {
 	if len(payload) == 0 {
 		return dst, errors.New(tagEmptyPayload, "a data packet needs at least one byte of payload")
 	}
-	if s.done {
+	if s.done.Load() {
 		return dst, errors.New(tagPacketIDExhausted, "every packet id of this key has been used")
 	}
-	id := s.next
+	id := s.next.Load()
 	if id == math.MaxUint32 {
-		s.done = true
+		s.done.Store(true)
 	} else {
-		s.next++
+		s.next.Store(id + 1)
 	}
+	s.blocks.Add((uint64(len(payload)&0x7fffffff) + blockSize - 1) / blockSize)
 
 	start := len(dst)
 	dst = slices.Grow(dst, s.header.minPacket()+len(payload))
@@ -214,7 +222,10 @@ type Receiver struct {
 	header  Header
 	window  *replay.Window // nil with strict order
 	strict  bool
-	highest uint32 // strict order: the highest id accepted, 0 before the first
+	highest uint32        // strict order: the highest id accepted, 0 before the first
+	maxID   atomic.Uint32 // the highest id accepted
+	blocks  atomic.Uint64 // the 16-byte blocks opened with this key
+	limit   uint64        // the usage limit of the cipher (0: none)
 	nonce   [nonceSize]byte
 	scratch []byte // the ciphertext and the tag, in the order Go's AEAD wants them
 
@@ -245,6 +256,9 @@ type ReceiverOptions struct {
 	// MaxAge is how late a packet may arrive after one with a higher id; 0 is 15
 	// seconds.
 	MaxAge time.Duration
+	// UsageLimit replaces the usage limit of the cipher, which decides when a new key
+	// is due. Only the tests set it, to reach the limit with a few packets.
+	UsageLimit uint64
 }
 
 // NewReceiver makes a Receiver for the packets that arrive with the key of one
@@ -258,7 +272,10 @@ func NewReceiver(c Cipher, k *keys.DirectionKey, h Header, opts ReceiverOptions)
 	if err != nil {
 		return nil, err
 	}
-	r := &Receiver{aead: aead, iv: iv, header: h, strict: opts.Strict}
+	r := &Receiver{aead: aead, iv: iv, header: h, strict: opts.Strict, limit: usageLimit(c)}
+	if opts.UsageLimit != 0 {
+		r.limit = opts.UsageLimit
+	}
 	if !opts.Strict {
 		size, age := opts.Window, opts.MaxAge
 		if size <= 0 {
@@ -270,6 +287,24 @@ func NewReceiver(c Cipher, k *keys.DirectionKey, h Header, opts ReceiverOptions)
 		r.window = replay.NewWindow(size, age)
 	}
 	return r, nil
+}
+
+// NeedsRenegotiation reports whether the packets opened with this key have used up
+// 7/8 of its usage limit: AES-GCM only.
+func (r *Receiver) NeedsRenegotiation() bool {
+	return r.limit > 0 && r.blocks.Load()+uint64(r.maxID.Load()) > r.limit/8*7
+}
+
+// usageLimit is the number of packets plus 16-byte blocks that a key of the cipher
+// may protect in a direction before a new one is due: 2^36 - 1 for AES-GCM, none for
+// CHACHA20-POLY1305. A renegotiation starts at 7/8 of it.
+//
+// OpenVPN: crypto.c cipher_get_aead_limits, ssl.c tls_get_limit_aead.
+func usageLimit(c Cipher) uint64 {
+	if c.name == "CHACHA20-POLY1305" {
+		return 0
+	}
+	return aeadLimit
 }
 
 // Dropped is how many packets were refused so far, by reason. It may be called
@@ -317,6 +352,10 @@ func (r *Receiver) Open(dst, packet []byte, now time.Time) ([]byte, error) {
 		return dst, errors.NewErr(tagAuthFailed, err)
 	}
 	r.accept(id, now)
+	if id > r.maxID.Load() {
+		r.maxID.Store(id)
+	}
+	r.blocks.Add((uint64((len(out)-len(dst))&0x7fffffff) + blockSize - 1) / blockSize)
 	return out, nil
 }
 

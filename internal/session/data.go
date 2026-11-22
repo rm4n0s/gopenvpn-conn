@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"os"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/rm4n0s/errors"
@@ -41,21 +42,38 @@ type exporter interface {
 	ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)
 }
 
-// dataPath is the data channel of one key: the channel that Write seals with and
-// the loop opens with, and the size of the largest packet.
-type dataPath struct {
-	mtu  int
+// dataKey is the data channel of one key id.
+type dataKey struct {
+	id   uint8
 	ch   datachan.Channel
 	rbuf []byte // the loop's buffer for what it opens
+}
+
+// keyTable is the data keys that are valid: the one that Write seals with and the
+// ones that the loop opens with, by key id. It is never changed after it is
+// published; the loop makes a new one when a key comes or goes.
+type keyTable struct {
+	send *dataKey
+	byID [datachan.MaxKeyID + 1]*dataKey
+}
+
+// dataPath is the data side of the session: the table of keys, what makes a new
+// key, and the size of the largest packet.
+type dataPath struct {
+	mtu    int
+	table  atomic.Pointer[keyTable]
+	cipher datachan.Cipher
+	header datachan.Header // the peer id; the key id is set for each key
+	epoch  bool            // the format with epochs
 
 	sem  chan struct{} // the right to write: Seal and wbuf, for many goroutines that may give up
 	wbuf []byte
 }
 
-// setupData makes the data channel from the TLS session that is complete and the
-// options that the server pushed: the keys from the TLS exporter, the cipher the
-// server chose, the header with the peer id, and the format (32-bit packet ids, or
-// epochs when protocol-flags has aead-epoch). It is called when the push reply is
+// setupData makes the data channel of key id 0 from the TLS session that is complete
+// and the options that the server pushed: the keys from the TLS exporter, the cipher
+// the server chose, the header with the peer id, and the format (32-bit packet ids,
+// or epochs when protocol-flags has aead-epoch). It is called when the push reply is
 // complete, before the handshake is.
 //
 // OpenVPN: ssl.c generate_key_expansion_tls_export, init_key_contexts.
@@ -68,34 +86,56 @@ func (s *Session) setupData(p *ctrlmsg.Pushed, x exporter) error {
 	if !ok {
 		return errors.New(ctrlmsg.TagCipherNegotiationFailed, "the server did not push a data cipher this library has", "cipher", p.Cipher)
 	}
+	s.ccExit = hasFlag(p.ProtocolFlags, "cc-exit")
+	d := &dataPath{
+		mtu:    cmpOr(p.MTU, s.opts.MTU, defaultMTU),
+		cipher: cipher,
+		header: datachan.Header{HasPeerID: p.HasPeerID, PeerID: p.PeerID},
+		epoch:  hasFlag(p.ProtocolFlags, "aead-epoch"),
+		sem:    make(chan struct{}, 1),
+	}
+	k, err := s.makeKey(d, 0, x)
+	if err != nil {
+		return err
+	}
+	t := &keyTable{send: k}
+	t.byID[0] = k
+	d.table.Store(t)
+	if hasFlag(p.ProtocolFlags, "dyn-tls-crypt") {
+		if err := s.setupDynamic(x); err != nil {
+			return err
+		}
+	}
+	s.data.Store(d)
+	return nil
+}
+
+// makeKey makes the data channel of a key id from the TLS session that made the key.
+// This library is the TLS client: it sends with the client-to-server keys. The epoch
+// format has a channel of its own; it exists only for DATA_V2.
+func (s *Session) makeKey(d *dataPath, id uint8, x exporter) (*dataKey, error) {
 	material, err := x.ExportKeyingMaterial(keys.ExportLabel, nil, keys.DataKeysSize)
 	if err != nil {
-		return errors.NewErr(TagKeyExportFailed, err)
+		return nil, errors.NewErr(TagKeyExportFailed, err)
 	}
 	dk, err := keys.SplitDataKeys(material)
 	clear(material)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer dk.Clear()
-
-	// This library is the TLS client: it sends with the client-to-server keys.
-	// The first key id of a session is 0. The epoch format (protocol-flags
-	// aead-epoch) has a channel of its own; it exists only for DATA_V2.
-	header := datachan.Header{HasPeerID: p.HasPeerID, PeerID: p.PeerID}
+	header := d.header
+	header.KeyID = id
 	var ch datachan.Channel
-	s.ccExit = hasFlag(p.ProtocolFlags, "cc-exit")
-	if hasFlag(p.ProtocolFlags, "aead-epoch") {
-		ch, err = datachan.NewEpochChannel(cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.EpochOptions{Strict: s.opts.Stream, UsageLimit: s.opts.EpochUsageLimit})
+	if d.epoch {
+		ch, err = datachan.NewEpochChannel(d.cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.EpochOptions{Strict: s.opts.Stream, UsageLimit: s.opts.EpochUsageLimit})
 	} else {
-		ch, err = datachan.NewChannel(cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.ReceiverOptions{Strict: s.opts.Stream})
+		ch, err = datachan.NewChannel(d.cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.ReceiverOptions{Strict: s.opts.Stream, UsageLimit: s.opts.UsageLimit})
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	mtu := cmpOr(p.MTU, s.opts.MTU, defaultMTU)
-	s.data.Store(&dataPath{mtu: mtu, ch: ch, sem: make(chan struct{}, 1)})
-	return nil
+	return &dataKey{id: id, ch: ch}, nil
 }
 
 // cmpOr is the first of its arguments that is not zero.
@@ -120,12 +160,20 @@ func (s *Session) handleData(raw []byte) {
 		s.drop("a data packet before the keys are made", nil)
 		return
 	}
-	plain, err := d.ch.Open(d.rbuf[:0], raw, time.Now())
+	k := d.table.Load().byID[raw[0]&0x07]
+	if k == nil {
+		s.drop("a data packet of a key id that has no key", nil)
+		return
+	}
+	plain, err := k.ch.Open(k.rbuf[:0], raw, time.Now())
 	if err != nil {
 		s.drop("a data packet that is refused", err)
 		return
 	}
-	d.rbuf = plain[:0]
+	k.rbuf = plain[:0]
+	if k.ch.NeedsRenegotiation() {
+		s.requestRenegotiation(k.id)
+	}
 	s.lastRecv = time.Now() // authentic: a ping counts, though Read does not get it
 	if bytes.Equal(plain, pingString) {
 		s.log.Debug("a keepalive ping arrived")
@@ -268,7 +316,8 @@ func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
 	if s.opts.Stream {
 		d.wbuf = append(d.wbuf, 0, 0) // the length of the frame goes here
 	}
-	packet, err := d.ch.Seal(d.wbuf, b)
+	k := d.table.Load().send
+	packet, err := k.ch.Seal(d.wbuf, b)
 	if err != nil {
 		s.fail(err)
 		return err
@@ -291,6 +340,9 @@ func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
 		return e
 	}
 	s.touchSent()
+	if k.ch.NeedsRenegotiation() {
+		s.requestRenegotiation(k.id)
+	}
 	return nil
 }
 

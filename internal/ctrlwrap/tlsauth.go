@@ -30,6 +30,7 @@ const (
 // tlsAuth is tls-auth: the packet is authenticated with an HMAC and not
 // encrypted.
 type tlsAuth struct {
+	static   keys.StaticKey // the key as it was given, for dynamic tls-crypt
 	hmacSize int
 	now      func() time.Time
 
@@ -71,6 +72,7 @@ func NewTLSAuth(key *keys.StaticKey, dir keys.Direction, newHash func() hash.Has
 		return nil, errors.New(tagHashTooLarge, "the hash is larger than the HMAC key of a static key", "size", size, "max", keys.PartSize)
 	}
 	return &tlsAuth{
+		static:   *key,
 		hmacSize: size,
 		now:      now,
 		sender:   replay.NewSender(0),

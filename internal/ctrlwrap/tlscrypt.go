@@ -36,7 +36,8 @@ const (
 // tlsCrypt is tls-crypt: the body is encrypted with AES-256-CTR and the packet
 // is authenticated with an HMAC-SHA256 that is also the IV.
 type tlsCrypt struct {
-	now func() time.Time
+	static keys.StaticKey // the key as it was given, for dynamic tls-crypt
+	now    func() time.Time
 
 	sendMu    sync.Mutex
 	sender    *replay.Sender
@@ -92,6 +93,7 @@ func newTLSCrypt(key *keys.StaticKey, dir keys.Direction, startID uint32, now fu
 		return nil, err
 	}
 	return &tlsCrypt{
+		static:    *key,
 		now:       now,
 		sender:    replay.NewSender(startID),
 		sendMAC:   hmac.New(sha256.New, send.HMAC[:cryptKeySize]),

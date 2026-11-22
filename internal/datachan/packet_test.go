@@ -266,7 +266,7 @@ func TestEveryPacketIDIsNew(t *testing.T) {
 
 func TestPacketIDsEndBeforeTheyWrap(t *testing.T) {
 	s, r := pair(t, "AES-256-GCM", Header{}, ReceiverOptions{})
-	s.next = math.MaxUint32 - 2
+	s.SetNextID(math.MaxUint32 - 2)
 	if s.NeedsRenegotiation() != true {
 		t.Error("a sender near the end of its ids does not ask for a new key")
 	}
@@ -298,11 +298,11 @@ func TestNeedsRenegotiation(t *testing.T) {
 	if s.NeedsRenegotiation() {
 		t.Error("a new sender needs a renegotiation")
 	}
-	s.next = RenegotiateAt - 1
+	s.SetNextID(RenegotiateAt - 1)
 	if s.NeedsRenegotiation() {
 		t.Error("asked one id too early")
 	}
-	s.next = RenegotiateAt
+	s.SetNextID(RenegotiateAt)
 	if !s.NeedsRenegotiation() {
 		t.Error("did not ask at the trigger")
 	}
@@ -315,7 +315,7 @@ func TestSealRefusals(t *testing.T) {
 	s, _ := pair(t, "AES-256-GCM", Header{}, ReceiverOptions{})
 	_, err := s.Seal(nil, nil)
 	wantTag(t, err, tagEmptyPayload, "Sender.Seal.DataPayloadEmpty")
-	if s.next != 1 {
+	if s.next.Load() != 1 {
 		t.Error("a refused payload used a packet id")
 	}
 }

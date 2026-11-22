@@ -57,6 +57,7 @@ type wrapKind struct {
 	client func(t testing.TB) ctrlwrap.Wrapper
 	server func(t testing.TB) ctrlwrap.Wrapper
 	v3     bool
+	static func(t testing.TB) *keys.StaticKey // the key that protects the first session, nil for none
 }
 
 func mustWrapper(t testing.TB, w ctrlwrap.Wrapper, err error) ctrlwrap.Wrapper {
@@ -72,6 +73,7 @@ var wrapKinds = []wrapKind{
 		name:   "no protection",
 		client: func(testing.TB) ctrlwrap.Wrapper { return ctrlwrap.NewPlain() },
 		server: func(testing.TB) ctrlwrap.Wrapper { return ctrlwrap.NewPlain() },
+		static: func(testing.TB) *keys.StaticKey { return nil },
 	},
 	{
 		name: "tls-auth",
@@ -83,6 +85,7 @@ var wrapKinds = []wrapKind{
 			w, err := ctrlwrap.NewTLSAuth(testKey(1), keys.Normal, sha256.New, time.Now)
 			return mustWrapper(t, w, err)
 		},
+		static: func(testing.TB) *keys.StaticKey { return testKey(1) },
 	},
 	{
 		name: "tls-crypt",
@@ -94,6 +97,7 @@ var wrapKinds = []wrapKind{
 			w, err := ctrlwrap.NewTLSCryptServer(testKey(2), time.Now)
 			return mustWrapper(t, w, err)
 		},
+		static: func(testing.TB) *keys.StaticKey { return testKey(2) },
 	},
 	{
 		name: "tls-crypt-v2",
@@ -105,7 +109,8 @@ var wrapKinds = []wrapKind{
 			w, err := ctrlwrap.NewTLSCryptServer(&readV2Key(t).Kc, time.Now)
 			return mustWrapper(t, w, err)
 		},
-		v3: true,
+		v3:     true,
+		static: func(t testing.TB) *keys.StaticKey { return &readV2Key(t).Kc },
 	},
 }
 
