@@ -1,6 +1,6 @@
 # Implementation plan
 
-Status: **started at the owner's request, 2026-11-21** (the setup is tag `step-0`). The rule "Working through the steps" of `CLAUDE.md` applies: no stopping between steps.
+Status: **finished, 2026-11-22** (started at the owner's request, 2026-11-21; the setup is tag `step-0`, the last step is `step-5.1`, tag `v1.0.0`). The rule "Working through the steps" of `CLAUDE.md` applies: no stopping between steps.
 
 `docs/SPEC.md` says what is built. This file says in which order, in steps that are small and explicit enough for Claude Sonnet 5.5 at high effort to carry out one at a time (the owner's request, 2026-11-21). `docs/IMPLEMENTED.md` logs what is finished.
 

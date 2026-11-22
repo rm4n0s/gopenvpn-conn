@@ -8,10 +8,11 @@ machine, and works on Linux, Windows and macOS.
 > OpenVPN's own program, it is not affiliated with OpenVPN Inc, and OpenVPN is a
 > trademark of OpenVPN Inc.
 
-**Status: release candidate of 1.0 (`v1.0.0-rc.1`).** The tunnel (package `openvpn`), the
-profile parser (`ovpn`) and the userspace network (`vpnnet`) are complete and were run
-against a real OpenVPN 2.7.9 server on Linux, and, under Wine, on Windows. macOS is checked
-by building and vetting for it; its tests are for a Mac. `docs/SPEC.md` is the
+**Status: 1.0 (`v1.0.0`).** The tunnel (package `openvpn`), the profile parser (`ovpn`)
+and the userspace network (`vpnnet`) are complete and were run against a real OpenVPN
+2.7.9 server on Linux, under Wine on Windows, and on macOS (Apple silicon, against a
+server in a Linux VM, over UDP and TCP, with the server's kernel data channel (DCO) and
+without it). `docs/SPEC.md` is the
 specification, `docs/IMPLEMENTATION.md` the plan, and `docs/IMPLEMENTED.md` the log of
 what is done and how it was shown to work.
 
