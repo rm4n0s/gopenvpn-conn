@@ -32,10 +32,10 @@ const (
 	// TagDialFailed: the connection could not be made. The cause (a refused
 	// connection, the context) is behind the error. Metadata: "network", "address".
 	TagDialFailed = "NetDialFailed"
-	// TagResolveFailed: the host name could not be looked up through the tunnel (no
-	// DNS server was pushed, the servers do not know it, none answered), or it has no
-	// address that the tunnel can reach. The cause is behind the error. Metadata:
-	// "network", "address".
+	// TagResolveFailed: the host name was looked up, but it has no address that the
+	// tunnel can reach. (A lookup that fails returns its own error: TagNoSuchHost,
+	// TagNoDNSServers, TagDNSQueryFailed, ... of LookupNetIP.) Metadata: "network",
+	// "address".
 	TagResolveFailed = "NetResolveFailed"
 	// TagListenFailed: the listener could not be made (the port is taken, the
 	// address is not one of the tunnel). Metadata: "network", "address", "reason".
@@ -121,7 +121,7 @@ func (t target) full() tcpip.FullAddress {
 
 // DialContext connects to address through the tunnel. network is "tcp", "tcp4",
 // "tcp6", "udp", "udp4" or "udp6", and address is a host and a port. A host that is
-// not an IP address is looked up with Resolver, through the tunnel, and the
+// not an IP address is looked up with LookupNetIP, through the tunnel, and the
 // addresses that it has (of the families that the tunnel has and the network allows)
 // are tried in order. The connection is a net.Conn whose errors are the ones of
 // gVisor's gonet, which behave as those of the net package. ctx bounds the looking
@@ -138,9 +138,9 @@ func (n *Net) DialContext(ctx context.Context, network, address string) (net.Con
 	if t.host == "" {
 		return n.dialTarget(ctx, network, address, t)
 	}
-	addrs, err := n.resolver.LookupNetIP(ctx, n.lookupNetwork(network), t.host)
+	addrs, err := n.LookupNetIP(ctx, n.lookupNetwork(network), t.host)
 	if err != nil {
-		return nil, errors.NewErr(TagResolveFailed, err).SetMetadata("network", network, "address", address)
+		return nil, err
 	}
 	var lastErr error
 	for _, ip := range addrs {

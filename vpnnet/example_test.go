@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"time"
 
@@ -56,6 +57,56 @@ func ExampleNet_DialContext() {
 		log.Fatal(err)
 	}
 	fmt.Println(resp.Status, len(body), "bytes")
+}
+
+// ExampleNet_LookupNetIP uses the DNS server 1.1.1.1 and not the ones that the VPN server
+// pushed. The queries go through the tunnel (the VPN must route to 1.1.1.1), and
+// nothing of the machine is read: not /etc/resolv.conf, not /etc/hosts. DialContext
+// looks names up in the same way.
+func ExampleNet_LookupNetIP() {
+	profile, err := ovpn.ParseFS(os.DirFS("/etc/openvpn/client"), "work.ovpn")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conn, err := profile.Dial(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	n, err := vpnnet.New(conn, &vpnnet.Options{
+		CloseConn: true,
+		// In order; a port of 0 is 53. The pushed servers are not used.
+		DNSServers: []netip.AddrPort{
+			netip.MustParseAddrPort("1.1.1.1:53"),
+			netip.MustParseAddrPort("1.0.0.1:53"),
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := n.Close(); err != nil {
+			log.Print(err)
+		}
+	}()
+
+	addrs, err := n.LookupNetIP(ctx, "ip", "example.com") // asked of 1.1.1.1, through the VPN
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(addrs)
+
+	// The names of the dials are looked up at 1.1.1.1 too.
+	client := &http.Client{Transport: &http.Transport{DialContext: n.DialContext}}
+	resp, err := client.Get("http://example.com/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		log.Print(err)
+	}
+	fmt.Println(resp.Status)
 }
 
 // ExampleNet_Listen listens on the tunnel address of the client: another machine of the

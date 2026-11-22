@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,12 @@ type Options struct {
 	// CloseConn makes Close close the *openvpn.Conn too. By default the Conn is
 	// the caller's and stays open.
 	CloseConn bool
+	// DNSServers are the DNS servers for the names that DialContext, LookupNetIP,
+	// LookupHost and Resolver look up, asked through the tunnel in this order. A port of
+	// 0 is port 53. When there are some, the servers that the VPN server pushed are not
+	// used; with none, the pushed ones are. Servers of a family that the tunnel has no
+	// address for are skipped.
+	DNSServers []netip.AddrPort
 	// Logger gets the events of the Net (the end of the tunnel, a packet that was
 	// dropped). Nil is no log.
 	Logger *slog.Logger
@@ -68,7 +75,7 @@ type Net struct {
 	has6   bool // the tunnel has an IPv6 address
 
 	resolver *net.Resolver
-	dnsStart atomic.Int32 // the index in state.DNSServers where the next lookup starts
+	dnsStart atomic.Int32 // the index in dnsServers() where the next lookup starts
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -98,6 +105,7 @@ func New(conn *openvpn.Conn, opts *Options) (*Net, error) {
 	var o Options
 	if opts != nil {
 		o = *opts
+		o.DNSServers = slices.Clone(opts.DNSServers) // the caller may change its slice
 	}
 	n := &Net{conn: conn, stack: s, ep: ep, opts: o, logger: o.Logger, state: state}
 	for _, p := range state.Addrs {

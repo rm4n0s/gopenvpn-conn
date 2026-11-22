@@ -30,6 +30,12 @@ const serverIPv6 = "fd00:8::1"
 // listen on the server's tunnel addresses with the ordinary net package.
 func realNet(t testing.TB, proto string, extra ...string) (*Net, *openvpn.Conn, *servertest.Server) {
 	t.Helper()
+	return realNetWith(t, proto, &Options{CloseConn: true}, extra...)
+}
+
+// realNetWith is realNet with the options of the Net.
+func realNetWith(t testing.TB, proto string, opts *Options, extra ...string) (*Net, *openvpn.Conn, *servertest.Server) {
+	t.Helper()
 	srv := servertest.Start(t, servertest.Options{Proto: proto, Extra: append([]string{"--server-ipv6", "fd00:8::/64"}, extra...)})
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -41,7 +47,7 @@ func realNet(t testing.TB, proto string, extra ...string) (*Net, *openvpn.Conn, 
 	if err != nil {
 		t.Fatalf("Dial: %v\nserver log:\n%s", err, srv.Log())
 	}
-	n, err := New(conn, &Options{CloseConn: true})
+	n, err := New(conn, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -341,6 +347,46 @@ func TestRealServerHTTPByName(t *testing.T) {
 	if err != nil || len(addrs) != 1 || addrs[0] != srv.TunnelIP().String() {
 		t.Errorf("LookupHost = %v, %v", addrs, err)
 	}
+}
+
+// TestRealServerOwnDNS: the server pushes a DNS server where nothing answers, and
+// Options.DNSServers names another one (a small one that this test runs on
+// 10.8.0.1:5353). The lookups and the dials by name use the one of the options, through
+// the tunnel, and read nothing of the host: "localhost", which /etc/hosts has, is asked
+// of the DNS server, which does not know it.
+func TestRealServerOwnDNS(t *testing.T) {
+	own := netip.AddrPortFrom(netip.MustParseAddr("10.8.0.1"), 5353)
+	n, _, srv := realNetWith(t, "udp", &Options{CloseConn: true, DNSServers: []netip.AddrPort{own}},
+		"--push", "dhcp-option DNS 10.8.0.9")
+	if own.Addr() != srv.TunnelIP() {
+		t.Fatalf("the server's tunnel address is %v, the test expects %v", srv.TunnelIP(), own.Addr())
+	}
+	dns := listenPacketOnTunnel(t, "udp4", own.String())
+	serveDNS(dns, zone{"web.vpn.test": {srv.TunnelIP()}})
+	if servers := n.state.DNSServers; len(servers) != 1 || servers[0] != netip.MustParseAddr("10.8.0.9") {
+		t.Fatalf("the pushed DNS servers are %v", servers)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	addrs, err := n.LookupNetIP(ctx, "ip", "web.vpn.test")
+	if err != nil || len(addrs) != 1 || addrs[0] != srv.TunnelIP() {
+		t.Fatalf("LookupNetIP = %v, %v\nserver log:\n%s", addrs, err, srv.Log())
+	}
+	hosts, err := n.LookupHost(ctx, "web.vpn.test")
+	if err != nil || len(hosts) != 1 || hosts[0] != srv.TunnelIP().String() {
+		t.Errorf("LookupHost = %v, %v", hosts, err)
+	}
+	_, err = n.LookupNetIP(ctx, "ip", "localhost")
+	wantRoute(t, err, "parseResponse."+TagNoSuchHost)
+
+	l := listenOnTunnel(t, "tcp4", net.JoinHostPort(srv.TunnelIP().String(), "7000"))
+	echoServer(t, l)
+	c, err := n.DialContext(ctx, "tcp", "web.vpn.test:7000")
+	if err != nil {
+		t.Fatalf("DialContext by name: %v", err)
+	}
+	roundTrip(t, c, []byte("own dns"))
+	closeOrFail(t, c)
 }
 
 // BenchmarkThroughput sends 100 MiB through the Net and the real server, up (client to

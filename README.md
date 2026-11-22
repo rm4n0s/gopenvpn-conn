@@ -43,7 +43,7 @@ if err != nil {
 defer n.Close()
 
 // The name is looked up through the VPN, with the DNS servers that the server
-// pushed, and the connection goes through it too.
+// pushed (or those of vpnnet.Options.DNSServers), and the connection goes through it too.
 client := &http.Client{Transport: &http.Transport{DialContext: n.DialContext}}
 resp, err := client.Get("http://intranet.example.com/")
 ```
@@ -60,6 +60,40 @@ the other machines of the VPN at the client's tunnel address. See `ovpn/example_
 ```
 go run ./examples/http -profile client.ovpn -url http://intranet.example.com/
 ```
+
+### Your own DNS servers
+
+By default the names are looked up at the DNS servers that the VPN server pushed. To use
+your own, here 1.1.1.1, give them in `Options.DNSServers`; the pushed ones are then not
+used.
+
+```go
+n, err := vpnnet.New(conn, &vpnnet.Options{
+	CloseConn: true,
+	// In order; a port of 0 is 53.
+	DNSServers: []netip.AddrPort{
+		netip.MustParseAddrPort("1.1.1.1:53"),
+		netip.MustParseAddrPort("1.0.0.1:53"),
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+defer n.Close()
+
+addrs, err := n.LookupNetIP(ctx, "ip", "example.com") // asked of 1.1.1.1, through the VPN
+
+// The names of the dials are looked up at 1.1.1.1 too.
+client := &http.Client{Transport: &http.Transport{DialContext: n.DialContext}}
+resp, err := client.Get("http://example.com/")
+```
+
+The queries go through the tunnel, so the VPN must route to the DNS server (1.1.1.1 needs a
+VPN that reaches the internet). `LookupNetIP`, `LookupHost` and `DialContext` use a DNS
+client of this package that reads nothing of the machine: not `/etc/resolv.conf`, not
+`/etc/hosts`. A name is asked as it is given, with no search list. `n.Resolver()` is Go's
+`*net.Resolver` over the same servers, for code that needs that type; Go's resolver still
+reads those two files. See `ExampleNet_LookupNetIP` in `vpnnet/example_test.go`.
 
 ### The tunnel on its own
 

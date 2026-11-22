@@ -91,6 +91,11 @@ func dnsAnswer(z zone, query []byte) []byte {
 
 // serveDNS answers the queries that arrive on pc until it is closed.
 func serveDNS(pc net.PacketConn, z zone) {
+	serveDNSFunc(pc, func(query []byte) []byte { return dnsAnswer(z, query) })
+}
+
+// serveDNSFunc answers each query with what answer returns (nil: no answer).
+func serveDNSFunc(pc net.PacketConn, answer func(query []byte) []byte) {
 	go func() {
 		buf := make([]byte, 1500)
 		for {
@@ -98,8 +103,8 @@ func serveDNS(pc net.PacketConn, z zone) {
 			if err != nil {
 				return
 			}
-			if answer := dnsAnswer(z, buf[:size]); answer != nil {
-				if _, err := pc.WriteTo(answer, from); err != nil {
+			if reply := answer(buf[:size]); reply != nil {
+				if _, err := pc.WriteTo(reply, from); err != nil {
 					return
 				}
 			}
@@ -324,9 +329,9 @@ func TestDialContextByName(t *testing.T) {
 	}
 	// A name that does not exist, and a name that has no address of the family.
 	_, err = na.DialContext(t.Context(), "tcp", "nothing.vpn.test:7000")
-	wantRoute(t, err, "Net.DialContext."+TagResolveFailed)
+	wantRoute(t, err, "Net.DialContext->Net.LookupNetIP->Net.exchange->Net.queryServer->parseResponse."+TagNoSuchHost)
 	_, err = na.DialContext(t.Context(), "tcp4", "v6.vpn.test:7000")
-	wantRoute(t, err, "Net.DialContext."+TagResolveFailed)
+	wantRoute(t, err, "Net.DialContext->Net.LookupNetIP."+TagNoSuchHost)
 }
 
 // TestDialContextByNameWithOnlyIPv4 shows that a tunnel with no IPv6 address does not
@@ -340,7 +345,7 @@ func TestDialContextByNameWithOnlyIPv4(t *testing.T) {
 	defer closeOrFail(t, pc)
 	serveDNS(pc, zone{"v6.vpn.test": {netip.MustParseAddr("fd00:8::3")}})
 	_, err = na.DialContext(t.Context(), "tcp", "v6.vpn.test:7000")
-	wantRoute(t, err, "Net.DialContext."+TagResolveFailed)
+	wantRoute(t, err, "Net.DialContext->Net.LookupNetIP."+TagNoSuchHost)
 	if got := na.lookupNetwork("tcp"); got != "ip4" {
 		t.Errorf("lookupNetwork = %s, want ip4", got)
 	}

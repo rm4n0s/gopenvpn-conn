@@ -12,38 +12,65 @@ import (
 
 // Tags of the errors of the resolver.
 const (
-	// TagNoDNSServers: the server pushed no DNS server, so a name cannot be looked up
-	// through the tunnel. Reached through the errors of Resolver.
+	// TagNoDNSServers: there is no DNS server that the tunnel can reach (the VPN server
+	// pushed none and Options.DNSServers has none), so a name cannot be looked up
+	// through the tunnel. Returned by LookupNetIP; reached through the errors of Resolver.
 	TagNoDNSServers = "NetNoDNSServers"
 )
 
-// dnsPort is the port of the DNS servers of the VPN.
-const dnsPort = "53"
+// dnsPort is the port of a DNS server whose port is not given.
+const dnsPort = 53
 
 // Resolver returns a *net.Resolver whose queries go through the tunnel to the DNS
-// servers that the VPN server pushed, one after the other: a server whose answers fail
-// (an error, or no answer in time) is left, and the next one is tried at the next
-// attempt of the resolver. With no DNS server pushed every lookup fails (the
+// servers of Options.DNSServers, or, when there are none, to the ones that the VPN
+// server pushed, one after the other: a server whose answers fail (an error, or no
+// answer in time) is left, and the next one is tried at the next attempt of the
+// resolver. With no DNS server (none pushed, none in Options) every lookup fails (the
 // *net.DNSError says that there is no server: the standard library keeps the text of
 // the error of a Dial function, not the error).
 //
 // The resolver is Go's own (PreferGo) with a Dial function that ignores the address
 // that the resolver wants: the standard library still reads the host's /etc/hosts
 // and resolv.conf (the search list, the number of attempts, the timeout) where they
-// exist, besides the servers.
+// exist, besides the servers. A program that must not read them uses Net.LookupNetIP
+// and Net.LookupHost, the DNS client of this package, which reads nothing of the host
+// (and so does DialContext).
 func (n *Net) Resolver() *net.Resolver { return n.resolver }
 
-// dnsServers are the pushed DNS servers that the tunnel can reach, in the order that
-// the server gave them.
-func (n *Net) dnsServers() []netip.Addr {
-	var out []netip.Addr
-	for _, a := range n.state.DNSServers {
-		a = a.Unmap()
-		if (a.Is4() && n.has4) || (a.Is6() && n.has6) {
-			out = append(out, a)
+// dnsServers are the DNS servers that the tunnel can reach: those of Options.DNSServers,
+// or, when it has none, the pushed ones (port 53), in the order given.
+func (n *Net) dnsServers() []netip.AddrPort {
+	var out []netip.AddrPort
+	add := func(a netip.AddrPort) {
+		ip := a.Addr().Unmap()
+		if (ip.Is4() && n.has4) || (ip.Is6() && n.has6) {
+			out = append(out, netip.AddrPortFrom(ip, a.Port()))
 		}
 	}
+	if len(n.opts.DNSServers) > 0 {
+		for _, a := range n.opts.DNSServers {
+			if a.Port() == 0 {
+				a = netip.AddrPortFrom(a.Addr(), dnsPort)
+			}
+			add(a)
+		}
+		return out
+	}
+	for _, a := range n.state.DNSServers {
+		add(netip.AddrPortFrom(a, dnsPort))
+	}
 	return out
+}
+
+// noteDNS records the result of a query to the server at index of count: the server
+// that answered is the one to start with; one that failed gives its place to the
+// next, unless another query has moved on.
+func (n *Net) noteDNS(index, count int, err error) {
+	if err == nil {
+		n.dnsStart.Store(int32(index & 0xff))
+		return
+	}
+	n.dnsStart.CompareAndSwap(int32(index&0xff), int32((index+1)%count&0xff))
 }
 
 // dialDNS is the Dial function of the resolver. It connects to the first DNS server
@@ -52,14 +79,14 @@ func (n *Net) dnsServers() []netip.Addr {
 func (n *Net) dialDNS(ctx context.Context, network, _ string) (net.Conn, error) {
 	servers := n.dnsServers()
 	if len(servers) == 0 {
-		return nil, errors.New(TagNoDNSServers, "the server pushed no DNS server that the tunnel can reach")
+		return nil, errors.New(TagNoDNSServers, "no DNS server that the tunnel can reach: none was pushed and Options.DNSServers has none")
 	}
 	start := int(n.dnsStart.Load())
 	var lastErr error
 	for i := range servers {
 		idx := (start + i) % len(servers)
 		server := servers[idx]
-		conn, err := n.DialContext(ctx, network, net.JoinHostPort(server.String(), dnsPort))
+		conn, err := n.DialContext(ctx, network, server.String())
 		if err != nil {
 			lastErr = err
 			if ctx.Err() != nil {
@@ -86,15 +113,8 @@ type dnsConn struct {
 	count int
 }
 
-// note records the result of a read: a server that answered is the one to start with;
-// one that failed gives its place to the next, unless another connection has moved on.
-func (c *dnsConn) note(err error) {
-	if err == nil {
-		c.n.dnsStart.Store(int32(c.index & 0xff))
-		return
-	}
-	c.n.dnsStart.CompareAndSwap(int32(c.index&0xff), int32((c.index+1)%c.count&0xff))
-}
+// note records the result of a read.
+func (c *dnsConn) note(err error) { c.n.noteDNS(c.index, c.count, err) }
 
 func (c *dnsConn) Read(b []byte) (int, error) {
 	size, err := c.Conn.Read(b)
