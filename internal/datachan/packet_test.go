@@ -720,3 +720,27 @@ func TestCipherConstructorsRefuseABadKey(t *testing.T) {
 	_, err = newChaCha(make([]byte, 5))
 	wantTag(t, err, tagCipherInit, "newChaCha.DataCipherInitFailed")
 }
+
+// TestOverhead: Overhead is what a sealed packet is longer than its payload, in
+// each format; the MSS clamp of the session depends on it (SPEC §10).
+func TestOverhead(t *testing.T) {
+	payload := make([]byte, 1400)
+	for _, hh := range headers {
+		s, _ := pair(t, "AES-256-GCM", hh.h, ReceiverOptions{})
+		packet, err := s.Seal(nil, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(packet) - len(payload); Overhead(hh.h, false) != got {
+			t.Errorf("%s: Overhead = %d, a packet adds %d", hh.name, Overhead(hh.h, false), got)
+		}
+	}
+	client, _ := epochPair(t, "AES-256-GCM", EpochOptions{})
+	packet, err := client.Seal(nil, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(packet) - len(payload); Overhead(epochHeader, true) != got {
+		t.Errorf("epoch: Overhead = %d, a packet adds %d", Overhead(epochHeader, true), got)
+	}
+}

@@ -36,6 +36,16 @@ const (
 	// the minimum IPv6 does not work and above 9000 there are no packets.
 	minMTU = 576
 	maxMTU = 9000
+	// defaultMSSFix is the size that the MSS clamp keeps the packets of the link
+	// under when Config.MSSFix is zero and the MTU is 1500.
+	//
+	// OpenVPN: mtu.h MSSFIX_DEFAULT.
+	defaultMSSFix = 1492
+	// minMSSFix and maxMSSFix bound Config.MSSFix, as OpenVPN bounds mssfix.
+	//
+	// OpenVPN: options.c add_option "mssfix", common.h TLS_CHANNEL_MTU_MIN.
+	minMSSFix = 154
+	maxMSSFix = 65535
 	// peerInfoMaxEntries, peerInfoMaxName, peerInfoMaxValue and peerInfoMaxTotal
 	// (the bytes of all the lines "name=value\n") keep the peer info inside the
 	// key exchange message, which a server reads up to 2048 bytes of: with the
@@ -45,6 +55,23 @@ const (
 	peerInfoMaxName    = 64
 	peerInfoMaxValue   = 256
 	peerInfoMaxTotal   = 1024
+)
+
+// MSSFixMode is what Config.MSSFix counts: the second argument of the profile's
+// mssfix.
+type MSSFixMode int
+
+// The modes of Config.MSSFix.
+const (
+	// MSSFixPacket: MSSFix is the largest OpenVPN packet, without the IP and the
+	// UDP or TCP headers of the link ("mssfix N").
+	MSSFixPacket MSSFixMode = iota
+	// MSSFixMTU: MSSFix is the largest IP packet on the network under the
+	// tunnel, the headers of the link counted ("mssfix N mtu").
+	MSSFixMTU
+	// MSSFixFixed: MSSFix is the largest IP packet in the tunnel, whatever the
+	// overhead; the MSS is MSSFix less 40 ("mssfix N fixed").
+	MSSFixFixed
 )
 
 // defaultDataCiphers is OpenVPN's data-ciphers default, with ChaCha20 last.
@@ -125,6 +152,19 @@ type Config struct {
 
 	// MTU is the MTU of the tunnel (the profile's tun-mtu). Zero means 1500.
 	MTU int
+
+	// MSSFix makes the client lower the MSS that the TCP SYNs in the tunnel
+	// announce, in the packets that it reads and in the ones that it writes, so
+	// that a full TCP segment in its OpenVPN packet fits in one packet of the
+	// network under the tunnel and is not cut into IP fragments (the profile's
+	// mssfix; SPEC §10). Zero means OpenVPN's default: 1492 counted with the
+	// headers of the link (MSSFixMTU) when MTU is 1500, and MTU (MSSFixFixed)
+	// when it is not. A negative value turns the clamp off; otherwise it is 154
+	// to 65535. ConnectionState.MSS is the MSS that results.
+	MSSFix int
+	// MSSFixMode is what MSSFix counts. When MSSFix is zero only MSSFixFixed
+	// changes the default.
+	MSSFixMode MSSFixMode
 
 	// PeerInfo are variables that the server's scripts get with the other
 	// information about the client (the profile's setenv UV_name value). Each
@@ -227,6 +267,10 @@ func (c *Config) validate() error {
 		return errors.New(tagInvalidConfig, "Config.TLS is required: the server must be verified", "field", "TLS")
 	case c.MTU != 0 && (c.MTU < minMTU || c.MTU > maxMTU):
 		return errors.New(tagInvalidConfig, "the MTU is out of range", "field", "MTU", "min", minMTU, "max", maxMTU)
+	case c.MSSFix > 0 && (c.MSSFix < minMSSFix || c.MSSFix > maxMSSFix):
+		return errors.New(tagInvalidConfig, "the mssfix size is out of range", "field", "MSSFix", "min", minMSSFix, "max", maxMSSFix)
+	case c.MSSFixMode < MSSFixPacket || c.MSSFixMode > MSSFixFixed:
+		return errors.New(tagInvalidConfig, "the mssfix mode is not known", "field", "MSSFixMode")
 	}
 	for _, name := range c.DataCiphers {
 		if _, ok := cipherKeyBits[strings.ToUpper(name)]; !ok {

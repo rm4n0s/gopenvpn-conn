@@ -17,6 +17,7 @@ import (
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
+	"github.com/rm4n0s/gopenvpn-conn/internal/mss"
 	"github.com/rm4n0s/gopenvpn-conn/internal/wire"
 )
 
@@ -88,6 +89,9 @@ type Options struct {
 	Ciphers []string
 	// MTU is the tunnel MTU when the server pushes none; 1500 when zero.
 	MTU int
+	// MSSFix is how the largest MSS of the TCP SYNs in the tunnel is made; the
+	// zero value turns the clamp off (SPEC §10).
+	MSSFix mss.Settings
 	// PingInterval and PingTimeout are the keepalive when the server pushes none:
 	// the idle time after which a ping is sent, and the silence after which the
 	// session ends. Zero is off.

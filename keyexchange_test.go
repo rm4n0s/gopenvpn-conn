@@ -256,6 +256,10 @@ func TestInvalidConfigFields(t *testing.T) {
 		{"MTU too small", Config{resetOnly: true, MTU: 575}, "MTU"},
 		{"MTU too large", Config{resetOnly: true, MTU: 9001}, "MTU"},
 		{"MTU negative", Config{resetOnly: true, MTU: -1}, "MTU"},
+		{"mssfix too small", Config{resetOnly: true, MSSFix: minMSSFix - 1}, "MSSFix"},
+		{"mssfix too large", Config{resetOnly: true, MSSFix: maxMSSFix + 1}, "MSSFix"},
+		{"an mssfix mode that is not known", Config{resetOnly: true, MSSFixMode: MSSFixFixed + 1}, "MSSFixMode"},
+		{"a negative mssfix mode", Config{resetOnly: true, MSSFixMode: -1}, "MSSFixMode"},
 		{"a cipher that is not supported", Config{resetOnly: true, DataCiphers: []string{"AES-256-GCM", "AES-256-CBC"}}, "DataCiphers"},
 		{"an empty cipher", Config{resetOnly: true, DataCiphers: []string{""}}, "DataCiphers"},
 		{"peer info without UV_", Config{resetOnly: true, PeerInfo: map[string]string{"IV_VER": "x"}}, "PeerInfo"},
@@ -283,7 +287,7 @@ func TestInvalidConfigFields(t *testing.T) {
 		})
 	}
 	good := Config{
-		resetOnly: true, MTU: 1500, DataCiphers: []string{"aes-192-gcm", "AES-256-GCM"},
+		resetOnly: true, MTU: 1500, MSSFix: minMSSFix, MSSFixMode: MSSFixMTU, DataCiphers: []string{"aes-192-gcm", "AES-256-GCM"},
 		PeerInfo: map[string]string{"UV_Ok_1": strings.Repeat("v", peerInfoMaxValue)},
 	}
 	if err := good.validate(); err != nil {

@@ -59,6 +59,11 @@ type ConnectionState struct {
 	// MTU is the MTU of the tunnel: the one the server pushed, or the one of the
 	// Config. It is the size of the largest IP packet that Write takes.
 	MTU int
+	// MSS is the largest MSS that a TCP SYN over IPv4 in the tunnel may announce:
+	// the client lowers a larger one in the packets that it reads and writes, as
+	// OpenVPN's mssfix does (a SYN over IPv6 gets 20 less). Zero before the
+	// handshake is complete and when Config.MSSFix turns the clamp off.
+	MSS int
 	// PingInterval is the keepalive interval that the server pushed (ping); zero
 	// when it pushed none.
 	PingInterval time.Duration
@@ -95,6 +100,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 	if pushed.MTU != 0 {
 		state.MTU = pushed.MTU
 	}
+	state.MSS = c.s.MSS()
 	state.PingInterval = pushed.PingInterval
 	state.PingTimeout = pushed.PingRestart
 	state.PushedOptions = slices.Clone(pushed.Options)

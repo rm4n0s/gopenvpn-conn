@@ -9,9 +9,13 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -460,5 +464,82 @@ func BenchmarkThroughput(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// TestRealServerMSS: with a server that does not lower the MSS itself (mssfix 0, as
+// a server with the kernel data channel does not: SPEC §21 O32), the SYN of a TCP
+// connection of vpnnet arrives with the MSS of ConnectionState (20 less over IPv6),
+// so the server's socket sends segments no larger than that, and its packets fit in
+// one packet of the link. The MSS that the server's kernel uses is its TCP_MAXSEG,
+// which leaves out the room of TCP options such as timestamps.
+func TestRealServerMSS(t *testing.T) {
+	for _, proto := range []string{"udp", "tcp"} {
+		t.Run(proto, func(t *testing.T) {
+			n, conn, srv := realNet(t, proto, "--mssfix", "0")
+			// 1492 less the link's headers (UDP 28, TCP 40), the data packet's
+			// overhead (DATA_V2 4, packet id 4 or 8 in the epoch format, tag
+			// 16, and 2 for the length on TCP) and 40: 1400 or 1396 on UDP,
+			// 1386 or 1382 on TCP.
+			st := conn.ConnectionState()
+			want := 1492 - 28 - 24 - 40
+			if proto == "tcp" {
+				want = 1492 - 40 - 26 - 40
+			}
+			if slices.ContainsFunc(st.PushedOptions, func(o string) bool {
+				return strings.HasPrefix(o, "protocol-flags ") && slices.Contains(strings.Fields(o), "aead-epoch")
+			}) {
+				want -= 4
+			}
+			if st.MSS != want {
+				t.Fatalf("ConnectionState().MSS = %d, want %d (pushed %q)", st.MSS, want, st.PushedOptions)
+			}
+			for _, row := range []struct {
+				name, network, host string
+				limit               int
+			}{
+				{"IPv4", "tcp4", srv.TunnelIP().String(), want},
+				{"IPv6", "tcp6", serverIPv6, want - 20},
+			} {
+				l := listenOnTunnel(t, row.network, net.JoinHostPort(row.host, "0"))
+				accepted := make(chan net.Conn, 1)
+				go func() {
+					c, err := l.Accept()
+					if err != nil {
+						t.Errorf("%s: Accept: %v", row.name, err)
+						close(accepted)
+						return
+					}
+					accepted <- c
+				}()
+				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+				c, err := n.DialContext(ctx, row.network, l.Addr().String())
+				cancel()
+				if err != nil {
+					t.Fatalf("%s: DialContext: %v\nserver log:\n%s", row.name, err, srv.Log())
+				}
+				sc, ok := <-accepted
+				if !ok {
+					t.FailNow()
+				}
+				raw, err := sc.(*net.TCPConn).SyscallConn()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var maxSeg int
+				var serr error
+				if err := raw.Control(func(fd uintptr) {
+					maxSeg, serr = syscall.GetsockoptInt(int(min(fd, math.MaxInt)), syscall.IPPROTO_TCP, syscall.TCP_MAXSEG)
+				}); err != nil || serr != nil {
+					t.Fatalf("%s: TCP_MAXSEG: %v %v", row.name, err, serr)
+				}
+				if maxSeg > row.limit {
+					t.Errorf("%s: the server's socket sends segments of %d bytes, above the MSS of %d", row.name, maxSeg, row.limit)
+				}
+				t.Logf("%s: the server sends segments of up to %d bytes (MSS %d)", row.name, maxSeg, row.limit)
+				closeOrFail(t, sc)
+				closeOrFail(t, c)
+			}
+		})
 	}
 }

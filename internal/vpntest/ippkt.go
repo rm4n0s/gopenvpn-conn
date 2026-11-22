@@ -4,6 +4,7 @@ package vpntest
 
 import (
 	"encoding/binary"
+	"math"
 	"net/netip"
 )
 
@@ -102,4 +103,88 @@ func MakeEchoReply(request []byte) []byte {
 	r[22], r[23] = 0, 0
 	binary.BigEndian.PutUint16(r[22:], Checksum(r[20:]))
 	return r
+}
+
+// TCPSYN is a TCP SYN (a SYN-ACK when ack is set) from src to dst with an MSS
+// option of mss and the other options that Linux sends, over IPv4 or IPv6 as the
+// addresses are, with its checksums right.
+func TCPSYN(src, dst netip.Addr, mss uint16, ack bool) []byte {
+	opts := binary.BigEndian.AppendUint16([]byte{2, 4}, mss)
+	opts = append(opts, 4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 7) // SACK, timestamps, NOP, window scale
+	tcp := make([]byte, 20+len(opts))
+	binary.BigEndian.PutUint16(tcp[0:], 40000)
+	binary.BigEndian.PutUint16(tcp[2:], 80)
+	binary.BigEndian.PutUint32(tcp[4:], 1000)
+	tcp[12] = 10 << 4 // 40 bytes: 20 and the options
+	tcp[13] = 0x02
+	if ack {
+		tcp[13] |= 0x10
+		binary.BigEndian.PutUint32(tcp[8:], 2001)
+	}
+	binary.BigEndian.PutUint16(tcp[14:], 64240)
+	copy(tcp[20:], opts)
+	var p []byte
+	if src.Is4() {
+		p = make([]byte, 20, 20+len(tcp))
+		p[0] = 0x45
+		binary.BigEndian.PutUint16(p[2:], uint16(min(20+len(tcp), math.MaxUint16)))
+		binary.BigEndian.PutUint16(p[6:], 0x4000)
+		p[8], p[9] = 64, 6
+		s, d := src.As4(), dst.As4()
+		copy(p[12:], s[:])
+		copy(p[16:], d[:])
+		binary.BigEndian.PutUint16(p[10:], Checksum(p))
+	} else {
+		p = make([]byte, 40, 40+len(tcp))
+		p[0] = 0x60
+		binary.BigEndian.PutUint16(p[4:], uint16(min(len(tcp), math.MaxUint16)))
+		p[6], p[7] = 6, 64
+		s, d := src.As16(), dst.As16()
+		copy(p[8:], s[:])
+		copy(p[24:], d[:])
+	}
+	p = append(p, tcp...)
+	binary.BigEndian.PutUint16(p[len(p)-len(tcp)+16:], tcpChecksum(p))
+	return p
+}
+
+// SYNMSS is the MSS option of a TCP SYN that TCPSYN made (or another with the MSS
+// option first), and whether its TCP checksum is right; ok is false for a packet
+// that is not such a SYN.
+func SYNMSS(p []byte) (mss uint16, checksumOK, ok bool) {
+	hlen := 0
+	switch {
+	case len(p) >= 20 && p[0]>>4 == 4 && p[9] == 6:
+		hlen = int(p[0]&0x0f) * 4
+	case len(p) >= 40 && p[0]>>4 == 6 && p[6] == 6:
+		hlen = 40
+	default:
+		return 0, false, false
+	}
+	tcp := p[hlen:]
+	if len(tcp) < 24 || tcp[13]&0x02 == 0 || tcp[20] != 2 || tcp[21] != 4 {
+		return 0, false, false
+	}
+	return binary.BigEndian.Uint16(tcp[22:]), tcpChecksum(p) == 0, true
+}
+
+// tcpChecksum is the checksum of the TCP segment of p with its pseudo header, the
+// checksum field counted: 0 when the field is right, and what the field must be
+// when it is 0.
+func tcpChecksum(p []byte) uint16 {
+	var pseudo []byte
+	var tcp []byte
+	if p[0]>>4 == 4 {
+		hlen := int(p[0]&0x0f) * 4
+		tcp = p[hlen:]
+		pseudo = append(pseudo, p[12:20]...)
+		pseudo = append(pseudo, 0, 6)
+		pseudo = binary.BigEndian.AppendUint16(pseudo, uint16(min(len(tcp), math.MaxUint16)))
+	} else {
+		tcp = p[40:]
+		pseudo = append(pseudo, p[8:40]...)
+		pseudo = binary.BigEndian.AppendUint32(pseudo, uint32(min(len(tcp), math.MaxUint16)))
+		pseudo = append(pseudo, 0, 0, 0, 6)
+	}
+	return Checksum(append(pseudo, tcp...))
 }

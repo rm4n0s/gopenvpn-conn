@@ -12,6 +12,7 @@ import (
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlwrap"
 	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
+	"github.com/rm4n0s/gopenvpn-conn/internal/mss"
 	"github.com/rm4n0s/gopenvpn-conn/internal/session"
 )
 
@@ -135,6 +136,7 @@ func newConn(link net.Conn, stream bool, config *Config, poll time.Duration) *Co
 		opts.Wrapper = w
 	}
 	opts.Options, opts.PeerInfo, opts.Ciphers = keyExchangeStrings(config, link, stream)
+	opts.MSSFix = mssSettings(config, link, stream)
 	if config.Credentials != nil {
 		credentials := config.Credentials
 		opts.Credentials = func(ctx context.Context) (string, string, error) {
@@ -192,6 +194,42 @@ func keyExchangeStrings(config *Config, link net.Conn, stream bool) (options, pe
 		UV:      config.PeerInfo,
 	}
 	return options, info.String(), ciphers
+}
+
+// mssSettings is how the session makes the largest MSS of a SYN: the size and
+// mode of the Config, or OpenVPN's default for the MTU when the size is zero, and
+// the headers of the link when the size counts them.
+//
+// OpenVPN: options.c options_postprocess_mutate_ce (the default of mssfix),
+// mss.c get_ip_encap_overhead, socket_util.h datagram_overhead.
+func mssSettings(config *Config, link net.Conn, stream bool) mss.Settings {
+	size, mode := config.MSSFix, config.MSSFixMode
+	switch {
+	case size < 0:
+		return mss.Settings{}
+	case size == 0 && tunnelMTU(config) != DefaultMTU:
+		// Another MTU already makes the packets smaller: only the tunnel's MTU
+		// is applied.
+		size, mode = tunnelMTU(config), MSSFixFixed
+	case size == 0:
+		size = defaultMSSFix
+		if mode != MSSFixFixed {
+			mode = MSSFixMTU
+		}
+	}
+	s := mss.Settings{Size: size, Fixed: mode == MSSFixFixed}
+	if mode == MSSFixMTU {
+		s.Encap = 8 // UDP
+		if stream {
+			s.Encap = 20 // TCP
+		}
+		if isIPv6(link.RemoteAddr()) {
+			s.Encap += 40
+		} else {
+			s.Encap += 20
+		}
+	}
+	return s
 }
 
 // isIPv6 reports whether the link is to an IPv6 address.

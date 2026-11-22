@@ -109,6 +109,7 @@ func handlers() map[string]spec {
 		"reneg-sec":  {1, 2, (*builder).hRenegSec}, "hand-window": {1, 1, (*builder).hHandWindow}, "tls-timeout": {1, 1, (*builder).hTLSTimeout},
 		"ping": {1, 1, (*builder).hPing}, "ping-restart": {1, 1, (*builder).hPingRestart}, "ping-exit": {1, 1, (*builder).hPingExit},
 		"keepalive": {2, 2, (*builder).hKeepalive}, "tun-mtu": {1, 1, (*builder).hTunMTU},
+		"mssfix":               {0, 2, (*builder).hMSSFix},
 		"explicit-exit-notify": {0, 1, (*builder).hExplicitExitNotify},
 		"setenv":               {1, 64, (*builder).hSetenv}, "ignore-unknown-option": {1, 64, (*builder).hNothing},
 		"pull-filter": {2, 2, (*builder).hPullFilter}, "route-nopull": {0, 0, (*builder).hRouteNoPull},
@@ -128,7 +129,7 @@ var inConnection = []string{"remote", "proto", "port", "rport"}
 var ignoredOptions = map[string]bool{
 	"nobind": true, "persist-tun": true, "persist-key": true, "verb": true, "mute": true,
 	"mute-replay-warnings": true, "resolv-retry": true, "user": true, "group": true, "daemon": true,
-	"log": true, "log-append": true, "syslog": true, "script-security": true, "mssfix": true,
+	"log": true, "log-append": true, "syslog": true, "script-security": true,
 	"sndbuf": true, "rcvbuf": true, "socket-flags": true, "fast-io": true, "float": true,
 	"connect-retry": true, "connect-retry-max": true, "key-method": true,
 	"ifconfig-noexec": true, "route-noexec": true, "route-delay": true, "route-method": true,
@@ -203,6 +204,13 @@ func (b *builder) apply(l line, inConn bool) error {
 	}
 	if ignoredOptions[l.name] {
 		b.ignore(l.name)
+		return nil
+	}
+	if inConn && l.name == "mssfix" {
+		// Deviation: OpenVPN reads mssfix in a connection block for that remote
+		// (SPEC §20 V14); the Config has one mssfix for every remote, the one
+		// outside the blocks.
+		b.ignore("mssfix in a <connection> block")
 		return nil
 	}
 	if inConn && !slices.Contains(inConnection, l.name) {
@@ -693,6 +701,37 @@ func (b *builder) hTunMTU(l line) error {
 		return errors.New(TagBadOption, "the MTU is not a number", "option", l.name, "line", l.lineNo, "reason", "bad number")
 	}
 	b.cfg.MTU = int(n)
+	return nil
+}
+
+// hMSSFix takes mssfix [size [mtu|fixed]]: with no size, OpenVPN's default; a
+// size of 0 turns the clamp off. The Config checks the range of the size.
+//
+// OpenVPN: options.c add_option "mssfix".
+func (b *builder) hMSSFix(l line) error {
+	size := 0
+	if len(l.args) > 0 {
+		n, err := strconv.ParseUint(l.args[0], 10, 16)
+		if err != nil {
+			return errors.New(TagBadOption, "the mssfix size is not a number from 0 to 65535", "option", l.name, "line", l.lineNo, "reason", "bad number")
+		}
+		size = int(n)
+		if n == 0 {
+			size = -1
+		}
+	}
+	mode := openvpn.MSSFixPacket
+	if len(l.args) == 2 {
+		switch l.args[1] {
+		case "mtu":
+			mode = openvpn.MSSFixMTU
+		case "fixed":
+			mode = openvpn.MSSFixFixed
+		default:
+			return errors.New(TagBadOption, "the second argument of mssfix is not mtu or fixed", "option", l.name, "line", l.lineNo, "reason", "bad mode")
+		}
+	}
+	b.cfg.MSSFix, b.cfg.MSSFixMode = size, mode
 	return nil
 }
 

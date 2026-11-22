@@ -81,6 +81,17 @@ func (h Header) headerSize() int {
 	return 1 + packetIDSize
 }
 
+// Overhead is how many bytes a data packet adds to the IP packet in it: the opcode,
+// the peer id of DATA_V2, the packet id (64 bits in the epoch format) and the tag.
+//
+// OpenVPN: mtu.c frame_calculate_protocol_header_size, crypto.c calculate_crypto_overhead.
+func Overhead(h Header, epoch bool) int {
+	if epoch {
+		return epochHeaderSize + TagSize
+	}
+	return h.headerSize() + TagSize
+}
+
 // minPacket is the shortest packet that can be valid: the header, the tag and
 // one byte of payload.
 func (h Header) minPacket() int { return h.headerSize() + TagSize + 1 }

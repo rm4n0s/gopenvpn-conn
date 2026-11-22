@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Based on OpenVPN 2.7.9, src/openvpn/ssl.c (generate_key_expansion_tls_export, init_key_contexts) and forward.c (process_incoming_link_part2, process_outgoing_tun) (Copyright (C) 2002-2026 OpenVPN Inc); rewritten in Go and changed for gopenvpn-conn, 2026-11-22.
+// Based on OpenVPN 2.7.9, src/openvpn/ssl.c (generate_key_expansion_tls_export, init_key_contexts), forward.c (process_incoming_link_part2, process_outgoing_tun, process_ip_header) and mss.c (frame_calculate_mssfix) (Copyright (C) 2002-2026 OpenVPN Inc); rewritten in Go and changed for gopenvpn-conn, 2026-11-22.
 
 package session
 
@@ -16,6 +16,7 @@ import (
 	"github.com/rm4n0s/gopenvpn-conn/internal/ctrlmsg"
 	"github.com/rm4n0s/gopenvpn-conn/internal/datachan"
 	"github.com/rm4n0s/gopenvpn-conn/internal/keys"
+	"github.com/rm4n0s/gopenvpn-conn/internal/mss"
 )
 
 // recvQueue is how many decrypted packets wait for Read. A packet that comes when
@@ -57,16 +58,18 @@ type keyTable struct {
 }
 
 // dataPath is the data side of the session: the table of keys, what makes a new
-// key, and the size of the largest packet.
+// key, the size of the largest packet and the largest MSS of a TCP SYN.
 type dataPath struct {
 	mtu    int
+	mss    int // the largest MSS over IPv4; 0 means no clamp
 	table  atomic.Pointer[keyTable]
 	cipher datachan.Cipher
 	header datachan.Header // the peer id; the key id is set for each key
 	epoch  bool            // the format with epochs
 
-	sem  chan struct{} // the right to write: Seal and wbuf, for many goroutines that may give up
+	sem  chan struct{} // the right to write: Seal, wbuf and cbuf, for many goroutines that may give up
 	wbuf []byte
+	cbuf []byte // a copy of a SYN that Write clamps: the caller's buffer is not changed
 }
 
 // setupData makes the data channel of key id 0 from the TLS session that is complete
@@ -93,6 +96,7 @@ func (s *Session) setupData(p *ctrlmsg.Pushed, x exporter) error {
 		epoch:  hasFlag(p.ProtocolFlags, "aead-epoch"),
 		sem:    make(chan struct{}, 1),
 	}
+	d.mss = s.opts.MSSFix.Max(dataOverhead(d, s.opts.Stream))
 	k, err := s.makeKey(d, 0, x)
 	if err != nil {
 		return err
@@ -135,6 +139,28 @@ func (s *Session) makeKey(d *dataPath, id uint8, x exporter) (*dataKey, error) {
 		return nil, err
 	}
 	return &dataKey{id: id, ch: ch}, nil
+}
+
+// dataOverhead is what the link carries for each IP packet besides the packet:
+// the data packet's header and tag, and the length of the frame on a stream.
+//
+// OpenVPN: mtu.c frame_calculate_protocol_header_size.
+func dataOverhead(d *dataPath, stream bool) int {
+	n := datachan.Overhead(d.header, d.epoch)
+	if stream {
+		n += 2
+	}
+	return n
+}
+
+// MSS is the largest MSS that the TCP SYNs over IPv4 in the tunnel may announce:
+// a larger one is lowered, in both directions (an IPv6 SYN gets 20 less). It is 0
+// before the data channel is made and when the clamp is off (SPEC §10).
+func (s *Session) MSS() int {
+	if d := s.data.Load(); d != nil {
+		return d.mss
+	}
+	return 0
 }
 
 // cmpOr is the first of its arguments that is not zero.
@@ -184,6 +210,8 @@ func (s *Session) handleData(raw []byte) {
 	}
 	pb := s.pool.get(len(plain))
 	copy(pb.b, plain)
+	// OpenVPN: forward.c process_outgoing_tun, process_ip_header (PIP_MSSFIX).
+	mss.Clamp(pb.b, d.mss)
 	select {
 	case s.recv <- pb:
 	default:
@@ -271,7 +299,15 @@ func (s *Session) Write(b []byte) (int, error) {
 		return 0, err
 	}
 	defer d.unlockWrite()
-	if err := s.writeLocked(d, b, true); err != nil {
+	packet := b
+	// OpenVPN: forward.c process_incoming_tun, process_ip_header (PIP_MSSFIX). The
+	// clamp works on a copy: an io.Writer does not change the caller's bytes.
+	if mss.Needs(b, d.mss) {
+		d.cbuf = append(d.cbuf[:0], b...)
+		mss.Clamp(d.cbuf, d.mss)
+		packet = d.cbuf
+	}
+	if err := s.writeLocked(d, packet, true); err != nil {
 		if err == errDeadline {
 			return 0, err
 		}

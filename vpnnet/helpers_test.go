@@ -22,6 +22,9 @@ type peer struct {
 	server *vpntest.Server
 	// failed holds the first error of a packet that could not be sent on.
 	failed atomic.Pointer[error]
+	// tap, when set, sees every packet that the server got from the client, before
+	// it goes on to the other peer.
+	tap atomic.Pointer[func(packet []byte)]
 }
 
 // pushReply is a PUSH_REPLY for the address ip (and ip6 when it is not empty).
@@ -65,6 +68,9 @@ func hubDNS(t *testing.T, ip6 bool, mtu string, dns []string) (a, b *peer) {
 				// The other peer's server may not be there yet: nothing flows before both are up.
 				if other.server == nil {
 					return
+				}
+				if tap := p.tap.Load(); tap != nil {
+					(*tap)(packet)
 				}
 				if _, err := other.server.SendData(packet); err != nil {
 					p.failed.CompareAndSwap(nil, &err)

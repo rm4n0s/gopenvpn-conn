@@ -272,6 +272,36 @@ func TestSupportedOptions(t *testing.T) {
 				t.Errorf("MTU = %d", p.Config.MTU)
 			}
 		}},
+		{"mssfix", "mssfix 1450\n", func(t *testing.T, p *Profile) {
+			if p.Config.MSSFix != 1450 || p.Config.MSSFixMode != openvpn.MSSFixPacket || slices.Contains(p.Ignored, "mssfix") {
+				t.Errorf("MSSFix = %d, mode %d, Ignored %v", p.Config.MSSFix, p.Config.MSSFixMode, p.Ignored)
+			}
+		}},
+		{"mssfix mtu", "mssfix 1450 mtu\n", func(t *testing.T, p *Profile) {
+			if p.Config.MSSFix != 1450 || p.Config.MSSFixMode != openvpn.MSSFixMTU {
+				t.Errorf("MSSFix = %d, mode %d", p.Config.MSSFix, p.Config.MSSFixMode)
+			}
+		}},
+		{"mssfix fixed", "mssfix 1400 fixed\n", func(t *testing.T, p *Profile) {
+			if p.Config.MSSFix != 1400 || p.Config.MSSFixMode != openvpn.MSSFixFixed {
+				t.Errorf("MSSFix = %d, mode %d", p.Config.MSSFix, p.Config.MSSFixMode)
+			}
+		}},
+		{"mssfix with no size", "mssfix 1450\nmssfix\n", func(t *testing.T, p *Profile) {
+			if p.Config.MSSFix != 0 || p.Config.MSSFixMode != openvpn.MSSFixPacket {
+				t.Errorf("MSSFix = %d, mode %d", p.Config.MSSFix, p.Config.MSSFixMode)
+			}
+		}},
+		{"mssfix 0", "mssfix 0\n", func(t *testing.T, p *Profile) {
+			if p.Config.MSSFix != -1 {
+				t.Errorf("MSSFix = %d, want -1 (off)", p.Config.MSSFix)
+			}
+		}},
+		{"mssfix in a connection block", "<connection>\nremote a\nmssfix 1300\n</connection>\n", func(t *testing.T, p *Profile) {
+			if p.Config.MSSFix != 0 || !slices.Contains(p.Ignored, "mssfix in a <connection> block") {
+				t.Errorf("MSSFix = %d, Ignored %v", p.Config.MSSFix, p.Ignored)
+			}
+		}},
 		{"explicit-exit-notify", "explicit-exit-notify 3\n", func(t *testing.T, p *Profile) {
 			if !slices.Contains(p.Ignored, "explicit-exit-notify: tries beyond the first") {
 				t.Errorf("Ignored = %v", p.Ignored)
@@ -450,6 +480,11 @@ func TestBadOptions(t *testing.T) {
 		{"keepalive with a word", "keepalive 10 x\n", "builder.hKeepalive.BadOption"},
 		{"keepalive with one argument", "keepalive 10\n", "apply.BadOption"},
 		{"tun-mtu that is not a number", "tun-mtu big\n", "builder.hTunMTU.BadOption"},
+		{"mssfix that is not a number", "mssfix big\n", "builder.hMSSFix.BadOption"},
+		{"mssfix that is negative", "mssfix -1\n", "builder.hMSSFix.BadOption"},
+		{"mssfix above 65535", "mssfix 65536\n", "builder.hMSSFix.BadOption"},
+		{"mssfix with a mode that is not known", "mssfix 1400 path\n", "builder.hMSSFix.BadOption"},
+		{"mssfix with three arguments", "mssfix 1400 mtu x\n", "apply.BadOption"},
 		{"explicit-exit-notify that is not a number", "explicit-exit-notify often\n", "builder.hExplicitExitNotify.BadOption"},
 		{"pull-filter with an action that is not known", "pull-filter drop route\n", "builder.hPullFilter.BadOption"},
 		{"pull-filter with one argument", "pull-filter ignore\n", "apply.BadOption"},
@@ -709,6 +744,12 @@ func TestConfigOfAProfileIsValid(t *testing.T) {
 	if !ok || appErr.Tag != "InvalidConfig" || appErr.Metadata["field"] != "MTU" {
 		t.Errorf("error %v", err)
 	}
+	// OpenVPN refuses an mssfix below 154 too.
+	_, err = Parse(strings.NewReader(f.base() + "mssfix 100\n"))
+	appErr, ok = errors.FromError(err)
+	if !ok || appErr.Tag != "InvalidConfig" || appErr.Metadata["field"] != "MSSFix" {
+		t.Errorf("mssfix 100: error %v", err)
+	}
 }
 
 func TestParseFS(t *testing.T) {
@@ -821,6 +862,7 @@ func FuzzParse(f *testing.F) {
 		"setenv opt unknown 1\nsetenv UV_A b\nignore-unknown-option x\nx\n",
 		"<connection>\n<ca>\n</connection>",
 		"remote \"\nport 0\n",
+		base + "mssfix 1450 mtu\n<connection>\nremote a\nmssfix 0\n</connection>\n",
 	} {
 		f.Add(s)
 	}

@@ -51,7 +51,7 @@ type Profile struct {
 	// caller has to set Config.Credentials before it dials.
 	NeedsCredentials bool
 	// Ignored are the names of the options that the profile has and the library does
-	// nothing with (persist-tun, verb, mssfix, ...), in the order of their first
+	// nothing with (persist-tun, verb, nobind, ...), in the order of their first
 	// appearance, each once.
 	Ignored []string
 }
