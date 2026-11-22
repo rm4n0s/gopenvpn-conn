@@ -54,9 +54,9 @@ func (s *Server) setupData(conn *tls.Conn, ks *serverKS) {
 	var ch datachan.Channel
 	if s.opts.Epoch {
 		ch, err = datachan.NewEpochChannel(cipher, &dk.ServerToClient, &dk.ClientToServer, header,
-			datachan.EpochOptions{Strict: s.opts.Stream, UsageLimit: s.opts.EpochUsageLimit})
+			datachan.EpochOptions{UsageLimit: s.opts.EpochUsageLimit})
 	} else {
-		ch, err = datachan.NewChannel(cipher, &dk.ServerToClient, &dk.ClientToServer, header, datachan.ReceiverOptions{Strict: s.opts.Stream})
+		ch, err = datachan.NewChannel(cipher, &dk.ServerToClient, &dk.ClientToServer, header, datachan.ReceiverOptions{})
 	}
 	if err != nil {
 		s.tb.Errorf("vpntest server: %v", err)
@@ -198,6 +198,21 @@ func (s *Server) SendDataWithKey(id uint8, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	return packet, s.SendPacket(packet)
+}
+
+// SkipData seals a packet with the server's key and does not send it: its packet
+// id is used up and never arrives. A real server with the kernel data channel
+// (DCO) does that on a TCP link when its socket is full (SPEC §21 O31).
+func (s *Server) SkipData() error {
+	d := s.sendKey()
+	if d == nil {
+		s.tb.Error("vpntest server: SkipData before the key exchange is done")
+		return nil
+	}
+	d.mu.Lock()
+	_, err := d.ch.Seal(nil, []byte{0x45})
+	d.mu.Unlock()
+	return err
 }
 
 // SendPacket writes a packet of the caller's making to the link, framed when the

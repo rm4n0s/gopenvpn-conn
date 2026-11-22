@@ -742,38 +742,6 @@ func TestEpochSealRefusesAnEmptyPayload(t *testing.T) {
 	}
 }
 
-func TestEpochStrictOrder(t *testing.T) {
-	client, server := epochPair(t, "AES-256-GCM", EpochOptions{Strict: true, UsageLimit: 12})
-	var packets [][]byte
-	for i := range 60 {
-		p, err := client.Seal(nil, []byte{byte(i)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		packets = append(packets, p)
-	}
-	for i, p := range packets {
-		if _, err := server.Open(nil, p, epoch); err != nil {
-			t.Fatalf("packet %d in order: %v", i, err)
-		}
-	}
-	if server.ReceiveEpoch() < 3 {
-		t.Errorf("only epoch %d", server.ReceiveEpoch())
-	}
-	// Out of order and repeats are refused in the epoch they belong to.
-	p1, _ := client.Seal(nil, []byte{1})
-	p2, _ := client.Seal(nil, []byte{2})
-	p3, _ := client.Seal(nil, []byte{3})
-	for _, step := range []struct {
-		p  []byte
-		ok bool
-	}{{p1, true}, {p3, false}, {p1, false}, {p2, true}, {p3, true}} {
-		if _, err := server.Open(nil, step.p, epoch); (err == nil) != step.ok {
-			t.Errorf("err = %v, want ok = %v", err, step.ok)
-		}
-	}
-}
-
 func TestEpochAllocations(t *testing.T) {
 	for _, name := range cipherNames {
 		client, server := epochPair(t, name, EpochOptions{Window: 1 << 16, MaxAge: time.Hour})
@@ -934,19 +902,19 @@ func FuzzEpochOpen(f *testing.F) {
 	client, _ := epochPair(f, "AES-256-GCM", EpochOptions{})
 	for _, p := range [][]byte{{1}, []byte("hello"), bytes.Repeat([]byte{9}, 100)} {
 		packet, _ := client.Seal(nil, p)
-		f.Add(packet, false, false)
-		f.Add(packet[:len(packet)/2], true, false)
+		f.Add(packet, false)
+		f.Add(packet[:len(packet)/2], true)
 		forged := bytes.Clone(packet)
 		binary.BigEndian.PutUint64(forged[4:], 3<<48|5)
-		f.Add(forged, false, true)
+		f.Add(forged, false)
 	}
-	f.Add([]byte(nil), false, false)
-	f.Fuzz(func(t *testing.T, packet []byte, chacha, strict bool) {
+	f.Add([]byte(nil), false)
+	f.Fuzz(func(t *testing.T, packet []byte, chacha bool) {
 		name := "AES-256-GCM"
 		if chacha {
 			name = "CHACHA20-POLY1305"
 		}
-		_, server := epochPair(t, name, EpochOptions{Strict: strict})
+		_, server := epochPair(t, name, EpochOptions{})
 		before := bytes.Clone(packet)
 		for range 2 { // the second time, an accepted packet is a replay
 			out, err := server.Open([]byte("p"), packet, epoch)

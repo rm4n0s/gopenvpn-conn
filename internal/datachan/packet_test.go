@@ -398,7 +398,7 @@ func TestOpenRefusals(t *testing.T) {
 // rewind returns a receiver like r with the drop counters at zero.
 func rewind(t *testing.T, r *Receiver) *Receiver {
 	t.Helper()
-	n := &Receiver{aead: r.aead, iv: r.iv, header: r.header, window: r.window, strict: r.strict, highest: r.highest}
+	n := &Receiver{aead: r.aead, iv: r.iv, header: r.header, window: r.window}
 	return n
 }
 
@@ -562,26 +562,6 @@ func TestDefaultReplayWindow(t *testing.T) {
 	}
 }
 
-func TestStrictOrder(t *testing.T) {
-	s, r := pair(t, "AES-256-GCM", Header{}, ReceiverOptions{Strict: true})
-	var packets [][]byte
-	for range 6 {
-		p, _ := s.Seal(nil, []byte{1})
-		packets = append(packets, p)
-	}
-	// The first id may be any above 0: the receiver starts at 2.
-	steps := []struct {
-		index int
-		pass  bool
-	}{{1, true}, {1, false}, {0, false}, {3, false}, {2, true}, {3, true}, {5, false}, {4, true}, {5, true}}
-	for _, step := range steps {
-		_, err := r.Open(nil, packets[step.index], epoch)
-		if (err == nil) != step.pass {
-			t.Errorf("packet id %d: err = %v, want pass = %v", step.index+1, err, step.pass)
-		}
-	}
-}
-
 // A forged packet that carries a high id leaves no trace in the replay window.
 func TestForgedPacketIDsAreNotRemembered(t *testing.T) {
 	s, r := pair(t, "AES-256-GCM", Header{}, ReceiverOptions{})
@@ -699,19 +679,19 @@ func FuzzOpen(f *testing.F) {
 			s, _ := pair(f, name, hh.h, ReceiverOptions{})
 			for _, p := range [][]byte{{1}, []byte("hello"), bytes.Repeat([]byte{9}, 100)} {
 				packet, _ := s.Seal(nil, p)
-				f.Add(packet, hh.h.HasPeerID, name == "CHACHA20-POLY1305", false)
-				f.Add(packet[:len(packet)/2], hh.h.HasPeerID, name == "CHACHA20-POLY1305", true)
+				f.Add(packet, hh.h.HasPeerID, name == "CHACHA20-POLY1305")
+				f.Add(packet[:len(packet)/2], hh.h.HasPeerID, name == "CHACHA20-POLY1305")
 			}
 		}
 	}
-	f.Add([]byte(nil), true, false, false)
-	f.Fuzz(func(t *testing.T, packet []byte, v2, chacha, strict bool) {
+	f.Add([]byte(nil), true, false)
+	f.Fuzz(func(t *testing.T, packet []byte, v2, chacha bool) {
 		name := "AES-256-GCM"
 		if chacha {
 			name = "CHACHA20-POLY1305"
 		}
 		h := Header{KeyID: 3, HasPeerID: v2, PeerID: 0xabcdef}
-		_, r := pair(t, name, h, ReceiverOptions{Strict: strict})
+		_, r := pair(t, name, h, ReceiverOptions{})
 		before := bytes.Clone(packet)
 		for range 2 { // the second time, an accepted packet is a replay
 			out, err := r.Open([]byte("p"), packet, epoch)

@@ -553,6 +553,64 @@ func epochRig(t *testing.T, tr transport, cipher string, server vpntest.ServerOp
 	})
 }
 
+// A packet id that never arrives does not stop the packets after it, on a stream
+// link too. OpenVPN's receiver has the window of 64 packets on every link
+// (options.c: replay_window is DEFAULT_SEQ_BACKTRACK, whatever the protocol), and a
+// server with the kernel data channel (DCO) drops packets on a TCP link when its
+// socket is full, after their ids were used (SPEC §21 O31). With strict order on
+// the stream, every packet after the first gap was dropped and a download over TCP
+// stalled.
+func TestDataAfterAMissingPacketID(t *testing.T) {
+	formats := []struct {
+		name string
+		rig  func(t *testing.T, tr transport) *tlsRig
+	}{
+		{"DATA_V2", func(t *testing.T, tr transport) *tlsRig {
+			return dataRig(t, tr, "AES-256-GCM", false, vpntest.ServerOptions{})
+		}},
+		{"epoch", func(t *testing.T, tr transport) *tlsRig {
+			return epochRig(t, tr, "AES-256-GCM", vpntest.ServerOptions{})
+		}},
+	}
+	for _, tr := range transports {
+		for _, f := range formats {
+			t.Run(tr.name+"/"+f.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					r := f.rig(t, tr)
+					if err := r.session.Handshake(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					// 1, a gap of one, 3 and 4, a gap of 63, then 68: within the window.
+					var want [][]byte
+					for i, skip := range []int{0, 1, 0, 63, 0} {
+						for range skip {
+							if err := r.server.SkipData(); err != nil {
+								t.Fatal(err)
+							}
+						}
+						p := []byte{0x45, byte(i)}
+						if _, err := r.server.SendData(p); err != nil {
+							t.Fatal(err)
+						}
+						want = append(want, p)
+					}
+					synctest.Wait()
+					buf := make([]byte, 10)
+					for _, p := range want {
+						n, err := r.session.Read(buf)
+						if err != nil || !bytes.Equal(buf[:n], p) {
+							t.Fatalf("Read = %x, %v, want %x (%d packets dropped)", buf[:n], err, p, r.session.Dropped())
+						}
+					}
+					if got := r.session.Dropped(); got != 0 {
+						t.Errorf("%d packets dropped, want 0", got)
+					}
+				})
+			})
+		}
+	}
+}
+
 func TestEpochDataGoesBothWays(t *testing.T) {
 	for _, tr := range transports {
 		for _, cipher := range dataCiphers {

@@ -206,8 +206,8 @@ type Drops struct {
 	Format uint64
 	// KeyID is packets of another key id.
 	KeyID uint64
-	// Replay is packets that the replay protection refused: a repeated id, one that
-	// is too old, or, with strict order, one that is not the next.
+	// Replay is packets that the replay protection refused: a repeated id or one
+	// that is too old.
 	Replay uint64
 	// Auth is packets that did not authenticate.
 	Auth uint64
@@ -220,9 +220,7 @@ type Receiver struct {
 	aead    cipher.AEAD
 	iv      [implicitIVSize]byte
 	header  Header
-	window  *replay.Window // nil with strict order
-	strict  bool
-	highest uint32        // strict order: the highest id accepted, 0 before the first
+	window  *replay.Window
 	maxID   atomic.Uint32 // the highest id accepted
 	blocks  atomic.Uint64 // the 16-byte blocks opened with this key
 	limit   uint64        // the usage limit of the cipher (0: none)
@@ -245,13 +243,16 @@ func (d *dropCounters) snapshot() Drops {
 }
 
 // ReceiverOptions tune the replay protection. The zero value is OpenVPN's
-// default for a datagram link: a window of 64 packets and 15 seconds.
+// default, on a datagram link and on a stream link alike: a window of 64 packets
+// and 15 seconds.
+//
+// OpenVPN: options.c (replay_window is DEFAULT_SEQ_BACKTRACK whatever the
+// protocol), packet_id.c packet_id_test. Its mode without a window (each id the
+// last plus one, "used with TCP" in its comment) is only for --replay-window 0: a
+// server with the kernel data channel (DCO) drops packets on a TCP link when its
+// socket is full, so a receiver in that mode stalls (SPEC §21 O31).
 type ReceiverOptions struct {
-	// Strict makes the receiver accept only packets in order, each id one more than
-	// the last (the first may be any id above 0), as OpenVPN does with a stream
-	// link, where packets cannot be lost or reordered.
-	Strict bool
-	// Window is the size of the window of a datagram link, in packets; 0 is 64.
+	// Window is the size of the window, in packets; 0 is 64.
 	Window int
 	// MaxAge is how late a packet may arrive after one with a higher id; 0 is 15
 	// seconds.
@@ -272,20 +273,18 @@ func NewReceiver(c Cipher, k *keys.DirectionKey, h Header, opts ReceiverOptions)
 	if err != nil {
 		return nil, err
 	}
-	r := &Receiver{aead: aead, iv: iv, header: h, strict: opts.Strict, limit: usageLimit(c)}
+	r := &Receiver{aead: aead, iv: iv, header: h, limit: usageLimit(c)}
 	if opts.UsageLimit != 0 {
 		r.limit = opts.UsageLimit
 	}
-	if !opts.Strict {
-		size, age := opts.Window, opts.MaxAge
-		if size <= 0 {
-			size = defaultWindow
-		}
-		if age <= 0 {
-			age = defaultMaxAge
-		}
-		r.window = replay.NewWindow(size, age)
+	size, age := opts.Window, opts.MaxAge
+	if size <= 0 {
+		size = defaultWindow
 	}
+	if age <= 0 {
+		age = defaultMaxAge
+	}
+	r.window = replay.NewWindow(size, age)
 	return r, nil
 }
 
@@ -361,18 +360,11 @@ func (r *Receiver) Open(dst, packet []byte, now time.Time) ([]byte, error) {
 
 // fresh says whether a packet id may be taken. It changes nothing.
 func (r *Receiver) fresh(id uint32, now time.Time) bool {
-	if r.strict {
-		return id != 0 && (r.highest == 0 || id == r.highest+1)
-	}
 	return r.window.Check(uint64(id), now)
 }
 
 // accept records the id of a packet that authenticated.
 func (r *Receiver) accept(id uint32, now time.Time) {
-	if r.strict {
-		r.highest = id
-		return
-	}
 	r.window.Accept(uint64(id), now)
 }
 

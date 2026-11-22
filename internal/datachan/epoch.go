@@ -98,9 +98,8 @@ func NewChannel(c Cipher, send, receive *keys.DirectionKey, h Header, o Receiver
 
 // EpochOptions tune an EpochChannel. The zero value is OpenVPN's default.
 type EpochOptions struct {
-	// Strict, Window and MaxAge are the replay protection of each epoch, as in
+	// Window and MaxAge are the replay protection of each epoch, as in
 	// ReceiverOptions.
-	Strict bool
 	Window int
 	MaxAge time.Duration
 	// FutureKeys is how many future epoch keys the receiver keeps; DefaultFutureKeys
@@ -139,7 +138,7 @@ func newEpochState(c Cipher, e keys.EpochKey) (epochState, error) {
 type recvSlot struct {
 	epochState
 	window  *replay.Window // nil until the slot is current
-	highest uint64         // strict order: the highest counter accepted
+	highest uint64         // the highest counter accepted
 	blocks  uint64         // plaintext blocks opened with this key
 }
 
@@ -156,7 +155,6 @@ type EpochChannel struct {
 	cipher  Cipher
 	header  Header
 	limit   uint64
-	strict  bool
 	winSize int
 	maxAge  time.Duration
 	future  int
@@ -199,7 +197,7 @@ func NewEpochChannel(c Cipher, send, receive *keys.DirectionKey, h Header, o Epo
 		return nil, errors.New(tagBadCipher, "the cipher is not one of LookupCipher's")
 	}
 	ch := &EpochChannel{
-		cipher: c, header: h, limit: o.UsageLimit, strict: o.Strict, winSize: o.Window, maxAge: o.MaxAge, future: o.FutureKeys,
+		cipher: c, header: h, limit: o.UsageLimit, winSize: o.Window, maxAge: o.MaxAge, future: o.FutureKeys,
 	}
 	if ch.limit == 0 && c.name != "CHACHA20-POLY1305" {
 		ch.limit = aeadLimit
@@ -236,9 +234,6 @@ func NewEpochChannel(c Cipher, send, receive *keys.DirectionKey, h Header, o Epo
 }
 
 func (c *EpochChannel) newWindow() *replay.Window {
-	if c.strict {
-		return nil
-	}
 	return replay.NewWindow(c.winSize, c.maxAge)
 }
 
@@ -477,18 +472,11 @@ func (c *EpochChannel) Open(dst, packet []byte, now time.Time) ([]byte, error) {
 // fresh says whether a counter may be taken in the epoch of the slot. It changes
 // nothing.
 func (c *EpochChannel) fresh(s *recvSlot, counter uint64, now time.Time) bool {
-	if c.strict {
-		return counter != 0 && (s.highest == 0 || counter == s.highest+1)
-	}
 	return s.window.Check(counter, now)
 }
 
 // accept records the counter of a packet that authenticated.
 func (c *EpochChannel) accept(s *recvSlot, counter uint64, now time.Time) {
-	if c.strict {
-		s.highest = counter
-		return
-	}
 	s.window.Accept(counter, now)
 	s.highest = max(s.highest, counter)
 }

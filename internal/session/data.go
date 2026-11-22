@@ -128,9 +128,9 @@ func (s *Session) makeKey(d *dataPath, id uint8, x exporter) (*dataKey, error) {
 	header.KeyID = id
 	var ch datachan.Channel
 	if d.epoch {
-		ch, err = datachan.NewEpochChannel(d.cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.EpochOptions{Strict: s.opts.Stream, UsageLimit: s.opts.EpochUsageLimit})
+		ch, err = datachan.NewEpochChannel(d.cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.EpochOptions{UsageLimit: s.opts.EpochUsageLimit})
 	} else {
-		ch, err = datachan.NewChannel(d.cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.ReceiverOptions{Strict: s.opts.Stream, UsageLimit: s.opts.UsageLimit})
+		ch, err = datachan.NewChannel(d.cipher, &dk.ClientToServer, &dk.ServerToClient, header, datachan.ReceiverOptions{UsageLimit: s.opts.UsageLimit})
 	}
 	if err != nil {
 		return nil, err
