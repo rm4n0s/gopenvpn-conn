@@ -55,12 +55,28 @@ func (s *Session) readLoop() {
 			return
 		}
 		failures = 0
+		pb := s.packetFor(buf[:n])
 		select {
-		case s.in <- append([]byte(nil), buf[:n]...):
+		case s.in <- pb:
 		case <-s.done:
+			s.pool.put(pb)
 			return
 		}
 	}
+}
+
+// packetFor copies a packet that was read into a buffer of its own. A packet of the
+// data channel gets one from the pool, which the loop gives back when it has opened
+// the packet; a control packet is kept by the reliability layer and gets a new one.
+func (s *Session) packetFor(p []byte) *packetBuf {
+	if len(p) > 0 {
+		if op, _ := wire.SplitFirstByte(p[0]); op.IsData() {
+			pb := s.pool.get(len(p))
+			copy(pb.b, p)
+			return pb
+		}
+	}
+	return &packetBuf{b: append([]byte(nil), p...)}
 }
 
 // maxReadFailures is how many read errors in a row a datagram link may give, with
@@ -168,8 +184,9 @@ func (s *Session) loop() {
 		select {
 		case <-s.done:
 			return
-		case pkt := <-s.in:
-			s.handle(pkt)
+		case pb := <-s.in:
+			s.handle(pb.b)
+			s.pool.put(pb)
 		case m := <-s.out:
 			s.take(m)
 		case ev := <-s.events:

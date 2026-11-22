@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -155,6 +156,68 @@ func TestCloseStopsEveryGoroutineOfAConn(t *testing.T) {
 					t.Errorf("%d goroutines before, %d after Close", before, after)
 				}
 			})
+		})
+	}
+}
+
+// TestNoLeakAfterManyConnections opens and closes 200 connections (over both links,
+// with a packet each way), each in a bubble of its own, and checks that the goroutines
+// are the ones of the start and that the heap has not grown by anything near a
+// connection each: SPEC §17.
+func TestNoLeakAfterManyConnections(t *testing.T) {
+	for _, k := range kinds {
+		t.Run(k.name, func(t *testing.T) {
+			cycle := func(t *testing.T) {
+				pki := servertest.NewPKI(t) // in the bubble: its certificates are valid at the bubble's time
+				link, srv := tlsPairWith(t, k, protections()[0], serverTLS(pki, pki.ServerCert), func(o *vpntest.ServerOptions) {
+					o.EchoData = true
+					o.PushMessages = []string{vpntest.DefaultPushReply + ",protocol-flags cc-exit tls-ekm"}
+				})
+				cfg := &Config{TLS: NewTLSConfig(TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}})}
+				var conn *Conn
+				if k.stream {
+					conn = Client(link, cfg)
+				} else {
+					conn = PacketClient(link, cfg)
+				}
+				if _, err := conn.Write([]byte{0x45, 1, 2, 3}); err != nil {
+					t.Fatal(err)
+				}
+				buf := make([]byte, 100)
+				if _, err := conn.Read(buf); err != nil {
+					t.Fatal(err)
+				}
+				if err := conn.Close(); err != nil {
+					t.Fatal(err)
+				}
+				srv.Close()
+			}
+			heap := func() uint64 {
+				runtime.GC()
+				runtime.GC()
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				return m.HeapAlloc
+			}
+			for range 5 { // warm up: the first connections allocate what the runtime keeps
+				synctest.Test(t, cycle)
+			}
+			goroutines, before := runtime.NumGoroutine(), heap()
+			for range 200 {
+				synctest.Test(t, cycle)
+			}
+			if after := runtime.NumGoroutine(); after != goroutines {
+				t.Errorf("%d goroutines before 200 connections, %d after", goroutines, after)
+			}
+			after := heap()
+			var growth uint64
+			if after > before {
+				growth = after - before
+			}
+			t.Logf("heap: %d bytes before, %d after", before, after)
+			if growth > 2<<20 {
+				t.Errorf("the heap grew by %d bytes in 200 connections: about %d bytes each", growth, growth/200)
+			}
 		})
 	}
 }

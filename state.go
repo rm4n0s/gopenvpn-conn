@@ -50,17 +50,21 @@ type ConnectionState struct {
 	// RedirectGateway is true when the server asks for all the traffic of the
 	// client to go through the VPN.
 	RedirectGateway bool
-	// DNSServers and SearchDomains are the DNS settings that the server pushed
-	// (dhcp-option DNS, DNS6, DOMAIN, DOMAIN-SEARCH, and the dns option).
-	DNSServers    []netip.Addr
+	// DNSServers are the DNS servers that the server pushed (dhcp-option DNS and
+	// DNS6, and the dns option).
+	DNSServers []netip.Addr
+	// SearchDomains are the DNS search domains that the server pushed
+	// (dhcp-option DOMAIN and DOMAIN-SEARCH, and the dns option).
 	SearchDomains []string
 	// MTU is the MTU of the tunnel: the one the server pushed, or the one of the
 	// Config. It is the size of the largest IP packet that Write takes.
 	MTU int
-	// PingInterval and PingTimeout are the keepalive that the server pushed
-	// (ping and ping-restart); zero when it pushed none.
+	// PingInterval is the keepalive interval that the server pushed (ping); zero
+	// when it pushed none.
 	PingInterval time.Duration
-	PingTimeout  time.Duration
+	// PingTimeout is the keepalive timeout that the server pushed (ping-restart);
+	// zero when it pushed none.
+	PingTimeout time.Duration
 	// PushedOptions are the options of the PUSH_REPLY as the server sent them,
 	// the unknown ones too. The value of auth-token is left out: it is a secret.
 	PushedOptions []string

@@ -183,9 +183,12 @@ func (s *Session) handleData(raw []byte) {
 		s.serverExited()
 		return
 	}
+	pb := s.pool.get(len(plain))
+	copy(pb.b, plain)
 	select {
-	case s.recv <- bytes.Clone(plain):
+	case s.recv <- pb:
 	default:
+		s.pool.put(pb)
 		s.drop("the packets for Read are not read", nil)
 	}
 }
@@ -223,9 +226,11 @@ func (s *Session) Read(b []byte) (int, error) {
 		}
 		timer, expired := timerFor(t)
 		select {
-		case p := <-s.recv:
+		case pb := <-s.recv:
 			stopTimer(timer)
-			return copy(b, p), nil
+			n := copy(b, pb.b)
+			s.pool.put(pb)
+			return n, nil
 		case <-s.done:
 			stopTimer(timer)
 			return 0, s.result()
@@ -348,10 +353,13 @@ func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
 
 // writeLink writes one packet (or frame) to the link, with the deadline wd if it
 // is not zero. The loop writes control packets to the same link, so the two take
-// turns (linkMu), and the deadline never reaches a control write.
+// turns (linkSem), and the deadline never reaches a control write.
 func (s *Session) writeLink(p []byte, wd time.Time) (int, error) {
-	s.linkMu.Lock()
-	defer s.linkMu.Unlock()
+	// A channel and not a mutex: a writer that waits for the other is then blocked in
+	// a way that the fake clock of the tests sees, so that time goes on to the deadline
+	// of the writer that holds the link.
+	s.linkSem <- struct{}{}
+	defer func() { <-s.linkSem }()
 	if wd.IsZero() {
 		return s.opts.Link.Write(p)
 	}

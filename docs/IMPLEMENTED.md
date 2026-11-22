@@ -315,3 +315,32 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - The server pushes `dyn-tls-crypt` even when the first session has no protection (SPEC §21 O26), so the dynamic key is made for every session of this client; a test server that pushes the flag has to use the key too, or no renegotiation can happen.
   - The lame duck of OpenVPN is freed when the next renegotiation begins, not when the new key is made; a test server that kept it longer than the client kept its key would send packets that the client drops.
   - A failed renegotiation in OpenVPN throws away the whole TLS session; here only the failed state goes (SPEC §20 V11).
+
+## Step 2.10: the public API, examples and documentation (2026-11-22, tags `step-2.10` and `v0.2.0`)
+
+- **Built:**
+  - The review of package `openvpn` against SPEC §4.1: every identifier of the SPEC is in the code with the same shape (`Config`, `Client`, `PacketClient`, `Dial`, `Dialer`, `Conn` with its methods, `ConnectionState`, `ControlWrap` and its three constructors, `KeyDirection`, `TLSOptions`, `NewTLSConfig`, the `Tag...` constants); the code and the SPEC agree and neither changed. The doc comments of four fields were missing and were written; one stale paragraph of the `Config` comment was removed.
+  - `doc_test.go`: `TestEveryExportedIdentifierHasADocComment` walks every package of the module with `go/doc` (not `reference/`) and fails for an exported type, function, method, constant or variable with no doc comment, and for an exported field with no comment in the packages that users import.
+  - `example_test.go`: `ExampleDial` (compiled, not run).
+  - `examples/ping/main.go`: flags for the server, the CA, the certificate, the key and a `tls-crypt` file; it builds and reads the ICMP packets itself with the public API only. `examples/ping/main_realserver_test.go` runs the built program against the real server.
+  - `internal/session/bufpool.go`: a pool of packet buffers for each session, so that the data path allocates nothing per packet (SPEC §10, step 2.10 note).
+  - `internal/session/bench_test.go`: `BenchmarkWrite` and `BenchmarkRead`, with `ReportAllocs`, for both data formats.
+  - `contract_test.go`: `TestNoLeakAfterManyConnections` (SPEC §17).
+  - `README.md` (written now at the request of the owner, and refreshed at the end): what the library is, the tunnel, what it supports, how to test, the license.
+  - `.golangci.yml`: one exclusion (G304 in `examples/`, whose files are the ones that the person running the program names).
+- **Checks that ran:** `scripts/check.sh` (see the end of the entry).
+- **Tests:** the doc test (it found the four fields); the leak test: 200 connections, each with a handshake, a packet each way and a `Close`, each in a bubble of its own, for both links: the goroutines are the same before and after, and the heap grew by 0.2 MB and 0.06 MB (limit 2 MB).
+- **Proof:**
+  - Benchmark (`go test ./internal/session -run '^$' -bench . -benchtime 20000x`, 1400-byte packets, AMD Ryzen 9 6900HX): `Write` 1047 ns (32-bit ids) and 1209 ns (epochs), 0 B/op, **0 allocs/op**; `Read` 475 ns and 409 ns, **0 allocs/op** (the first run showed 61 B/op in total and 36 B/op with 300000 iterations, less than one allocation in the timed part; the benchmark counts the client alone: the link discards what `Write` sends, and the server sends a batch of packets while the timer is stopped).
+  - `examples/ping` against the real server 2.7.9 with `--tls-crypt`, inside `scripts/vpn-ns.sh` (`TestPingWithRealServer`):
+    ```
+    connected: address 10.8.0.2/24, cipher AES-256-GCM, MTU 1500; pinging 10.8.0.1
+    28 bytes from 10.8.0.1: seq=1 time=150µs payload="ping 0001 from gopenvpn-conn"
+    28 bytes from 10.8.0.1: seq=2 time=390µs payload="ping 0002 from gopenvpn-conn"
+    28 bytes from 10.8.0.1: seq=3 time=580µs payload="ping 0003 from gopenvpn-conn"
+    ```
+    and the same over TCP (140, 380 and 480 µs). `GOOS=windows` and `GOOS=darwin` builds of `./...`, which include the example, are part of `scripts/check.sh`.
+- **Learned:**
+  - `t.Run` is not allowed inside a `synctest` bubble: a test of many connections runs one bubble for each, and its certificates are made inside the bubble, since a certificate made outside is valid from the real time and the bubble's clock starts in the year 2000.
+  - Before the pool, each received packet cost two allocations (the copy of the reader and the copy for `Read`); a buffer may only go back to the pool for a data packet: the reliability layer can keep the payload of a control packet.
+  - A flaky hang of `TestDeadlines` ("a Write that the link does not take, on a datagram link") that has been there since step 2.8 (also at the tag `step-2.8`: 60 runs without cgo hang) showed up in the check of this step. The loop waited for the link on a `sync.Mutex` while a `Write` held it, asleep on the fake clock until its deadline; under `synctest` a goroutine blocked on a mutex is not blocked "durably", so the clock never moved on. The right to write the link is a channel of one place now (`linkSem`): the same one-at-a-time rule, blocking in a way that the fake clock sees; 100 runs of the test and 8 runs of the package without cgo pass.

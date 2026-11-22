@@ -139,7 +139,8 @@ type Session struct {
 	ready    chan struct{} // closed when the handshake is complete
 	wg       sync.WaitGroup
 
-	in        chan []byte // from the reader to the loop
+	in        chan *packetBuf // from the reader to the loop
+	pool      bufPool         // the buffers of the data packets
 	readErr   chan error
 	out       chan outMsg   // from the TLS sessions to the loop: what crypto/tls wrote
 	events    chan keyEvent // from the TLS sessions of the renegotiations to the loop
@@ -169,10 +170,10 @@ type Session struct {
 	wake      chan struct{}              // wakes the loop to look at what Close changed
 	drained   chan struct{}              // closed by the loop when everything it sent is acknowledged, after EXIT
 	rdl, wdl  *deadline                  // the read and write deadlines of the connection
-	linkMu    sync.Mutex                 // one writer of the link at a time
+	linkSem   chan struct{}              // holds a token while a writer has the link: one at a time
 	base      time.Time                  // the zero of sentAt
 	sentAt    atomic.Int64               // when a packet last went to the link, as time since base
-	recv      chan []byte                // decrypted IP packets for Read
+	recv      chan *packetBuf            // decrypted IP packets for Read
 	wkcLen    int                        // the wrapped key that CONTROL_WKC_V1 carries, or 0
 
 	// Owned by the loop goroutine.
@@ -215,13 +216,14 @@ func New(opts Options) *Session {
 		resetOp: wire.HardResetClientV2,
 		done:    make(chan struct{}),
 		ready:   make(chan struct{}),
-		in:      make(chan []byte, inQueue),
+		in:      make(chan *packetBuf, inQueue),
 		readErr: make(chan error, 1),
-		recv:    make(chan []byte, recvQueue),
+		recv:    make(chan *packetBuf, recvQueue),
 		base:    time.Now(),
 		rdl:     newDeadline(),
 		drained: make(chan struct{}),
 		wake:    make(chan struct{}, 1),
+		linkSem: make(chan struct{}, 1),
 		wdl:     newDeadline(),
 	}
 	if s.log == nil {

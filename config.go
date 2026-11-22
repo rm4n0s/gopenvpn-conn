@@ -15,7 +15,10 @@ import (
 // Credentials are the user name and password of auth-user-pass. The server
 // accepts at most 127 bytes of each.
 type Credentials struct {
+	// Username is the user name; at most 127 bytes.
 	Username string
+	// Password is the password; at most 127 bytes. It is never logged and never in
+	// an error.
 	Password string
 }
 
@@ -56,10 +59,6 @@ const DefaultRenegotiateAfter = time.Hour
 // Config is the configuration of a client, as tls.Config is for TLS. The zero
 // value of a field means its default. A Config is not changed by the library
 // and may be shared by connections.
-//
-// The fields that the later parts of the protocol need (credentials, data
-// ciphers, keepalive, MTU, peer info) are added as the library learns those
-// parts.
 type Config struct {
 	// TLS is the configuration of the TLS client of the control channel: the
 	// server's certificate is verified with it, and its Certificates are the

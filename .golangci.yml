@@ -31,6 +31,12 @@ linters:
         linters:
           - gosec
         text: "G204"
+      # The same for the test that builds examples/ping and runs it: the
+      # program and its arguments are made by the test.
+      - path: ^examples/ping/main_realserver_test\.go$
+        linters:
+          - gosec
+        text: "G204"
       # G505 and G401 flag SHA-1. OpenVPN's tls-auth uses HMAC-SHA1 by default
       # (--auth), and the library must speak it to work with servers that
       # keep the default. The security of an HMAC does not depend on the
@@ -59,6 +65,13 @@ linters:
         linters:
           - gosec
         text: "G402: TLS InsecureSkipVerify"
+      # G304 flags a file name that comes from a variable. The examples are
+      # programs for a person at a terminal: the files that a flag names are the
+      # files that the person asked them to read.
+      - path: ^examples/
+        linters:
+          - gosec
+        text: "G304"
       # G402 also flags a MinVersion below TLS 1.2. Two tests set TLS 1.0 on
       # purpose, to show that the library raises it to TLS 1.2.
       - path: _test\.go
