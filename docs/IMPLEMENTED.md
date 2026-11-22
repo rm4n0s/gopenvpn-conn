@@ -389,3 +389,20 @@ Not a step of the plan: the setup that the plan starts from. No library code.
     ```
     which shows that the parser reads what OpenVPN reads.
 - **Learned:** `--cd` makes the real client find `creds.txt` the way `ParseFS` does, relative to the directory of the profile; a profile with `remote` lines of its own protocol works in both programs with no change.
+
+
+## Step 3.4: `vpnnet` (2026-11-22, tag `step-3.4`)
+
+- **Built:**
+  - `vpnnet/net.go`: `New`, `Options` (`CloseConn`, `Logger`), `Net`, `Close`; the stack (`newStack`: IPv4, IPv6, TCP, UDP and ICMP; one NIC on a `channel.Endpoint` with the MTU of the tunnel; the addresses; default routes) and the two goroutines that move the packets. `vpnnet/dial.go`: `DialContext`, `Listen`, `ListenPacket` and the reading of addresses; the tags `TagNilConn`, `TagNotConnected`, `TagStackSetupFailed`, `TagUnsupportedNetwork`, `TagBadAddress`, `TagDialFailed`, `TagListenFailed`.
+  - `internal/vpntest`: `ServerOptions.OnData`, to hand each packet that a server opens to someone else (two servers that send each other's packets make a hub: two clients on one network).
+  - `go.mod`: **gVisor `gvisor.dev/gvisor v0.0.0-20261121111754-3eadbee70834`** (the `go` branch), and with it `github.com/google/btree` v1.1.2 (Apache-2.0), `golang.org/x/time` v0.15.0 and `golang.org/x/exp` v0.0.0-20250711185948-6ae5c78190dc (BSD-3-Clause). **The `go` line of `go.mod` went from 1.26.3 to 1.27.3**: that is what gVisor's `go.mod` says, and a module cannot ask for less than a dependency; SPEC §18 and §19 say so, and it is a thing for the owner to look at (a gVisor version with a lower requirement would bring it back).
+- **Checks that ran:** `scripts/check.sh`: all 14 checks OK. No parser of bytes in this step, so no fuzz target.
+- **Tests:**
+  - Unit (`vpnnet/net_test.go`, two `Net`s on two clients of a hub of `vpntest` servers): a TCP echo of 1 MiB over IPv4 and IPv6, with the address named and with every address (`tcp`, `tcp4`, `tcp6`); a UDP exchange with datagrams of 5, 1200 and 0 bytes; a listener on port 0; the tunnel ends (a blocked `Read` of a TCP connection and of a packet connection returns an error; the later calls return the error of the `Conn`); `Close` with and without `CloseConn` (blocked calls return, a second `Close` is fine, `net.ErrClosed` untouched, no goroutine of the `Net` or of gVisor left, the `Conn` still usable and its read deadline cleared, shown by a ping that the other client's stack answers); 15 address errors with their routes, a port that is taken (TCP and UDP); a refused connection, a context that is done, a deadline that passes; `New` with no `Conn`, with a `Conn` that has not done its handshake, and with a stack that refuses a duplicate address.
+  - Real server 2.7.9 with `--server-ipv6 fd00:8::/64` (`vpnnet/net_realserver_test.go`, under `scripts/vpn-ns.sh`): TCP echo listeners of the `net` package on the server's tunnel addresses (`10.8.0.1` and `fd00:8::1`) reached through `Net.DialContext`, 1 MiB each way, with the tunnel over UDP and over TCP; the same for UDP datagrams; `Net.Listen` and `Net.ListenPacket` listeners on the client's tunnel addresses reached by the `net` package, over IPv4 and IPv6 (1 MiB over TCP); the `Conn` is closed while a `Read` waits: it returns, and no goroutine is left.
+- **Learned:**
+  - **gVisor and `testing/synctest` do not go together.** gVisor's goroutines park with its own `sleep` package, which the bubble does not see as durably blocked: its clock never moves and `synctest.Wait` does not return. The first run of the timed cases hung; the tests of the package run on real time.
+  - A `stack.Stack` has goroutines from `stack.New` on (one per CPU for TCP), so a stack that was made and not used has to be destroyed: the first version of `newStack` left them on the error path, and the bubble showed them at once.
+  - gonet's `DialContextTCP` returns `ctx.Err()` itself, so `errors.Is(err, context.DeadlineExceeded)` works through the `TagDialFailed` wrapper.
+  - The `go` line of a module follows its dependencies: `go get` of gVisor changed it by itself.

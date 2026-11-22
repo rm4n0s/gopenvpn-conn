@@ -149,6 +149,9 @@ func (s *Server) handleData(raw []byte) {
 	s.mu.Lock()
 	s.dataIn = append(s.dataIn, packet)
 	s.mu.Unlock()
+	if s.opts.OnData != nil {
+		s.opts.OnData(packet)
+	}
 	if s.opts.EchoData {
 		if _, err := s.SendData(packet); err != nil {
 			s.writeFailed(err)

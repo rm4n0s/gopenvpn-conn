@@ -366,6 +366,12 @@ Until TLS runs (step 1.11) the handshake is complete when the server's reset has
 - TCP and UDP over IPv4 and IPv6, and ICMP echo. `network` and `address` mean what they mean in `net`.
 - `Resolver` returns a `*net.Resolver` whose queries go through the tunnel to the DNS servers of the VPN; `DialContext` uses it for host names.
 - `Close` closes the stack and its connections. It does not close the `*openvpn.Conn` unless `Options` says so. When the tunnel ends, the connections of the `Net` fail with the errors of §5.3.
+- **Decided in step 3.4** (`vpnnet/`; gVisor `go` branch, version in §19):
+  - One NIC with no link layer: a `channel.Endpoint` with the MTU of `ConnectionState`, the addresses of `ConnectionState().Addrs` (each with its prefix length), and a default route for IPv4 and for IPv6 into it. The packets that the stack sends are written to the `Conn`; the packets that the `Conn` reads are given to the stack (IPv4 or IPv6 by the first nibble; anything else is dropped). Two goroutines do this; both stop at `Close`, and when `Close` returns no goroutine of the `Net` (nor of gVisor's stack) runs.
+  - `New` needs a `Conn` whose handshake is complete (`TagNotConnected`); a stack that cannot be set up is destroyed before `New` returns (`TagStackSetupFailed`). A `Net` takes over the `Read` of its `Conn`: to end that `Read` without closing the `Conn`, `Close` sets a read deadline in the past and clears it again when the goroutine has returned.
+  - When the `Conn` fails, the `Net` is down: its connections and listeners fail (with gonet's errors, as §5.3 says), and `DialContext`, `Listen` and `ListenPacket` return the error that ended the `Conn` (`io.EOF` when the server left); after `Close` they return `net.ErrClosed`.
+  - Addresses are IP literals until step 3.5 (`TagBadAddress` for a host name, a zone, a missing port, a family that the network does not name); `Listen` and `ListenPacket` also take an empty host: every address, IPv4 and IPv6 for `tcp` and `udp`, one family for `tcp4`, `tcp6`, `udp4` and `udp6` (IPv6 only, as `net` does). A port of 0 takes a free port. Errors: `TagUnsupportedNetwork`, `TagBadAddress`, `TagDialFailed` (the cause is behind it: `context.Canceled`, `context.DeadlineExceeded`, a refused connection), `TagListenFailed`; the tag strings begin with `Net` so that they differ from the ones of package `openvpn`.
+  - The tests of the package run on real time and not on `testing/synctest`: gVisor's goroutines wait in a way that the bubble does not count as blocked, so its clock does not advance and a test that needs a timer would wait for ever. They wait for events, and the only timed case is a context that expires after 100 ms.
 
 ## 14. Errors
 
@@ -425,7 +431,7 @@ The list grows with the steps. The ones a caller will branch on: `TagHandshakeTi
 
 ## 18. Platforms and build tags
 
-- Linux, Windows and macOS, on amd64 and arm64. The module needs the Go version that `github.com/rm4n0s/errors` needs (1.26.3) or newer.
+- Linux, Windows and macOS, on amd64 and arm64. The module needs Go 1.27.3 or newer: that is the version of `go.mod` of gVisor's `go` branch (step 3.4), and the `go` line of a module cannot be lower than the one of a dependency. Until step 3.4 it was 1.26.3, the version that `github.com/rm4n0s/errors` needs. **The owner may want to choose a gVisor version with a lower requirement** (D4); the line is a consequence of the plan's `go get gvisor.dev/gvisor@go`.
 - `openvpn`, `ovpn`, `vpnnet` and everything under `internal/` except `internal/servertest` are plain Go with no OS build tags, no cgo and no `unsafe`: they behave the same on the three systems.
 - OS build tags are allowed only in `internal/servertest` (Linux: namespaces), in `tun` (after 1.0) and in tests that skip by platform.
 - How each platform is checked:
@@ -440,7 +446,9 @@ The list grows with the steps. The ones a caller will branch on: `TagHandshakeTi
 | `github.com/rm4n0s/errors` v0.2.0 | MIT | everything | The owner's error package |
 | `golang.org/x/crypto` v0.59.0 | BSD-3-Clause | `internal/datachan` | `chacha20poly1305` |
 | `golang.org/x/sys` v0.50.0 | BSD-3-Clause | through `x/crypto` | CPU feature detection of `chacha20poly1305`; not imported by this module (an indirect dependency, same license and authors) |
-| `gvisor.dev/gvisor` | Apache-2.0 | `vpnnet` only | The userspace TCP/IP stack (D4) |
+| `gvisor.dev/gvisor` v0.0.0-20261121111754-3eadbee70834 (the `go` branch) | Apache-2.0 | `vpnnet` only | The userspace TCP/IP stack (D4) |
+| `github.com/google/btree` v1.1.2 | Apache-2.0 | through gVisor (`tcpip/transport/tcp`) | Needed by the stack; same license as gVisor, so the linking exception of `NOTICE` covers it the same way |
+| `golang.org/x/time` v0.15.0, `golang.org/x/exp` v0.0.0-20250711185948-6ae5c78190dc | BSD-3-Clause | through gVisor | Needed by the stack |
 
 HKDF, AES-GCM, HMAC, SHA-2, TLS and X.509 come from the standard library. Any other dependency is asked for first and needs a license that combines with GPL-2.0-only.
 

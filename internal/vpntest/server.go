@@ -107,6 +107,11 @@ type ServerOptions struct {
 	SwitchDelay time.Duration
 	// EchoData makes the server send every IP packet that it receives back.
 	EchoData bool
+	// OnData, when set, is called with every IP packet that the server opens (not
+	// with pings and exit messages), in the order of arrival, from the goroutine that
+	// reads the link; it must not wait for the server. A test that joins two clients
+	// sends each packet to the other server with it.
+	OnData func(packet []byte)
 	// Fault is how the server misbehaves.
 	Fault Fault
 	// RetransmitTimeout is the first wait before it sends a packet again;
