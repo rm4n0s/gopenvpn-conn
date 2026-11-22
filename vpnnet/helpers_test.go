@@ -25,8 +25,11 @@ type peer struct {
 }
 
 // pushReply is a PUSH_REPLY for the address ip (and ip6 when it is not empty).
-func pushReply(ip, ip6 string, mtu string) string {
+func pushReply(ip, ip6 string, mtu string, dns []string) string {
 	reply := "PUSH_REPLY,topology subnet,ifconfig " + ip + " 255.255.255.0,"
+	for _, server := range dns {
+		reply += "dhcp-option " + server + ","
+	}
 	if ip6 != "" {
 		reply += "ifconfig-ipv6 " + ip6 + " fd00:8::1,"
 	}
@@ -37,6 +40,13 @@ func pushReply(ip, ip6 string, mtu string) string {
 // that what one writes, the other reads: two clients on one network. Each Conn has
 // finished its handshake. Call it inside the bubble when the test has one.
 func hub(t *testing.T, ip6 bool, mtu string) (a, b *peer) {
+	t.Helper()
+	return hubDNS(t, ip6, mtu, nil)
+}
+
+// hubDNS is hub with dhcp-option values ("DNS 10.8.0.3", "DNS6 fd00:8::3") that the
+// server pushes to both clients.
+func hubDNS(t *testing.T, ip6 bool, mtu string, dns []string) (a, b *peer) {
 	t.Helper()
 	pki := servertest.NewPKI(t)
 	a, b = &peer{}, &peer{}
@@ -50,7 +60,7 @@ func hub(t *testing.T, ip6 bool, mtu string) (a, b *peer) {
 		client, link := vpntest.NewDatagramPair(vpntest.LinkOptions{})
 		p.server = vpntest.NewServer(t, link, vpntest.ServerOptions{
 			TLS:          &tls.Config{Certificates: []tls.Certificate{pki.ServerCert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pki.CAPool},
-			PushMessages: []string{pushReply(addrs[i][0], addrs[i][1], mtu)},
+			PushMessages: []string{pushReply(addrs[i][0], addrs[i][1], mtu, dns)},
 			OnData: func(packet []byte) {
 				// The other peer's server may not be there yet: nothing flows before both are up.
 				if other.server == nil {

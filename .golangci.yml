@@ -33,7 +33,7 @@ linters:
         text: "G204"
       # The same for the test that builds examples/ping and runs it: the
       # program and its arguments are made by the test.
-      - path: ^examples/ping/main_realserver_test\.go$
+      - path: ^examples/(ping|http)/main_realserver_test\.go$
         linters:
           - gosec
         text: "G204"

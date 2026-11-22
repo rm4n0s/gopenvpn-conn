@@ -406,3 +406,19 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - A `stack.Stack` has goroutines from `stack.New` on (one per CPU for TCP), so a stack that was made and not used has to be destroyed: the first version of `newStack` left them on the error path, and the bubble showed them at once.
   - gonet's `DialContextTCP` returns `ctx.Err()` itself, so `errors.Is(err, context.DeadlineExceeded)` works through the `TagDialFailed` wrapper.
   - The `go` line of a module follows its dependencies: `go get` of gVisor changed it by itself.
+
+## Step 3.5: DNS, HTTP and throughput (2026-11-22, tag `step-3.5`)
+
+- **Built:**
+  - `vpnnet/dns.go`: `Net.Resolver()` (Go's resolver with a Dial function that goes through the tunnel to the pushed DNS servers: in order, from the one that worked last; `dnsConn` and `dnsPacketConn` tell it how a server did), `TagNoDNSServers`. `vpnnet/dial.go`: `DialContext` looks up host names with it and tries the addresses in order (`dialTarget`, `lookupNetwork`, `validHostName`), `TagResolveFailed`; `parse` takes a host name for `DialContext` only.
+  - `examples/http`: `-profile` and `-url` (and `-user`, `-password-file` for a profile that asks for credentials): reads the profile with `ovpn.ParseFS` from its directory, `Profile.Dial`, `vpnnet.New`, an `http.Client` with `DialContext: n.DialContext`; prints the status and the size of the body.
+  - `BenchmarkThroughput` in `vpnnet/net_realserver_test.go`.
+- **Checks that ran:** `scripts/check.sh`: all 14 checks OK. No parser of bytes in the library; the DNS messages of the tests are made by the test.
+- **Tests:**
+  - Unit (hub of two clients; the second one runs a small DNS server written in the test, `dns_test.go`): the resolver (an IPv4 name, both families, `ip4` and `ip6` only, capital letters, an unknown name is `IsNotFound`); no DNS server (the message, the route of `dialDNS`; a server of a family that the tunnel does not have is no server); the choice of the server (UDP connection is a `PacketConn`, a failed read moves on, an answer stays, wrap-around, a stale failure changes nothing, a refused TCP connection goes on to the next server); `DialContext` by name (`tcp`, `tcp4`, an IPv6 name, a name with an IPv4 and an IPv6 address where a listener has one family, an unknown name, a name with no address of the family; a tunnel with only IPv4 does not try IPv6 addresses); an HTTP client gets a 300 kB page by name; `validHostName`.
+  - Real server 2.7.9 (under `scripts/vpn-ns.sh`): the server pushes `dhcp-option DNS 10.8.0.1`; the test's DNS server listens on `10.8.0.1:53` and the page (2 MiB) on `10.8.0.1:80`, both with the `net` package; an `http.Client` whose transport dials through `Net.DialContext` gets it by the name `web.vpn.test` (the query and the connection both go through the tunnel); the `examples/http` program built and run with a profile file against the real server (`http://10.8.0.1:46027/: 200 OK, 1000000 bytes`).
+  - **Benchmark** (`scripts/vpn-ns.sh -- go test -tags gopenvpn_server -run '^$' -bench Throughput -benchtime 1x ./vpnnet`, 100 MiB through `vpnnet`, the real server 2.7.9 on the loopback, AMD Ryzen 9 6900HX): tunnel over UDP, up 56.0 MB/s, down 53.6 MB/s; tunnel over TCP, up 37.4 MB/s, down 60.4 MB/s.
+- **Learned:**
+  - gVisor sends no ICMP error for a UDP datagram to a closed port, so a DNS server that is down is a timeout (5 s in Go's resolver), not a refusal: the test of the selection makes a read fail with a deadline that has passed, and the stream case uses a refused TCP connection, which is quick.
+  - The error that a Dial function of `net.Resolver` returns is flattened to its text inside `*net.DNSError`: a tag cannot be found behind it, so the route test calls the Dial function itself.
+  - Go's resolver with a custom Dial function still reads `/etc/hosts` and `/etc/resolv.conf`; SPEC §13 says so as a limit of the plan's design.

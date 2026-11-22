@@ -23,7 +23,13 @@ import (
 // ends.
 func newNets(t *testing.T, ip6 bool) (na, nb *Net, a, b *peer) {
 	t.Helper()
-	a, b = hub(t, ip6, "1500")
+	return newNetsDNS(t, ip6, nil)
+}
+
+// newNetsDNS is newNets with DNS servers that the server pushes.
+func newNetsDNS(t *testing.T, ip6 bool, dns []string) (na, nb *Net, a, b *peer) {
+	t.Helper()
+	a, b = hubDNS(t, ip6, "1500", dns)
 	var err error
 	if na, err = New(a.conn, nil); err != nil {
 		t.Fatalf("New: %v", err)
@@ -386,7 +392,6 @@ func TestAddressErrors(t *testing.T) {
 		{"dial: no port", "tcp", "10.8.0.3", "Net.DialContext->parse." + TagBadAddress, "dial"},
 		{"dial: bad port", "tcp", "10.8.0.3:http", "Net.DialContext->parse." + TagBadAddress, "dial"},
 		{"dial: port too large", "tcp", "10.8.0.3:65536", "Net.DialContext->parse." + TagBadAddress, "dial"},
-		{"dial: a host name", "tcp", "example.com:80", "Net.DialContext->parse." + TagBadAddress, "dial"},
 		{"dial: a zone", "tcp", "[fe80::1%eth0]:80", "Net.DialContext->parse." + TagBadAddress, "dial"},
 		{"dial: no host", "tcp", ":80", "Net.DialContext->parse." + TagBadAddress, "dial"},
 		{"dial: tcp4 with IPv6", "tcp4", "[fd00::1]:80", "Net.DialContext->parse." + TagBadAddress, "dial"},
@@ -445,12 +450,12 @@ func TestDialErrors(t *testing.T) {
 	na, _, _, _ := newNets(t, false)
 	// Nothing listens: the other side answers with a reset.
 	_, err := na.DialContext(t.Context(), "tcp", "10.8.0.3:9")
-	wantRoute(t, err, "Net.DialContext."+TagDialFailed)
+	wantRoute(t, err, "Net.DialContext->Net.dialTarget."+TagDialFailed)
 	// A context that is done.
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err = na.DialContext(ctx, "tcp", "10.8.0.3:9")
-	wantRoute(t, err, "Net.DialContext."+TagDialFailed)
+	wantRoute(t, err, "Net.DialContext->Net.dialTarget."+TagDialFailed)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled behind it", err)
 	}
@@ -458,7 +463,7 @@ func TestDialErrors(t *testing.T) {
 	ctx, cancel = context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	_, err = na.DialContext(ctx, "tcp", "10.8.0.77:9")
-	wantRoute(t, err, "Net.DialContext."+TagDialFailed)
+	wantRoute(t, err, "Net.DialContext->Net.dialTarget."+TagDialFailed)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want context.DeadlineExceeded behind it", err)
 	}

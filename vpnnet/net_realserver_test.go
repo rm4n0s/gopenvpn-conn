@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"testing"
 	"time"
@@ -27,9 +28,9 @@ const serverIPv6 = "fd00:8::1"
 // realNet starts a real server with an IPv4 and an IPv6 tunnel, dials it and makes a
 // Net over the Conn. The test process is in the namespace of the server, so it can
 // listen on the server's tunnel addresses with the ordinary net package.
-func realNet(t *testing.T, proto string) (*Net, *openvpn.Conn, *servertest.Server) {
+func realNet(t testing.TB, proto string, extra ...string) (*Net, *openvpn.Conn, *servertest.Server) {
 	t.Helper()
-	srv := servertest.Start(t, servertest.Options{Proto: proto, Extra: []string{"--server-ipv6", "fd00:8::/64"}})
+	srv := servertest.Start(t, servertest.Options{Proto: proto, Extra: append([]string{"--server-ipv6", "fd00:8::/64"}, extra...)})
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	conn, err := openvpn.Dial(ctx, proto, srv.Addr(), &openvpn.Config{
@@ -56,7 +57,7 @@ func realNet(t *testing.T, proto string) (*Net, *openvpn.Conn, *servertest.Serve
 }
 
 // tunnelAddr is the address of the client of the family, from what the server pushed.
-func tunnelAddr(t *testing.T, conn *openvpn.Conn, v6 bool) netip.Addr {
+func tunnelAddr(t testing.TB, conn *openvpn.Conn, v6 bool) netip.Addr {
 	t.Helper()
 	for _, p := range conn.ConnectionState().Addrs {
 		if p.Addr().Is6() == v6 {
@@ -70,7 +71,7 @@ func tunnelAddr(t *testing.T, conn *openvpn.Conn, v6 bool) netip.Addr {
 // listenOnTunnel listens on the server's own tunnel address with the net package. The
 // address of an IPv6 interface may not be usable for a moment (duplicate address
 // detection), so a failure is tried again for a few seconds.
-func listenOnTunnel(t *testing.T, network, address string) net.Listener {
+func listenOnTunnel(t testing.TB, network, address string) net.Listener {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -86,7 +87,7 @@ func listenOnTunnel(t *testing.T, network, address string) net.Listener {
 	}
 }
 
-func listenPacketOnTunnel(t *testing.T, network, address string) net.PacketConn {
+func listenPacketOnTunnel(t testing.TB, network, address string) net.PacketConn {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -102,7 +103,7 @@ func listenPacketOnTunnel(t *testing.T, network, address string) net.PacketConn 
 	}
 }
 
-func closeIgnoringClosed(t *testing.T, c io.Closer) {
+func closeIgnoringClosed(t testing.TB, c io.Closer) {
 	t.Helper()
 	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Errorf("Close: %v", err)
@@ -279,5 +280,139 @@ func TestRealServerTunnelEnds(t *testing.T) {
 	}
 	if got := netGoroutines(); len(got) != 0 {
 		t.Errorf("%d goroutines of the Net after Close", len(got))
+	}
+}
+
+// TestRealServerHTTPByName: the server pushes a DNS server (a small one that this test
+// runs on 10.8.0.1:53 with the net package) and the page is served on 10.8.0.1:80;
+// an http.Client whose transport dials through the Net gets it by name, so the query
+// and the connection both go through the tunnel.
+func TestRealServerHTTPByName(t *testing.T) {
+	n, _, srv := realNet(t, "udp", "--push", "dhcp-option DNS 10.8.0.1")
+	dns := listenPacketOnTunnel(t, "udp4", net.JoinHostPort(srv.TunnelIP().String(), "53"))
+	serveDNS(dns, zone{"web.vpn.test": {srv.TunnelIP()}})
+	if servers := n.state.DNSServers; len(servers) != 1 || servers[0] != srv.TunnelIP() {
+		t.Fatalf("the pushed DNS servers are %v", servers)
+	}
+
+	body := payload(2 << 20)
+	web := listenOnTunnel(t, "tcp4", net.JoinHostPort(srv.TunnelIP().String(), "80"))
+	server := &http.Server{ReadHeaderTimeout: 10 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Host", r.Host)
+		if _, err := w.Write(body); err != nil {
+			t.Logf("write of the page: %v", err)
+		}
+	})}
+	go func() {
+		if err := server.Serve(web); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Logf("Serve: %v", err)
+		}
+	}()
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+	})
+
+	client := &http.Client{Transport: &http.Transport{DialContext: n.DialContext}}
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://web.vpn.test/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Get: %v\nserver log:\n%s", err, srv.Log())
+	}
+	got, err := io.ReadAll(resp.Body)
+	if cerr := resp.Body.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Fatalf("reading the page: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Host") != "web.vpn.test" || !bytes.Equal(got, body) {
+		t.Errorf("status %d, host %q, %d bytes (want %d)", resp.StatusCode, resp.Header.Get("X-Host"), len(got), len(body))
+	}
+	// The same name through the Resolver on its own.
+	addrs, err := n.Resolver().LookupHost(ctx, "web.vpn.test")
+	if err != nil || len(addrs) != 1 || addrs[0] != srv.TunnelIP().String() {
+		t.Errorf("LookupHost = %v, %v", addrs, err)
+	}
+}
+
+// BenchmarkThroughput sends 100 MiB through the Net and the real server, up (client to
+// server) and down, over a tunnel on UDP and on TCP, and reports MB/s:
+//
+//	scripts/vpn-ns.sh -- go test -tags gopenvpn_server -run '^$' -bench Throughput -benchtime 1x ./vpnnet
+func BenchmarkThroughput(b *testing.B) {
+	const size = 100 << 20
+	for _, proto := range []string{"udp", "tcp"} {
+		for _, direction := range []string{"up", "down"} {
+			b.Run(proto+"/"+direction, func(b *testing.B) {
+				n, _, srv := realNet(b, proto)
+				l := listenOnTunnel(b, "tcp4", net.JoinHostPort(srv.TunnelIP().String(), "0"))
+				chunk := payload(64 << 10)
+				go func() {
+					for {
+						c, err := l.Accept()
+						if err != nil {
+							return
+						}
+						go func() {
+							defer closeIgnoringClosed(b, c)
+							if direction == "up" {
+								if _, err := io.Copy(io.Discard, c); err != nil {
+									b.Logf("discard: %v", err)
+									return
+								}
+								// Everything has arrived: tell the client, so that it stops the clock then.
+								if _, err := c.Write([]byte{1}); err != nil {
+									b.Logf("done byte: %v", err)
+								}
+								return
+							}
+							for sent := 0; sent < size; sent += len(chunk) {
+								if _, err := c.Write(chunk); err != nil {
+									return
+								}
+							}
+						}()
+					}
+				}()
+				b.SetBytes(size)
+				b.ResetTimer()
+				for range b.N {
+					c, err := n.DialContext(b.Context(), "tcp4", l.Addr().String())
+					if err != nil {
+						b.Fatalf("DialContext: %v", err)
+					}
+					if direction == "up" {
+						for sent := 0; sent < size; sent += len(chunk) {
+							if _, err := c.Write(chunk); err != nil {
+								b.Fatalf("Write: %v", err)
+							}
+						}
+						cw, ok := c.(interface{ CloseWrite() error })
+						if !ok {
+							b.Fatal("the connection has no CloseWrite")
+						}
+						if err := cw.CloseWrite(); err != nil {
+							b.Fatalf("CloseWrite: %v", err)
+						}
+						if _, err := io.ReadFull(c, make([]byte, 1)); err != nil {
+							b.Fatalf("waiting for the end of the transfer: %v", err)
+						}
+					} else if got, err := io.CopyN(io.Discard, c, size); err != nil {
+						b.Fatalf("read %d of %d bytes: %v", got, size, err)
+					}
+					if err := c.Close(); err != nil {
+						b.Fatalf("Close: %v", err)
+					}
+				}
+			})
+		}
 	}
 }

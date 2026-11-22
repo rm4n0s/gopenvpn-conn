@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rm4n0s/errors"
@@ -63,6 +64,11 @@ type Net struct {
 	opts   Options
 	logger *slog.Logger
 	state  openvpn.ConnectionState
+	has4   bool // the tunnel has an IPv4 address
+	has6   bool // the tunnel has an IPv6 address
+
+	resolver *net.Resolver
+	dnsStart atomic.Int32 // the index in state.DNSServers where the next lookup starts
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -94,6 +100,11 @@ func New(conn *openvpn.Conn, opts *Options) (*Net, error) {
 		o = *opts
 	}
 	n := &Net{conn: conn, stack: s, ep: ep, opts: o, logger: o.Logger, state: state}
+	for _, p := range state.Addrs {
+		n.has4 = n.has4 || p.Addr().Unmap().Is4()
+		n.has6 = n.has6 || p.Addr().Unmap().Is6()
+	}
+	n.resolver = &net.Resolver{PreferGo: true, Dial: n.dialDNS}
 	if n.logger == nil {
 		n.logger = slog.New(slog.DiscardHandler)
 	}
