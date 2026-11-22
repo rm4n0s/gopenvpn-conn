@@ -31,9 +31,10 @@ linters:
         linters:
           - gosec
         text: "G204"
-      # The same for the test that builds examples/ping and runs it: the
-      # program and its arguments are made by the test.
-      - path: ^examples/(ping|http)/main_realserver_test\.go$
+      # The same for the tests that build examples/ping and examples/http (for
+      # Linux and for Windows) and run them: the program and its arguments are
+      # made by the test.
+      - path: ^examples/(ping|http)/main_(realserver|wine)_test\.go$
         linters:
           - gosec
         text: "G204"

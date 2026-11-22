@@ -422,3 +422,23 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - gVisor sends no ICMP error for a UDP datagram to a closed port, so a DNS server that is down is a timeout (5 s in Go's resolver), not a refusal: the test of the selection makes a read fail with a deadline that has passed, and the stream case uses a refused TCP connection, which is quick.
   - The error that a Dial function of `net.Resolver` returns is flattened to its text inside `*net.DNSError`: a tag cannot be found behind it, so the route test calls the Dial function itself.
   - Go's resolver with a custom Dial function still reads `/etc/hosts` and `/etc/resolv.conf`; SPEC §13 says so as a limit of the plan's design.
+
+## Step 4.1: Windows under Wine (2026-11-22, tag `step-4.1`)
+
+- **Built:** `scripts/wine-exec.sh` (the prefix `.wine-test/prefix`, `WINEDEBUG=-all`, `timeout -k 5 600 wine`), `scripts/test-windows.sh` (makes the prefix once, runs `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -exec scripts/wine-exec.sh ./...`, `wineserver -k` at the end; skips with a line when `wine` is missing), two lines in `scripts/check.sh` (the tests under Wine; no Wine process left, 16 checks in all), `internal/servertest/wine.go` (`RunWine`: runs a Windows program under Wine in its own process group, with the output in a file), `examples/ping/main_wine_test.go` and `examples/http/main_wine_test.go`.
+- **Checks that ran:** `scripts/check.sh`: all 16 checks OK.
+- **Tests:**
+  - The unit tests of every package under Wine 11.21 (`scripts/test-windows.sh`, about 35 s): all pass, `vpnnet` and gVisor included. One test was changed: `TestDialFailedToConnect/a refused connection` looked for `syscall.ECONNREFUSED` behind the tag; on Windows the cause is `WSAECONNREFUSED`, a different value, so there the test checks that the `*net.OpError` of the dial is behind it.
+  - The tests against the real server with the client under Wine: **it works** inside `scripts/vpn-ns.sh`. A Linux test starts the server and runs the Windows build under Wine:
+    ```
+    ping.exe over udp:  connected: address 10.8.0.2/24, cipher AES-256-GCM, MTU 1500; pinging 10.8.0.1
+                        28 bytes from 10.8.0.1: seq=1 time=270µs ... seq=3 time=620µs
+    ping.exe over tcp:  28 bytes from 10.8.0.1: seq=1 time=500µs ... seq=3 time=12.56ms
+    http.exe:           connected: address [10.8.0.2/24], DNS servers []
+                        http://10.8.0.1:36415/: 200 OK, 1000000 bytes
+    ```
+    These are in `scripts/vpn-ns.sh -- go test -tags gopenvpn_server ./...`, so they are part of the check. SPEC §18 says what Wine does not show.
+- **Learned:**
+  - A program started under Wine leaves a Wine server behind for a few seconds that keeps the standard output of its parent open: `exec.Cmd` with a `bytes.Buffer` waited for a pipe that stayed open (120 s, until the timeout), and the first run looked like a hang. The output goes to a file now.
+  - Wine runs as the "root" of the user namespace without a complaint, and its prefix, made outside by the user, is the same prefix inside.
+  - `wineserver -k` exits with 1 when there is no server, which is the state that is wanted.

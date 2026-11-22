@@ -5,6 +5,7 @@ package openvpn
 import (
 	"context"
 	"net"
+	"runtime"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -142,7 +143,14 @@ func TestDialFailedToConnect(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = Dial(t.Context(), "tcp", addr, nil)
-		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagDialFailed || !errors.Is(err, syscall.ECONNREFUSED) {
+		refused := errors.Is(err, syscall.ECONNREFUSED)
+		if runtime.GOOS == "windows" {
+			// Windows says WSAECONNREFUSED, which is not the value of syscall.ECONNREFUSED:
+			// what is left to see is that the dial error of package net is behind the tag.
+			var opErr *net.OpError
+			refused = errors.As(err, &opErr) && opErr.Op == "dial"
+		}
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagDialFailed || !refused {
 			t.Fatalf("Dial = %v, want %s with ECONNREFUSED", err, TagDialFailed)
 		}
 	})

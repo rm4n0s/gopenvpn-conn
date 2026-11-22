@@ -49,6 +49,16 @@ no_server_left() {
 	fi
 }
 
+# no_wine_left fails when a Wine process is still running after the tests.
+no_wine_left() {
+	local left
+	left="$(pgrep -a wine || true)"
+	if [ -n "$left" ]; then
+		printf 'wine processes left running:\n%s\n' "$left"
+		return 1
+	fi
+}
+
 # cross <goos> <goarch> builds and vets the module for another system.
 cross() {
 	GOOS="$1" GOARCH="$2" go build ./... && GOOS="$1" GOARCH="$2" go vet ./...
@@ -68,5 +78,7 @@ run "windows/amd64 build and vet" cross windows amd64
 run "windows/arm64 build and vet" cross windows arm64
 run "darwin/amd64 build and vet" cross darwin amd64
 run "darwin/arm64 build and vet" cross darwin arm64
+run "unit tests for Windows under Wine" scripts/test-windows.sh -count=1
+run "no wine process left" no_wine_left
 
 echo "All checks passed."
