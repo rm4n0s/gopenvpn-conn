@@ -165,6 +165,11 @@ func TestCloseStopsEveryGoroutineOfAConn(t *testing.T) {
 // are the ones of the start and that the heap has not grown by anything near a
 // connection each: SPEC §17.
 func TestNoLeakAfterManyConnections(t *testing.T) {
+	noLeak(t, 200)
+}
+
+// noLeak is TestNoLeakAfterManyConnections with n connections (the soak test has 1000).
+func noLeak(t *testing.T, n int) {
 	for _, k := range kinds {
 		t.Run(k.name, func(t *testing.T) {
 			cycle := func(t *testing.T) {
@@ -203,11 +208,11 @@ func TestNoLeakAfterManyConnections(t *testing.T) {
 				synctest.Test(t, cycle)
 			}
 			goroutines, before := runtime.NumGoroutine(), heap()
-			for range 200 {
+			for range n {
 				synctest.Test(t, cycle)
 			}
 			if after := runtime.NumGoroutine(); after != goroutines {
-				t.Errorf("%d goroutines before 200 connections, %d after", goroutines, after)
+				t.Errorf("%d goroutines before %d connections, %d after", goroutines, n, after)
 			}
 			after := heap()
 			var growth uint64
@@ -215,8 +220,8 @@ func TestNoLeakAfterManyConnections(t *testing.T) {
 				growth = after - before
 			}
 			t.Logf("heap: %d bytes before, %d after", before, after)
-			if growth > 2<<20 {
-				t.Errorf("the heap grew by %d bytes in 200 connections: about %d bytes each", growth, growth/200)
+			if limit := uint64(n&0xffffff) * (2 << 20) / 200; growth > limit {
+				t.Errorf("the heap grew by %d bytes in %d connections: about %d bytes each", growth, n, growth/uint64(n&0xffffff))
 			}
 		})
 	}
