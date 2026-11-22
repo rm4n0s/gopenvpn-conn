@@ -371,3 +371,21 @@ Not a step of the plan: the setup that the plan starts from. No library code.
   - The subject that OpenVPN compares is not RFC 2253 (Go's `pkix.Name.String` reverses it): the attributes in the order of the certificate, joined by `, `; the test writes it from `RawSubject` and the order comes out as in the manual's example (`C=KG, ST=NA, L=Bishkek, CN=Server-1`).
   - A profile with a `peer-fingerprint` and no `ca` has to be complete: the pinned certificate is trusted, and the dates are the only part of the chain check that is kept.
   - The lexer's rule that the grammar's own errors keep their tags through `Parse` lets a profile error name the line of the file, also inside a `<connection>` block (its lines are counted from the opening tag).
+
+## Step 3.3: `Profile.Dial` (2026-11-22, tag `step-3.3`)
+
+- **Built:**
+  - `ovpn/dial.go`: `Profile.Dial(ctx)` (the remotes in the order of the profile, or in a random order from `crypto/rand` with `remote-random`; each remote gets its own `ConnectTimeout`; the error of the last remote comes back with `remotes_tried` and `remotes` in its metadata; ctx done stops it), `TagNoRemotes`, `TagCredentialsMissing`. The order and the function that makes one connection are parameters of the unexported `dial`, so the tests choose both.
+  - `server-poll-timeout` is read as `connect-timeout` (it was in the ignored table).
+  - `internal/servertest/client.go`: `StartClient`, the real `openvpn` client (`--dev null --ifconfig-noexec --route-noexec --disable-dco`, its own process group, SIGTERM then SIGKILL), `Wait`, `Log`, `Stop`.
+  - SPEC §12 and §20 V13 (one round through the remotes; OpenVPN repeats the list).
+- **OpenVPN files used as reference:** `doc/man-sections/client-options.rst` (`--remote`, `--remote-random`, `--connect-timeout`, `--server-poll-timeout`).
+- **Checks that ran:** `scripts/check.sh`: all 14 checks OK. No new parser, so no new fuzz target.
+- **Tests:**
+  - Unit (`ovpn/dial_test.go`, a fake dial function; the timeouts on the `synctest` clock): the order of the remotes (the first answers, the second, the third; an order from the test with `remote-random`; the network of each remote); `shuffled` (a permutation, and 12 or more of the 24 orders of 4 seen in 200 runs); first dead and second alive; all failed (the tag of the last, `remotes_tried` 3 of 3); an error that is not tagged comes back as it is; no remotes and missing credentials (the routes, also through `Dial`; no remote is tried; credentials set); the timeout of each remote (7 s, a whole timeout for each attempt, 120 s by default, 3 remotes of 2 s take 6 s); ctx cancelled during the first remote (one remote tried, 3 s).
+  - Real server 2.7.9 (`ovpn/dial_realserver_test.go`, under `scripts/vpn-ns.sh`): a profile that the test writes (inline CA, certificate, key and `tls-crypt`; `auth-user-pass creds.txt`, read through `ParseFS(os.DirFS(dir), ...)`), the server checks the user name and the password with `--auth-user-pass-verify`: `Profile.Dial` connects over UDP and over TCP and an ICMP echo goes through the tunnel and comes back; a dead TCP remote first and the live UDP server second; two dead remotes (`TagDialFailed`, `remotes_tried` 2, the address of the last); and **the same profile file run by the real `openvpn` client**, which logs:
+    ```
+    2026-11-22 03:07:08 us=381427 Initialization Sequence Completed
+    ```
+    which shows that the parser reads what OpenVPN reads.
+- **Learned:** `--cd` makes the real client find `creds.txt` the way `ParseFS` does, relative to the directory of the profile; a profile with `remote` lines of its own protocol works in both programs with no change.

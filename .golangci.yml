@@ -78,6 +78,12 @@ linters:
         linters:
           - gosec
         text: "G304"
+      # G703 flags a path that comes from a variable. The tests write into the
+      # directories that they made themselves (t.TempDir).
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G703"
       # G304 flags a file name that comes from a variable. The examples are
       # programs for a person at a terminal: the files that a flag names are the
       # files that the person asked them to read.

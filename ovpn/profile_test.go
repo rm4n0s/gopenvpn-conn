@@ -146,6 +146,16 @@ func TestSupportedOptions(t *testing.T) {
 				t.Errorf("ConnectTimeout = %v", p.ConnectTimeout)
 			}
 		}},
+		{"server-poll-timeout", "server-poll-timeout 9\n", func(t *testing.T, p *Profile) {
+			if p.ConnectTimeout != 9*time.Second {
+				t.Errorf("ConnectTimeout = %v", p.ConnectTimeout)
+			}
+			for _, name := range p.Ignored {
+				if name == "server-poll-timeout" {
+					t.Errorf("server-poll-timeout is in Ignored: %v", p.Ignored)
+				}
+			}
+		}},
 		{"ca", "", func(t *testing.T, p *Profile) {
 			if p.Config.TLS == nil || p.Config.TLS.VerifyConnection == nil {
 				t.Error("no verification")
