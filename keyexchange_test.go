@@ -82,7 +82,7 @@ func TestKeyExchangeMessage(t *testing.T) {
 						t.Errorf("%s = %q, want %q", name, info[name], want)
 					}
 				}
-				if !strings.HasPrefix(info["IV_VER"], "gopenvpn-conn ") || strings.HasPrefix(info["IV_VER"], "2.") {
+				if info["IV_VER"] != "gopenvpn-conn "+libraryVersion {
 					t.Errorf("IV_VER = %q: it must say what this client is", info["IV_VER"])
 				}
 				if want := platform(); info["IV_PLAT"] != want {

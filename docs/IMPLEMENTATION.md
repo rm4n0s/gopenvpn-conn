@@ -68,6 +68,7 @@ OpenVPN's code is the reference for the protocol. It is not a design to translat
    | M5: macOS | 5.1 | `v1.0.0` | `git tag -a v1.0.0 -m "v1.0.0"` |
 
    The versions before 1.0 say that the API may still change. `v1.0.0-rc.1` is everything of 1.0, checked on Linux and on Windows under Wine; `v1.0.0` is the same code once it is shown to work on a Mac. A fix after a tag gets the next patch number (`v0.2.1`). Never move or delete a tag.
+   **Every release, a milestone or a fix, also changes the constant `libraryVersion` in `conn.go` to its version without the `v`** (it is the `IV_VER` that the server sees, SPEC §8.2), and its entry in `docs/IMPLEMENTED.md` ends with the line ``- **Version:** `vX.Y.Z` `` (`TestLibraryVersionIsTheNewestRelease` fails when the two differ), and the status line of `README.md` names the version.
    **Nothing is pushed to GitHub by a step.** Merging and tagging are local; pushing `main` and the tags is done when the owner asks for it.
 6. **If a step needs a decision the SPEC does not make,** ask the owner. If a step shows the SPEC is wrong, fix the SPEC on the step's branch and say so in the entry.
 7. **If a step turns out too large,** split it in this file, on the branch, before going on.

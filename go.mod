@@ -2,6 +2,8 @@ module github.com/rm4n0s/gopenvpn-conn
 
 go 1.27.3
 
+toolchain go1.27.4
+
 require (
 	github.com/rm4n0s/errors v0.3.1
 	golang.org/x/crypto v0.59.0

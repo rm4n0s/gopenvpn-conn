@@ -13,11 +13,11 @@ func TestPeerInfoString(t *testing.T) {
 		{
 			name: "the defaults of the library",
 			p: PeerInfo{
-				Version: "gopenvpn-conn 0.2.0", Platform: "linux", MTU: 1600,
+				Version: "gopenvpn-conn 1.2.3", Platform: "linux", MTU: 1600,
 				Ciphers: []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"},
 				Proto:   IVProtoDataV2 | IVProtoRequestPush | IVProtoTLSKeyExport,
 			},
-			want: "IV_VER=gopenvpn-conn 0.2.0\nIV_PLAT=linux\nIV_TCPNL=1\nIV_MTU=1600\nIV_NCP=2\n" +
+			want: "IV_VER=gopenvpn-conn 1.2.3\nIV_PLAT=linux\nIV_TCPNL=1\nIV_MTU=1600\nIV_NCP=2\n" +
 				"IV_CIPHERS=AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\nIV_PROTO=14\n",
 		},
 		{

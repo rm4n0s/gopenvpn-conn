@@ -260,8 +260,11 @@ func platform() string {
 	return runtime.GOOS
 }
 
-// libraryVersion is what IV_VER says after the name of the library.
-const libraryVersion = "0.2.0"
+// libraryVersion is what IV_VER says after the name of the library: the version
+// of the release, without the "v" (SPEC §8.2). A release changes it with its tag;
+// TestLibraryVersionIsTheNewestRelease fails when it is not the newest version
+// that docs/IMPLEMENTED.md records.
+const libraryVersion = "1.0.4"
 
 // implementedProto is IV_PROTO: the bits of the features that this client has.
 // Each step that adds a feature adds its bit (SPEC §8.2).

@@ -8,7 +8,7 @@ machine, and works on Linux, Windows and macOS.
 > OpenVPN's own program, it is not affiliated with OpenVPN Inc, and OpenVPN is a
 > trademark of OpenVPN Inc.
 
-**Status: 1.0 (`v1.0.1`).** The tunnel (package `openvpn`), the profile parser (`ovpn`)
+**Status: 1.0 (`v1.0.4`).** The tunnel (package `openvpn`), the profile parser (`ovpn`)
 and the userspace network (`vpnnet`) are complete and were run against a real OpenVPN
 2.7.9 server on Linux, under Wine on Windows, and on macOS (Apple silicon, against a
 server in a Linux VM, over UDP and TCP, with the server's kernel data channel (DCO) and
@@ -177,7 +177,8 @@ namespace, with no root, where the server and the client talk over the loopback.
 soak tests (loss, reordering, an hour of renegotiations) are listed in `CLAUDE.md`.
 
 The `go` line of `go.mod` is 1.27.3, the version that gVisor's `go` branch needs
-(SPEC §18).
+(SPEC §18); its `toolchain` line is go1.27.4, the Go that this module's own builds and
+checks use (the first one with the fixes that `govulncheck` named).
 
 ## License
 

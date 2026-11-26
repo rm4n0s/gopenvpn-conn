@@ -72,7 +72,7 @@ func TestKeyExchangeWithRealServer(t *testing.T) {
 				t.Errorf("the server's message was not read: %+v", kx)
 			}
 			// What the server read, and what it decided.
-			srv.WaitLog(t, "peer info: IV_VER=gopenvpn-conn_0.2.0", 3*time.Second)
+			srv.WaitLog(t, "peer info: IV_VER=gopenvpn-conn_"+libraryVersion, 3*time.Second)
 			srv.WaitLog(t, "IV_PROTO=1950", 3*time.Second)
 			srv.WaitLog(t, "IV_CIPHERS=AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", 3*time.Second)
 			srv.WaitLog(t, "UV_FROM=gopenvpn-conn_tests", 3*time.Second)
