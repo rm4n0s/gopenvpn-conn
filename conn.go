@@ -82,6 +82,11 @@ const (
 
 // Conn is one session with a server and a net.Conn of IP packets: Read returns one
 // IP packet that the server sent, and Write sends one (SPEC §5.1).
+//
+// The error that ends a Conn is one value: every later call returns that same
+// error, to every goroutine, and its route begins at the call that started the
+// session (Dial, HandshakeContext, or a first Read or Write). It is shared, so a
+// program must not change it (SetMetadata) (SPEC §14.2).
 type Conn struct {
 	s   *session.Session
 	mtu int // the tunnel MTU of the Config, for ConnectionState before the server pushes one

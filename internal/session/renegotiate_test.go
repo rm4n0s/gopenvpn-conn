@@ -276,7 +276,7 @@ func TestAFailedRenegotiationEndsTheSession(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := r.session.Read(make([]byte, 10))
-		wantRoute(t, err, TagRenegotiationFailed, "Session.loop->Session.renegTick.RenegotiationFailed")
+		wantRoute(t, err, TagRenegotiationFailed, routeStart+"Session.loop->Session.renegTick.RenegotiationFailed")
 		if elapsed := time.Since(start); elapsed != 40*time.Second {
 			t.Errorf("the session ended after %v, want 40s", elapsed)
 		}
@@ -312,7 +312,7 @@ func TestARenegotiationThatFailsForAReasonEndsTheSessionWithIt(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := r.session.Read(make([]byte, 10))
-		wantRoute(t, err, TagCredentialsFailed, ".CredentialsFailed")
+		wantRoute(t, err, TagCredentialsFailed, routeTLSOfClient+"->Session.keyExchange.CredentialsFailed")
 		if !errors.Is(err, boom) {
 			t.Errorf("the cause is lost: %v", err)
 		}
@@ -343,7 +343,7 @@ func TestTheSessionEndsWhenTheOldKeyExpires(t *testing.T) {
 		if err == nil {
 			t.Fatal("the session lives after its key expired")
 		}
-		wantRoute(t, err, TagRenegotiationFailed, "Session.renegTick->Session.expired.RenegotiationFailed")
+		wantRoute(t, err, TagRenegotiationFailed, routeStart+"Session.loop->Session.renegTick->Session.expired.RenegotiationFailed")
 		if _, err := r.session.Write([]byte{0x45}); err == nil {
 			t.Error("Write works after the session ended")
 		}

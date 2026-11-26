@@ -22,17 +22,17 @@ func TestServerEndingsEndTheSession(t *testing.T) {
 		route    string
 		metadata map[string]any
 	}{
-		{"auth failed", "AUTH_FAILED,wrong password", TagAuthFailed, "control.AuthFailed",
+		{"auth failed", "AUTH_FAILED,wrong password", TagAuthFailed, routeControl + ".AuthFailed",
 			map[string]any{"reason": "wrong password", "session": false, "temporary": false, "backoff": 0, "advance": ""}},
-		{"auth failed with no reason", "AUTH_FAILED", TagAuthFailed, "control.AuthFailed",
+		{"auth failed with no reason", "AUTH_FAILED", TagAuthFailed, routeControl + ".AuthFailed",
 			map[string]any{"reason": ""}},
-		{"auth failed, token expired", "AUTH_FAILED,SESSION:token expired", TagAuthFailed, "control.AuthFailed",
+		{"auth failed, token expired", "AUTH_FAILED,SESSION:token expired", TagAuthFailed, routeControl + ".AuthFailed",
 			map[string]any{"session": true, "reason": "token expired"}},
-		{"auth failed, temporary", "AUTH_FAILED,TEMP[backoff 42,advance no]:busy", TagAuthFailed, "control.AuthFailed",
+		{"auth failed, temporary", "AUTH_FAILED,TEMP[backoff 42,advance no]:busy", TagAuthFailed, routeControl + ".AuthFailed",
 			map[string]any{"temporary": true, "backoff": 42, "advance": "no", "reason": "busy"}},
-		{"halt", "HALT,server is going down", TagServerHalt, "control.ServerHalt",
+		{"halt", "HALT,server is going down", TagServerHalt, routeControl + ".ServerHalt",
 			map[string]any{"reason": "server is going down"}},
-		{"restart", "RESTART,[PN]reloading", TagServerRestart, "control.ServerRestart",
+		{"restart", "RESTART,[PN]reloading", TagServerRestart, routeControl + ".ServerRestart",
 			map[string]any{"reason": "reloading", "flags": "PN"}},
 	}
 	for _, tt := range tests {

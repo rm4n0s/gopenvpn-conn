@@ -176,24 +176,25 @@ func cmpOr(values ...int) int {
 // handleData opens a packet of the data channel and queues the IP packet for
 // Read. Anyone can send a packet to the client, so one that does not open, that is a
 // replay, or that comes before the keys are there is dropped and counted; it never
-// ends the session (SPEC §15 rule 7).
+// ends the session (SPEC §15 rule 7). What it returns is not a failure of the
+// packet: it is the end of the session that the server's exit message asks for.
 //
 // OpenVPN: forward.c process_incoming_link_part2.
-func (s *Session) handleData(raw []byte) {
+func (s *Session) handleData(raw []byte) error {
 	d := s.data.Load()
 	if d == nil {
 		s.drop("a data packet before the keys are made", nil)
-		return
+		return nil
 	}
 	k := d.table.Load().byID[raw[0]&0x07]
 	if k == nil {
 		s.drop("a data packet of a key id that has no key", nil)
-		return
+		return nil
 	}
 	plain, err := k.ch.Open(k.rbuf[:0], raw, time.Now())
 	if err != nil {
 		s.drop("a data packet that is refused", err)
-		return
+		return nil
 	}
 	k.rbuf = plain[:0]
 	if k.ch.NeedsRenegotiation() {
@@ -202,11 +203,10 @@ func (s *Session) handleData(raw []byte) {
 	s.lastRecv = time.Now() // authentic: a ping counts, though Read does not get it
 	if bytes.Equal(plain, pingString) {
 		s.log.Debug("a keepalive ping arrived")
-		return
+		return nil
 	}
 	if isOCCExit(plain) {
-		s.serverExited()
-		return
+		return s.serverExited()
 	}
 	pb := s.pool.get(len(plain))
 	copy(pb.b, plain)
@@ -218,6 +218,7 @@ func (s *Session) handleData(raw []byte) {
 		s.pool.put(pb)
 		s.drop("the packets for Read are not read", nil)
 	}
+	return nil
 }
 
 // awaitReady waits for the handshake when it has not run, as the first Read or Write
@@ -349,7 +350,8 @@ func (d *dataPath) unlockWrite() { <-d.sem }
 // sealLocked seals one IP packet (or the ping) into the buffer of the data path, as
 // a frame on a stream link. The caller holds the right to write, and uses the packet
 // before it gives the right back. The end of the packet ids ends the session: the
-// error is stored and returned.
+// error is returned, and the caller stores it (a Write at once, the loop when it has
+// returned it through its hand-off).
 func (s *Session) sealLocked(d *dataPath, b []byte) ([]byte, *dataKey, error) {
 	d.wbuf = d.wbuf[:0]
 	if s.opts.Stream {
@@ -358,7 +360,6 @@ func (s *Session) sealLocked(d *dataPath, b []byte) ([]byte, *dataKey, error) {
 	k := d.table.Load().send
 	packet, err := k.ch.Seal(d.wbuf, b)
 	if err != nil {
-		s.fail(err)
 		return nil, nil, err
 	}
 	d.wbuf = packet
@@ -369,16 +370,21 @@ func (s *Session) sealLocked(d *dataPath, b []byte) ([]byte, *dataKey, error) {
 }
 
 // writeLocked seals one IP packet and writes it to the link. The caller holds the
-// right to write. A failure of the link that ends the session, or the end of the
-// packet ids, is made and stored where it happens, and the returned error is that
-// one. With user set the write deadline of the connection applies, and a deadline
-// that passes gives errDeadline.
+// right to write, and is not a goroutine of the session: it is a Write of the
+// connection, or Close. A failure of the link that ends the session, or the end of
+// the packet ids, is stored here, and the returned error is that one. With user set
+// the write deadline of the connection applies, and a deadline that passes gives
+// errDeadline.
 func (s *Session) writeLocked(d *dataPath, b []byte, user bool) error {
 	packet, k, err := s.sealLocked(d, b)
 	if err != nil {
+		s.fail(err)
 		return err
 	}
 	if err := s.writeLink(packet, user); err != nil {
+		if err != errDeadline {
+			s.fail(err) // nothing changes when it is the error that has ended the session
+		}
 		return err
 	}
 	if k.ch.NeedsRenegotiation() {

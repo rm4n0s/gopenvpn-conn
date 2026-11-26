@@ -475,7 +475,7 @@ func TestPushWithoutTheExporterEndsTheHandshake(t *testing.T) {
 		r := newTLSRig(t, tlsOptions{rigOptions: rigOptions{transport: transports[0], wrap: wrapKinds[0],
 			server: vpntest.ServerOptions{PushMessages: []string{reply}}}})
 		err := r.session.Handshake(t.Context())
-		wantRoute(t, err, TagKeyDerivationUnsupported, "control->Session.setupData.KeyDerivationUnsupported")
+		wantRoute(t, err, TagKeyDerivationUnsupported, routeControl+"->Session.setupData.KeyDerivationUnsupported")
 		if r.session.Pushed() != nil {
 			t.Error("Pushed() is not nil after a failure")
 		}
@@ -505,7 +505,9 @@ func TestDataWithTLS12(t *testing.T) {
 
 func TestHandleDataBeforeTheKeys(t *testing.T) {
 	s := New(Options{Link: &net.UDPConn{}, Err: errors.New(tagNeverStarts, "a session that never starts")})
-	s.handleData([]byte{9 << 3, 1, 2, 3})
+	if err := s.handleData([]byte{9 << 3, 1, 2, 3}); err != nil {
+		t.Fatalf("a data packet before the keys ended the session: %v", err)
+	}
 	if s.Dropped() != 1 || len(s.recv) != 0 {
 		t.Errorf("dropped %d, queued %d", s.Dropped(), len(s.recv))
 	}
@@ -777,7 +779,7 @@ func TestReadErrorsThatNeverStopEndTheSession(t *testing.T) {
 		_ = err
 		err = r.session.Err()
 		appErr, ok := errors.FromError(err)
-		if !ok || appErr.Tag != TagLinkFailed || appErr.Metadata["op"] != "read" || !errors.Is(err, errFakeICMP) || !appErr.HasRoute("Session.readLoop.LinkFailed") {
+		if !ok || appErr.Tag != TagLinkFailed || appErr.Metadata["op"] != "read" || !errors.Is(err, errFakeICMP) || !appErr.HasRoute(routeStart+"Session.readLoop.LinkFailed") {
 			t.Fatalf("the session ended with %v (route %v), want %s with the fake error as cause", err, appErr, TagLinkFailed)
 		}
 		link.mu.Lock()

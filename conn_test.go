@@ -213,11 +213,53 @@ func TestHandshakeTimeout(t *testing.T) {
 				if !ok {
 					t.Fatalf("expected *errors.Error, got %T: %v", err, err)
 				}
-				if appErr.Tag != TagHandshakeTimeout {
+				if appErr.Tag != TagHandshakeTimeout || !appErr.HasRoute("Conn.HandshakeContext->Session.Handshake->Session.start->Session.loop.HandshakeTimeout") {
 					t.Errorf("tag = %s, want %s (route %s)", appErr.Tag, TagHandshakeTimeout, appErr.Route())
 				}
 				if elapsed := time.Since(start); elapsed != tt.want {
 					t.Errorf("failed after %v, want %v", elapsed, tt.want)
+				}
+			})
+		})
+	}
+}
+
+// TestTheRouteStartsAtTheCallThatStartedTheSession: the goroutines of a Conn make the
+// error that ends it, and its route begins at the call that started them: the
+// HandshakeContext, or the first Read or Write that ran the handshake. Every later
+// call returns that same error, whoever makes it.
+func TestTheRouteStartsAtTheCallThatStartedTheSession(t *testing.T) {
+	const timedOut = "Session.Handshake->Session.start->Session.loop.HandshakeTimeout"
+	tests := []struct {
+		name  string
+		start func(ctx context.Context, conn *Conn) error
+		route string
+	}{
+		{"HandshakeContext", func(ctx context.Context, conn *Conn) error { return conn.HandshakeContext(ctx) },
+			"Conn.HandshakeContext->" + timedOut},
+		{"a first Read", func(_ context.Context, conn *Conn) error { _, err := conn.Read(make([]byte, 10)); return err },
+			"Conn.Read->Session.Read->Session.awaitReady->" + timedOut},
+		{"a first Write", func(_ context.Context, conn *Conn) error { _, err := conn.Write([]byte{0x45}); return err },
+			"Conn.Write->Session.Write->Session.awaitReady->" + timedOut},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				link, _ := pair(t, kinds[0], protections()[0], vpntest.Silent)
+				conn := PacketClient(link, &Config{HandshakeTimeout: 7 * time.Second, resetOnly: true})
+				closeAtEnd(t, conn)
+				err := tt.start(t.Context(), conn)
+				appErr, ok := errors.FromError(err)
+				if !ok {
+					t.Fatalf("expected *errors.Error, got %T: %v", err, err)
+				}
+				if appErr.Tag != TagHandshakeTimeout || !appErr.HasRoute(tt.route) {
+					t.Errorf("unexpected failure path: %s, want %s", appErr.Route(), tt.route)
+				}
+				// A later call of another kind gets the same error, with the route of the
+				// call that started the session.
+				if _, again := conn.Read(make([]byte, 10)); again != err {
+					t.Errorf("a later Read returned %v, want the same error", again)
 				}
 			})
 		})

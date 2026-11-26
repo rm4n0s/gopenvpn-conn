@@ -118,10 +118,26 @@ func New(conn *openvpn.Conn, opts *Options) (*Net, error) {
 		n.logger = slog.New(slog.DiscardHandler)
 	}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
+	// The two goroutines hand on what ends the tunnel, and the calls of other
+	// goroutines return it. Their work is handed off here, so that an error that is
+	// made in one of them (the writer's Write of the Conn can make the error that ends
+	// the Conn) has a route that begins at New. The error that the Conn has stored
+	// already was made elsewhere and keeps its route.
+	read := errors.Async(n.readTunnel)
+	write := errors.Async(n.writeTunnel)
 	n.wg.Add(2)
-	go n.readTunnel()
-	go n.writeTunnel()
+	go n.run(read)
+	go n.run(write)
 	return n, nil
+}
+
+// run is a goroutine of the Net: when its work returns an error, the tunnel has
+// ended with it.
+func (n *Net) run(work func() error) {
+	defer n.wg.Done()
+	if err := work(); err != nil {
+		n.fail(err)
+	}
 }
 
 // newStack makes the stack of the tunnel: the protocols, the interface with the MTU
@@ -165,18 +181,18 @@ func tcpipAddr(a netip.Addr) tcpip.Address {
 }
 
 // readTunnel gives each packet that the Conn reads to the stack, until the Conn
-// fails or the Net is closed.
-func (n *Net) readTunnel() {
-	defer n.wg.Done()
+// fails or the Net is closed. It returns what ended the Conn, and nil when the Net
+// was closed.
+func (n *Net) readTunnel() error {
 	mtu := max(n.state.MTU, 576)
 	buf := make([]byte, mtu)
 	for {
 		size, err := n.conn.Read(buf)
 		if err != nil {
 			if n.ctx.Err() == nil {
-				n.fail(err)
+				return err
 			}
-			return
+			return nil
 		}
 		var proto tcpip.NetworkProtocolNumber
 		switch buf[0] >> 4 {
@@ -195,13 +211,13 @@ func (n *Net) readTunnel() {
 }
 
 // writeTunnel writes each packet that the stack sends to the Conn, until the Net is
-// closed or the Conn fails.
-func (n *Net) writeTunnel() {
-	defer n.wg.Done()
+// closed or the Conn fails. It returns what ended the Conn, and nil when the Net was
+// closed.
+func (n *Net) writeTunnel() error {
 	for {
 		pkt := n.ep.ReadContext(n.ctx)
 		if pkt == nil {
-			return
+			return nil
 		}
 		view := pkt.ToView()
 		_, err := n.conn.Write(view.AsSlice())
@@ -209,9 +225,9 @@ func (n *Net) writeTunnel() {
 		pkt.DecRef()
 		if err != nil {
 			if n.ctx.Err() == nil {
-				n.fail(err)
+				return err
 			}
-			return
+			return nil
 		}
 	}
 }

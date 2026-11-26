@@ -292,7 +292,7 @@ func TestHandshakeTimeout(t *testing.T) {
 				if !ok {
 					t.Fatalf("expected *errors.Error, got %T: %v", err, err)
 				}
-				if appErr.Tag != TagHandshakeTimeout || !appErr.HasRoute("loop.HandshakeTimeout") {
+				if appErr.Tag != TagHandshakeTimeout || !appErr.HasRoute(routeStart+"Session.loop.HandshakeTimeout") {
 					t.Errorf("unexpected failure path: %s", appErr.Route())
 				}
 				if elapsed := time.Since(start); elapsed != handshakeTimeout {
@@ -541,7 +541,7 @@ func TestLinkFailures(t *testing.T) {
 			closeAtEnd(t, s)
 			err := s.Handshake(t.Context())
 			appErr, ok := errors.FromError(err)
-			if !ok || appErr.Tag != TagLinkFailed || !appErr.HasRoute("Session.writeLoop->Session.writeLink.LinkFailed") {
+			if !ok || appErr.Tag != TagLinkFailed || !appErr.HasRoute(routeStart+"Session.writeLoop->Session.writeLink.LinkFailed") {
 				t.Fatalf("Handshake = %v, want a failed write", err)
 			}
 			if !errors.Is(err, os.ErrPermission) {
@@ -563,7 +563,7 @@ func TestLinkFailures(t *testing.T) {
 			}
 			err := <-result
 			appErr, ok := errors.FromError(err)
-			if !ok || appErr.Tag != TagLinkFailed || !appErr.HasRoute("readLoop.LinkFailed") {
+			if !ok || appErr.Tag != TagLinkFailed || !appErr.HasRoute(routeStart+"Session.readLoop.LinkFailed") {
 				t.Fatalf("Handshake = %v, want a failed read (tag %s, route %s)", err, appErr.Tag, appErr.Route())
 			}
 		})
@@ -596,7 +596,7 @@ func TestLinkFailures(t *testing.T) {
 			_ = s.Handshake(t.Context()) // times out: the loop closes the link
 			err := s.Close()
 			appErr, ok := errors.FromError(err)
-			if !ok || appErr.Tag != tagLinkCloseFailed || !appErr.HasRoute("closeLink.LinkCloseFailed") {
+			if !ok || appErr.Tag != tagLinkCloseFailed || !appErr.HasRoute(routeStart+"Session.closeLink.LinkCloseFailed") {
 				t.Fatalf("Close = %v, want a failed close of the link", err)
 			}
 		})

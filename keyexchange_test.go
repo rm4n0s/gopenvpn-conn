@@ -160,7 +160,7 @@ func TestCredentialsFailure(t *testing.T) {
 		closeAtEnd(t, conn)
 		err := conn.HandshakeContext(t.Context())
 		appErr, ok := errors.FromError(err)
-		if !ok || appErr.Tag != TagCredentialsFailed || !errors.Is(err, boom) || !appErr.HasRoute("keyExchange.CredentialsFailed") {
+		if !ok || appErr.Tag != TagCredentialsFailed || !errors.Is(err, boom) || !appErr.HasRoute("Conn.HandshakeContext->Session.Handshake->Session.start->Session.startTLS->Session.startTLS.func1->Session.tlsMain->Session.keyExchange.CredentialsFailed") {
 			t.Fatalf("HandshakeContext = %v, want %s", err, TagCredentialsFailed)
 		}
 	})
@@ -203,7 +203,7 @@ func TestCredentialsThatDoNotFit(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected *errors.Error, got %T: %v", err, err)
 		}
-		if appErr.Tag != TagKeyExchangeTooLong || !appErr.HasRoute("Session.keyExchange->AppendClientKeyExchange.KeyExchangeTooLong") {
+		if appErr.Tag != TagKeyExchangeTooLong || !appErr.HasRoute("Conn.HandshakeContext->Session.Handshake->Session.start->Session.startTLS->Session.startTLS.func1->Session.tlsMain->Session.keyExchange->AppendClientKeyExchange.KeyExchangeTooLong") {
 			t.Errorf("unexpected failure path: %s", appErr.Route())
 		}
 		for _, text := range []string{err.Error(), appErr.Route(), fmt.Sprint(appErr.Metadata)} {

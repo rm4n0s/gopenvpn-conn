@@ -64,7 +64,7 @@ func TestPullFilterRejectEndsTheHandshake(t *testing.T) {
 		})
 		err := r.session.Handshake(t.Context())
 		appErr, ok := errors.FromError(err)
-		if !ok || appErr.Tag != ctrlmsg.TagPushedOptionRejected || !appErr.HasRoute("control->PushReply.Filter.PushedOptionRejected") {
+		if !ok || appErr.Tag != ctrlmsg.TagPushedOptionRejected || !appErr.HasRoute(routeControl+"->PushReply.Filter.PushedOptionRejected") {
 			t.Fatalf("Handshake = %v (route %v)", err, appErr)
 		}
 		if r.session.Pushed() != nil {

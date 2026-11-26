@@ -38,19 +38,18 @@ const (
 // connection whose path is dead, a peer that does not read) must not stop the
 // timers, the keepalive that ends such a session among them, nor the reading.
 //
+// It returns the error of a write that ends the session, or nil when the session
+// has ended; its goroutine stores the error and sends what is left (runWrite).
+//
 // OpenVPN: forward.c io_wait (its loop does not block on the link either).
-func (s *Session) writeLoop() {
-	defer s.wg.Done()
-	defer close(s.ctlDone)
+func (s *Session) writeLoop() error {
 	for {
 		select {
 		case <-s.done:
-			s.drainCtl()
-			return
+			return nil
 		case p := <-s.ctl:
 			if err := s.writeLink(p, false); err != nil {
-				s.drainCtl()
-				return
+				return err
 			}
 		}
 	}
@@ -136,7 +135,9 @@ func (s *Session) lockLink(user bool) error {
 // write waits. It returns nil when the packet is out, and also when a datagram link
 // refused it in a way that says nothing of the next packet (the packet is lost, as
 // a network loses one); errDeadline when the deadline passed and nothing went out;
-// else the error that ended the session, which is made and stored here.
+// else the error that ends the session: the one that has ended it already, or one
+// that is made here and that the caller stores (a Write at once, the writer of the
+// link when it has returned it through its hand-off).
 //
 // OpenVPN: forward.c process_outgoing_link, error.c x_check_status (a failed write
 // of a datagram is logged, and the keepalive decides).
@@ -166,9 +167,7 @@ func (s *Session) writeLink(p []byte, user bool) error {
 		s.log.Debug("a write of the datagram link failed; the packet is lost", "err", err)
 		return nil
 	}
-	e := errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
-	s.fail(e)
-	return e
+	return errors.NewErr(TagLinkFailed, err).SetMetadata("op", "write")
 }
 
 // writeUser is the write of a Write of the connection: the link has the write

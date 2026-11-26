@@ -5,17 +5,20 @@ package vpnnet
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/netip"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rm4n0s/errors"
 
 	openvpn "github.com/rm4n0s/gopenvpn-conn"
+	"github.com/rm4n0s/gopenvpn-conn/internal/servertest"
 	"github.com/rm4n0s/gopenvpn-conn/internal/vpntest"
 )
 
@@ -250,6 +253,105 @@ func TestTunnelEnds(t *testing.T) {
 	// Close still works, and the Conn was not the Net's to close.
 	if err := na.Close(); err != nil {
 		t.Errorf("Close = %v", err)
+	}
+}
+
+// TestTunnelEndsWithTheErrorOfTheConn: when the session of the Conn fails, the Net
+// hands on the error that ended the Conn, untouched: the same value that the Conn
+// returns, with its route, which begins at the HandshakeContext that started the Conn
+// and ends in the goroutine of the Conn that found the failure. The goroutines of the
+// Net add nothing to it (they use no errors.Async: the error is not theirs to change).
+func TestTunnelEndsWithTheErrorOfTheConn(t *testing.T) {
+	na, _, a, _ := newNets(t, false)
+	a.server.SendControl("HALT,the server is going down")
+	select {
+	case <-na.ctx.Done(): // the reader of the tunnel got the error of the Conn
+	case <-time.After(10 * time.Second):
+		t.Fatal("the Net did not end with its Conn")
+	}
+	_, err := na.DialContext(t.Context(), "tcp", "10.8.0.3:7000")
+	appErr, ok := errors.FromError(err)
+	if !ok || appErr.Tag != openvpn.TagServerHalt {
+		t.Fatalf("DialContext after the tunnel ended = %v, want %s", err, openvpn.TagServerHalt)
+	}
+	wantRoute(t, err, "Conn.HandshakeContext->Session.Handshake->Session.start->Session.startTLS->Session.startTLS.func1->Session.tlsMain->Session.controlLoop->Session.control.ServerHalt")
+	if _, connErr := a.conn.Read(make([]byte, 10)); connErr != err {
+		t.Errorf("the Conn returns %v, the Net %v: want the same error", connErr, err)
+	}
+	if _, err := na.Listen("tcp", ":1"); !errors.Is(err, &errors.Error{Tag: openvpn.TagServerHalt}) {
+		t.Errorf("Listen after the tunnel ended = %v", err)
+	}
+}
+
+// closedLink is a link that, once shut is set, fails the write of a data packet as a
+// closed socket does, while its reads and the control packets go on: only a Write of
+// the Conn finds the failure, not the goroutines of the Conn.
+type closedLink struct {
+	net.Conn
+	shut atomic.Bool
+}
+
+func (c *closedLink) Write(p []byte) (int, error) {
+	// The opcode is in the high five bits of the first byte: 6 is DATA_V1, 9 is DATA_V2.
+	if c.shut.Load() && len(p) > 0 && (p[0]>>3 == 6 || p[0]>>3 == 9) {
+		return 0, net.ErrClosed
+	}
+	return c.Conn.Write(p)
+}
+
+// TestTunnelEndsInTheWriterOfTheNet: the goroutine of the Net that writes the packets
+// of the stack to the Conn can be the one that finds the end of the tunnel: its Write
+// makes the error that ends the Conn. That error is made in a goroutine of the Net, so
+// its route begins at the New that started it (errors.Async), and every later call of
+// the Net and of the Conn returns it.
+func TestTunnelEndsInTheWriterOfTheNet(t *testing.T) {
+	pki := servertest.NewPKI(t)
+	client, peer := vpntest.NewDatagramPair(vpntest.LinkOptions{})
+	vpntest.NewServer(t, peer, vpntest.ServerOptions{
+		TLS:          &tls.Config{Certificates: []tls.Certificate{pki.ServerCert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pki.CAPool},
+		PushMessages: []string{pushReply("10.8.0.2", "", "1500", nil)},
+	})
+	link := &closedLink{Conn: client}
+	conn := openvpn.PacketClient(link, &openvpn.Config{
+		TLS: openvpn.NewTLSConfig(openvpn.TLSOptions{RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert}}),
+	})
+	if err := conn.HandshakeContext(t.Context()); err != nil {
+		t.Fatalf("HandshakeContext: %v", err)
+	}
+	n, err := New(conn, &Options{CloseConn: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() {
+		if err := n.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	link.shut.Store(true)
+	// The SYN of this dial is the packet that the writer cannot send.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if c, err := n.DialContext(ctx, "tcp", "10.8.0.3:7000"); err == nil {
+		closeOrFail(t, c)
+		t.Fatal("DialContext over a link that takes no packet succeeded")
+	}
+	// Both goroutines of the Net have returned: the reader may be the first to hand
+	// the error on, a moment before the writer has returned it through its hand-off.
+	ended := make(chan struct{})
+	go func() { n.wg.Wait(); close(ended) }()
+	select {
+	case <-ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the Net did not end with its Conn")
+	}
+	_, err = n.DialContext(t.Context(), "tcp", "10.8.0.3:7000")
+	appErr, ok := errors.FromError(err)
+	if !ok || appErr.Tag != openvpn.TagLinkFailed || appErr.Metadata["op"] != "write" {
+		t.Fatalf("DialContext after the tunnel ended = %v, want %s of a write", err, openvpn.TagLinkFailed)
+	}
+	wantRoute(t, err, "New->Net.writeTunnel->Conn.Write->Session.Write->Session.writeLocked->Session.writeLink.LinkFailed")
+	if _, connErr := conn.Read(make([]byte, 10)); connErr != err {
+		t.Errorf("the Conn returns %v, the Net %v: want the same error", connErr, err)
 	}
 }
 

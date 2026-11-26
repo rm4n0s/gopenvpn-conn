@@ -26,7 +26,7 @@ OpenVPN's code is the reference for the protocol. It is not a design to translat
 
 ### The procedure of every step
 1. `git switch main && git switch -c feat/step-<id>-<short-name>`.
-2. Read `CLAUDE.md`, the step, the SPEC sections it names, and (if the step makes errors) `$(go env GOMODCACHE)/github.com/rm4n0s/errors@v0.2.0/AI_GUIDE.md`.
+2. Read `CLAUDE.md`, the step, the SPEC sections it names, and (if the step makes errors) `$(go env GOMODCACHE)/github.com/rm4n0s/errors@v0.3.1/AI_GUIDE.md`.
 3. If `reference/` is empty, run `scripts/fetch-reference.sh`. Read the OpenVPN functions the step names.
 4. Write the tests and the code. Every Go file starts with `// SPDX-License-Identifier: GPL-2.0-only`; a file based on an OpenVPN file names it on the next line (the exact form is in `CLAUDE.md`).
 5. Run `scripts/check.sh` (from step 1.1 on) and fix everything it reports. Do not weaken a test or a check to make it pass.

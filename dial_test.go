@@ -142,7 +142,7 @@ func TestDialServerPollTimeout(t *testing.T) {
 				}
 				_, err := d.Dial(t.Context(), network, "vpn.example:1194")
 				appErr, ok := errors.FromError(err)
-				if !ok || appErr.Tag != TagServerPollTimeout || !appErr.HasRoute("Session.loop.ServerPollTimeout") {
+				if !ok || appErr.Tag != TagServerPollTimeout || !appErr.HasRoute("Dialer.Dial->Conn.HandshakeContext->Session.Handshake->Session.start->Session.loop.ServerPollTimeout") {
 					t.Fatalf("Dial = %v, want %s", err, TagServerPollTimeout)
 				}
 				if elapsed := time.Since(start); elapsed != 3*time.Second {
@@ -336,7 +336,7 @@ func TestDialTriesTheAddressesOfAName(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected *errors.Error, got %T: %v", err, err)
 			}
-			if !appErr.HasRoute("Session.loop.ServerPollTimeout") {
+			if !appErr.HasRoute("Dialer.Dial->Conn.HandshakeContext->Session.Handshake->Session.start->Session.loop.ServerPollTimeout") {
 				t.Errorf("unexpected failure path: %s", appErr.Route())
 			}
 			if appErr.Metadata["addresses"] != 2 || appErr.Metadata["addresses_tried"] != 2 {

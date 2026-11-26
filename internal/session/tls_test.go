@@ -357,7 +357,7 @@ func TestTLSFailures(t *testing.T) {
 					r := newTLSRig(t, o)
 					err := r.session.Handshake(t.Context())
 					appErr, ok := errors.FromError(err)
-					if !ok || appErr.Tag != TagTLSHandshakeFailed || !appErr.HasRoute("tlsMain.TLSHandshakeFailed") {
+					if !ok || appErr.Tag != TagTLSHandshakeFailed || !appErr.HasRoute(routeTLS+".TLSHandshakeFailed") {
 						t.Fatalf("Handshake = %v, want a failed TLS handshake", err)
 					}
 					if !tt.as(err) {
@@ -488,7 +488,9 @@ func TestInboundTLSBytesAreBounded(t *testing.T) {
 		return raw
 	}
 	s.ks0.adapter.push(make([]byte, inboundLimit))
-	s.handle(packet(1))
+	if err := s.handle(packet(1)); err != nil {
+		t.Fatal(err)
+	}
 	if s.ks0.receiver.HasPendingAcks() || s.Dropped() != 1 {
 		t.Fatalf("a packet was taken with %d bytes waiting (dropped %d)", s.ks0.adapter.queued(), s.Dropped())
 	}
@@ -497,7 +499,9 @@ func TestInboundTLSBytesAreBounded(t *testing.T) {
 	if n, err := s.ks0.adapter.Read(buf); err != nil || n != inboundLimit {
 		t.Fatalf("Read = %d, %v", n, err)
 	}
-	s.handle(packet(1))
+	if err := s.handle(packet(1)); err != nil {
+		t.Fatal(err)
+	}
 	if !s.ks0.receiver.HasPendingAcks() || s.ks0.adapter.queued() != len("tls bytes") {
 		t.Errorf("the packet was not taken: acks %v, queued %d", s.ks0.receiver.HasPendingAcks(), s.ks0.adapter.queued())
 	}
@@ -518,10 +522,10 @@ func TestKeyExchangeFailures(t *testing.T) {
 		tag    string
 		route  string
 	}{
-		{"a message that is too short", []byte{0, 0, 0, 0, 2, 1, 2, 3}, false, "KeyExchangeTruncated", "keyExchange->ParseServerKeyExchange.KeyExchangeTruncated"},
-		{"another key method", badMethod, false, "BadKeyMethod", "keyExchange->ParseServerKeyExchange.BadKeyMethod"},
-		{"bytes after the message", append(good(), 7), false, "KeyExchangeTrailing", "keyExchange->ParseServerKeyExchange.KeyExchangeTrailing"},
-		{"the session ends before the answer", []byte{}, true, TagKeyExchangeFailed, "keyExchange.KeyExchangeFailed"},
+		{"a message that is too short", []byte{0, 0, 0, 0, 2, 1, 2, 3}, false, "KeyExchangeTruncated", routeTLS + "->Session.keyExchange->ParseServerKeyExchange.KeyExchangeTruncated"},
+		{"another key method", badMethod, false, "BadKeyMethod", routeTLS + "->Session.keyExchange->ParseServerKeyExchange.BadKeyMethod"},
+		{"bytes after the message", append(good(), 7), false, "KeyExchangeTrailing", routeTLS + "->Session.keyExchange->ParseServerKeyExchange.KeyExchangeTrailing"},
+		{"the session ends before the answer", []byte{}, true, TagKeyExchangeFailed, routeTLS + "->Session.keyExchange.KeyExchangeFailed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -571,9 +575,9 @@ func TestKeyExchangeRefusesCredentialsThatAreTooLong(t *testing.T) {
 		route    string
 	}{
 		// Longer than any OpenVPN takes (USER_PASS_LEN of a build with PKCS#11).
-		{"a password longer than a server's buffer for it", ctrlmsg.MaxCredentialLen, "keyExchange->AppendClientKeyExchange.StringTooLong"},
+		{"a password longer than a server's buffer for it", ctrlmsg.MaxCredentialLen, routeTLS + "->Session.keyExchange->AppendClientKeyExchange.StringTooLong"},
 		// Short enough for that, and the message is longer than a server reads.
-		{"a message longer than a server reads", ctrlmsg.MaxKeyExchangeLen, "keyExchange->AppendClientKeyExchange.KeyExchangeTooLong"},
+		{"a message longer than a server reads", ctrlmsg.MaxKeyExchangeLen, routeTLS + "->Session.keyExchange->AppendClientKeyExchange.KeyExchangeTooLong"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -635,7 +639,7 @@ func TestKeyExchangeCredentialsFailure(t *testing.T) {
 		closeAtEnd(t, s)
 		err := s.Handshake(t.Context())
 		appErr, ok := errors.FromError(err)
-		if !ok || appErr.Tag != TagCredentialsFailed || !appErr.HasRoute("tlsMain->Session.keyExchange.CredentialsFailed") || !errors.Is(err, cause) {
+		if !ok || appErr.Tag != TagCredentialsFailed || !appErr.HasRoute(routeTLS+"->Session.keyExchange.CredentialsFailed") || !errors.Is(err, cause) {
 			t.Fatalf("Handshake = %v, want %s", err, TagCredentialsFailed)
 		}
 	})
@@ -745,12 +749,12 @@ func TestPushedOptionsThatEndTheSession(t *testing.T) {
 		tag   string
 		route string
 	}{
-		{"PUSH_REPLY,compress lz4", "UnsupportedPushedOption", "control->Pushed.Add->Pushed.apply.UnsupportedPushedOption"},
-		{"PUSH_REPLY,cipher AES-256-CBC", "UnsupportedPushedOption", "Pushed.apply.UnsupportedPushedOption"},
-		{"PUSH_REPLY,cipher AES-192-GCM", "CipherNegotiationFailed", "Pushed.apply.CipherNegotiationFailed"},
-		{"PUSH_REPLY,tun-mtu 5", "BadPushedOption", "Pushed.apply.BadPushedOption"},
-		{"PUSH_REPLY,topology subnet,ifconfig 10.8.0.2 255.0.255.0", "BadPushedOption", "control->Pushed.Finish.BadPushedOption"},
-		{"PUSH_REPLY,push-continuation 7", "BadPushedOption", "control->ParsePushReply.BadPushedOption"},
+		{"PUSH_REPLY,compress lz4", "UnsupportedPushedOption", routeControl + "->Pushed.Add->Pushed.apply.UnsupportedPushedOption"},
+		{"PUSH_REPLY,cipher AES-256-CBC", "UnsupportedPushedOption", routeControl + "->Pushed.Add->Pushed.apply.UnsupportedPushedOption"},
+		{"PUSH_REPLY,cipher AES-192-GCM", "CipherNegotiationFailed", routeControl + "->Pushed.Add->Pushed.apply.CipherNegotiationFailed"},
+		{"PUSH_REPLY,tun-mtu 5", "BadPushedOption", routeControl + "->Pushed.Add->Pushed.apply.BadPushedOption"},
+		{"PUSH_REPLY,topology subnet,ifconfig 10.8.0.2 255.0.255.0", "BadPushedOption", routeControl + "->Pushed.Finish.BadPushedOption"},
+		{"PUSH_REPLY,push-continuation 7", "BadPushedOption", routeControl + "->ParsePushReply.BadPushedOption"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.reply, func(t *testing.T) {
@@ -796,7 +800,7 @@ func TestControlChannelEndsAfterTheHandshake(t *testing.T) {
 		}
 		again := r.session.Handshake(t.Context())
 		appErr, ok := errors.FromError(again)
-		if !ok || appErr.Tag != TagControlChannelFailed || !appErr.HasRoute("controlLoop.ControlChannelFailed") || appErr.Metadata["op"] != "read" {
+		if !ok || appErr.Tag != TagControlChannelFailed || !appErr.HasRoute(routeTLS+"->Session.controlLoop.ControlChannelFailed") || appErr.Metadata["op"] != "read" {
 			t.Fatalf("Handshake after the server ended the session = %v, want %s", again, TagControlChannelFailed)
 		}
 	})
@@ -807,7 +811,7 @@ func TestControlMessageThatNeverEndsIsRefused(t *testing.T) {
 		r := pushRig(t, vpntest.ServerOptions{PushMessages: []string{strings.Repeat("a", 3*maxControlMessage)}})
 		err := r.session.Handshake(t.Context())
 		appErr, ok := errors.FromError(err)
-		if !ok || appErr.Tag != tagControlMessageTooLong || !appErr.HasRoute("controlLoop.ControlMessageTooLong") {
+		if !ok || appErr.Tag != tagControlMessageTooLong || !appErr.HasRoute(routeTLS+"->Session.controlLoop.ControlMessageTooLong") {
 			t.Fatalf("Handshake = %v, want %s", err, tagControlMessageTooLong)
 		}
 	})

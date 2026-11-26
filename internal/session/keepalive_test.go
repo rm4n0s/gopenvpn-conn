@@ -124,7 +124,7 @@ func TestSilenceEndsTheSession(t *testing.T) {
 				if elapsed := time.Since(start); elapsed < 59*time.Second || elapsed > 61*time.Second {
 					t.Errorf("Read gave up after %v, want about 60s", elapsed)
 				}
-				wantRoute(t, errRead, TagPingTimeout, "Session.loop->Session.keepaliveTick.PingTimeout")
+				wantRoute(t, errRead, TagPingTimeout, routeStart+"Session.loop->Session.keepaliveTick.PingTimeout")
 				appErr, _ := errors.FromError(errRead)
 				if appErr.Metadata["timeout"] != "1m0s" {
 					t.Errorf("metadata = %v", appErr.Metadata)
@@ -169,7 +169,7 @@ func TestForgeriesDoNotKeepTheSessionAlive(t *testing.T) {
 		synctest.Wait()
 		// The one good packet was read; now the second Read waits and the silence ends it.
 		_, err = r.session.Read(make([]byte, 10))
-		wantRoute(t, err, TagPingTimeout, "Session.loop->Session.keepaliveTick.PingTimeout")
+		wantRoute(t, err, TagPingTimeout, routeStart+"Session.loop->Session.keepaliveTick.PingTimeout")
 		if rerr := <-done; rerr != nil {
 			t.Errorf("the first Read = %v, want the packet that the server sent", rerr)
 		}
@@ -185,7 +185,7 @@ func TestKeepaliveOfTheOptionsWhenNothingIsPushed(t *testing.T) {
 			}
 			start := time.Now()
 			_, err := r.session.Read(make([]byte, 10))
-			wantRoute(t, err, TagPingTimeout, "Session.loop->Session.keepaliveTick.PingTimeout")
+			wantRoute(t, err, TagPingTimeout, routeStart+"Session.loop->Session.keepaliveTick.PingTimeout")
 			if elapsed := time.Since(start); elapsed < 19*time.Second || elapsed > 21*time.Second {
 				t.Errorf("gave up after %v, want about 20s", elapsed)
 			}
@@ -202,7 +202,7 @@ func TestKeepaliveOfTheOptionsWhenNothingIsPushed(t *testing.T) {
 			}
 			start := time.Now()
 			_, err := r.session.Read(make([]byte, 10))
-			wantRoute(t, err, TagPingTimeout, "Session.loop->Session.keepaliveTick.PingTimeout")
+			wantRoute(t, err, TagPingTimeout, routeStart+"Session.loop->Session.keepaliveTick.PingTimeout")
 			if elapsed := time.Since(start); elapsed < 59*time.Second {
 				t.Errorf("gave up after %v: the 5 seconds of the options won over the pushed 60", elapsed)
 			}

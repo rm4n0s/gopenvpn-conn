@@ -114,6 +114,42 @@ func TestHandshakeWithTLSFailsForACertificateOfAnotherAuthority(t *testing.T) {
 	})
 }
 
+// TestTheCauseOfAFailedTLSHandshakeHasItsRoute: the check of the server's certificate
+// runs inside crypto/tls, in the TLS goroutine of the Conn, and its error is the cause
+// inside the TagTLSHandshakeFailed that HandshakeContext returns. errors.All gives
+// both, and the route of each begins at the HandshakeContext that started the Conn.
+func TestTheCauseOfAFailedTLSHandshakeHasItsRoute(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pki := servertest.NewPKI(t)
+		link, _ := tlsPair(t, kinds[0], protections()[0], serverTLS(pki, pki.ServerCert))
+		conn := PacketClient(link, &Config{TLS: NewTLSConfig(TLSOptions{
+			RootCAs: pki.CAPool, Certificates: []tls.Certificate{pki.ClientCert},
+			VerifyName: "another-server", VerifyNameMatch: MatchCommonName,
+		})})
+		closeAtEnd(t, conn)
+		err := conn.HandshakeContext(t.Context())
+		if appErr, ok := errors.FromError(err); !ok || appErr.Tag != TagTLSHandshakeFailed {
+			t.Fatalf("HandshakeContext = %v, want %s", err, TagTLSHandshakeFailed)
+		}
+		if !errors.Is(err, &errors.Error{Tag: TagServerNameMismatch}) {
+			t.Errorf("the cause is not %s: %v", TagServerNameMismatch, err)
+		}
+		all := errors.All(err)
+		if len(all) != 2 || all[0].Tag != TagTLSHandshakeFailed || all[1].Tag != TagServerNameMismatch {
+			t.Fatalf("errors.All = %v, want %s and its cause %s", all, TagTLSHandshakeFailed, TagServerNameMismatch)
+		}
+		const routeToTLSMain = "Conn.HandshakeContext->Session.Handshake->Session.start->Session.startTLS->Session.startTLS.func1->Session.tlsMain"
+		if !all[0].HasRoute(routeToTLSMain + ".TLSHandshakeFailed") {
+			t.Errorf("unexpected failure path: %s", all[0].Route())
+		}
+		// Between tlsMain and the check are the functions of crypto/tls, which are not
+		// this library's to name: the route is checked at its two ends.
+		if !all[1].HasRoute(routeToTLSMain+"->") || !all[1].HasRoute("verifyServer->checkName.ServerNameMismatch") {
+			t.Errorf("unexpected failure path of the cause: %s", all[1].Route())
+		}
+	})
+}
+
 func TestNewTLSConfig(t *testing.T) {
 	pki, other := servertest.NewPKI(t), servertest.NewPKI(t)
 	parse := func(der []byte) *x509.Certificate {

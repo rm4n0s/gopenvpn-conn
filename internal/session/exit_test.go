@@ -275,7 +275,7 @@ func TestServerEXITBeforeTheHandshakeIsComplete(t *testing.T) {
 		r := newTLSRig(t, tlsOptions{rigOptions: rigOptions{transport: transports[0], wrap: wrapKinds[0],
 			server: vpntest.ServerOptions{EarlyMessages: []string{"EXIT"}, PushMessages: []string{}}}})
 		err := r.session.Handshake(t.Context())
-		wantRoute(t, err, TagServerExit, "Session.serverExited.ServerExit")
+		wantRoute(t, err, TagServerExit, routeControl+"->Session.serverExited.ServerExit")
 	})
 }
 

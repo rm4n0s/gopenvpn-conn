@@ -74,7 +74,7 @@ Before reporting a task as finished, run `gofmt`, `go vet ./...`, `golangci-lint
 - Security rules (SPEC §15): random bytes come from `crypto/rand`; MACs are compared with `hmac.Equal`; a packet is authenticated before anything in it is used; no key, password or token goes into a log line, an error message or error metadata
 
 ## Error handling
-Use `github.com/rm4n0s/errors` (v0.2.0) for all errors, the way its `AI_GUIDE.md` says. This is a requirement of the project owner: read the whole guide (it is in the module cache, `$(go env GOMODCACHE)/github.com/rm4n0s/errors@v0.2.0/AI_GUIDE.md`) before you write or change code that makes, returns, logs or tests an error, and again when the dependency version changes. SPEC §14 lists the rules with the reasons, and the error rules check enforces them. Never use `fmt.Errorf`, and never import the standard library `errors` package under the name `errors`: this package re-exports `errors.Is`, `errors.As` and `errors.Unwrap`, so a single import covers everything (if `Join` is needed, import the standard one as `stdErrors "errors"`).
+Use `github.com/rm4n0s/errors` (v0.3.1) for all errors, the way its `AI_GUIDE.md` says. This is a requirement of the project owner: read the whole guide (it is in the module cache, `$(go env GOMODCACHE)/github.com/rm4n0s/errors@v0.3.1/AI_GUIDE.md`) before you write or change code that makes, returns, logs or tests an error, and again when the dependency version changes. SPEC §14 lists the rules with the reasons, and the error rules check enforces them. Never use `fmt.Errorf`, and never import the standard library `errors` package under the name `errors`: this package re-exports `errors.Is`, `errors.As`, `errors.Unwrap` and `errors.Join`, so a single import covers everything (if something else of the standard package is needed, import it as `stdErrors "errors"`).
 
 **The one deviation (SPEC §5.3, D2).** Where a standard library contract names an exact error value, that value is returned untouched: `io.EOF`, `net.ErrClosed` and `os.ErrDeadlineExceeded` from the `Read`, `Write` and deadline methods of `*openvpn.Conn`, and whatever gVisor's `gonet` returns from the connections of `vpnnet`. Callers and the standard library compare these with `==` or assert `net.Error`. Everything else is tagged.
 
@@ -92,8 +92,18 @@ Use `github.com/rm4n0s/errors` (v0.2.0) for all errors, the way its `AI_GUIDE.md
 - Functions return the plain `error` interface, never `*errors.Error`
 - The error that ends a connection is made once, in the goroutine that found it, and every later `Read` and `Write` returns that same value
 
+**Goroutines** (rule R7 of the guide; SPEC §14.1 rule 12 and §14.2)
+- A goroutine has its own call stack, so an error that is made in it has a route with no parent. Work whose error leaves its goroutine (another goroutine returns it, stores it, logs it or shows it) is handed off: `work := errors.Async(fn)` in the function that starts the goroutine, never inside the goroutine, and the goroutine runs `work()`. The route then reads as if `fn` had been called there: `Session.Handshake->Session.start->Session.loop.HandshakeTimeout`. `internal/session` does it in `Session.start` and `Session.startTLS`, and `vpnnet` in `New`
+- `fn` returns its error. The error is stored, sent on a channel or given to another goroutine only after `work()` has returned it: the hand-off gives the error its route when the work returns it, and an error that is stored before has the short route until then. So a goroutine of a session never calls `Session.fail` from inside its work: it returns the error, and its `run...` function stores it
+- An error that another goroutine already holds may still come back through a hand-off: the stack is replaced as a whole and reading the route at the same moment is safe (errors v0.3.1), but the holder sees the route grow. The one case here is the error that a `Write` of the `Conn` makes in the writer of a `vpnnet.Net`: the session stores it, and a moment later the hand-off of `New` puts `New` in front of its route
+- Work that was handed off may hand more work off. The route has both parents only when the error returns through both hand-offs; when it does not return through the outer one, the route starts at the function that the outer goroutine ran. So the TLS goroutine of a renegotiation, which the loop starts, gives its error to the loop, and the loop returns it; and the hand-off of the sender of `PUSH_REQUEST` is made in `Session.start`, not in the TLS goroutine that starts it
+- `errors.AsyncRecover` returns a panic of the goroutine as an error (Tag `errors.TagPanic`). Nothing in this module turns a panic into an error, so nothing uses it: it changes a crash into an error, which is a decision of the owner. Ask first
+- When several goroutines can fail and all of their errors are wanted, collect what they return and combine it with `errors.Join`; the caller of a joined error reads it with `errors.All`. A connection ends with one error (SPEC §14.2), so nothing in this module joins errors today
+- An `*errors.Error` is not safe for concurrent use: no `SetMetadata`, `RemoveMetadata` or `SetMessage` on an error that another goroutine can still reach (`Dial` adds its metadata to the error of a session after `Close` has returned, when no goroutine of it runs)
+
 **Inspecting errors**
-- `appErr, ok := errors.FromError(err)`, then use `appErr.Tag`, `appErr.Metadata`, `appErr.Message`
+- `appErr, ok := errors.FromError(err)`, then use `appErr.Tag`, `appErr.Metadata`, `appErr.Message`. It is a plain type assertion: it does not look inside a wrapped or joined error
+- `errors.All(err)` returns every `*errors.Error` in the tree of an error, outermost first: the `TagTLSHandshakeFailed` of a handshake and, inside it, the error of the check of the server's certificate that caused it
 - Branch on the tag constant or on `errors.Is(err, sentinel)`, never on a string literal, `Message` or `Error()`
 
 **Logging errors**
@@ -107,11 +117,12 @@ Use `github.com/rm4n0s/errors` (v0.2.0) for all errors, the way its `AI_GUIDE.md
   if !ok {
       t.Fatalf("expected *errors.Error, got %T", err)
   }
-  if !appErr.HasRoute("Conn.HandshakeContext->Conn.threeWay.HandshakeTimeout") {
+  if !appErr.HasRoute("Conn.HandshakeContext->Session.Handshake->Session.start->Session.loop.HandshakeTimeout") {
       t.Errorf("unexpected failure path: %s", appErr.Route())
   }
   ```
-- A route lists the call chain from outermost to innermost (`Type.Method` or `Func`, joined by `->`, no package names) and ends with the Tag. Print `appErr.Route()` when an assertion fails
+- A route lists the call chain from outermost to innermost (`Type.Method` or `Func`, joined by `->`, no package names) and ends with the Tag. It has no frame of the Go runtime (`goexit`, `main`). Print `appErr.Route()` when an assertion fails
+- The route of an error that a goroutine made is asserted across the hand-off, from the function that the test calls down to the Tag, as above: the `go` statement and the `errors` package are not in it. `internal/session/route_test.go` has one case for each goroutine of a session, and the constants `routeStart`, `routeTLS` and `routeControl` for the tests of that package
 
 ## Git and GitHub
 - Never commit or push directly to `main`; work on a branch named `feat/...` or `fix/...`

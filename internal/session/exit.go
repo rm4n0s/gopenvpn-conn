@@ -94,15 +94,16 @@ func (s *Session) goodbye() {
 	}
 }
 
-// serverExited ends the session cleanly because the server left: io.EOF once the
-// handshake is complete (the value that a Read at the end of a stream returns, SPEC
-// §5.3), a tagged error before, when there is no caller of Read yet to tell it to.
-func (s *Session) serverExited() {
+// serverExited is the clean end of the session because the server left. It returns
+// what the session ends with: io.EOF once the handshake is complete (the value that a
+// Read at the end of a stream returns, SPEC §5.3), a tagged error before, when there
+// is no caller of Read yet to tell it to.
+func (s *Session) serverExited() error {
 	select {
 	case <-s.ready:
-		s.fail(io.EOF)
+		return io.EOF
 	default:
-		s.fail(errors.New(TagServerExit, "the server ended the session before the handshake was complete"))
+		return errors.New(TagServerExit, "the server ended the session before the handshake was complete")
 	}
 }
 

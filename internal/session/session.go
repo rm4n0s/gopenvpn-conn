@@ -152,6 +152,7 @@ type Session struct {
 	readErr      chan error
 	out          chan outMsg   // from the TLS sessions to the loop: what crypto/tls wrote
 	events       chan keyEvent // from the TLS sessions of the renegotiations to the loop
+	push         func() error  // the sender of PUSH_REQUEST, handed off by start; the TLS goroutine of key id 0 runs it
 	ks0          *keyState     // the control channel of key id 0
 	tlsReady     chan struct{} // closed when the TLS handshake is complete
 	tlsConn      *tls.Conn     // the TLS session of key id 0; set before tlsReady is closed
@@ -344,16 +345,108 @@ func (s *Session) result() error {
 }
 
 // start launches the goroutines. The caller holds s.mu.
+//
+// The work of each goroutine is handed off with errors.Async, here, in the goroutine
+// of the Handshake that starts the session: the error that ends the session is made
+// in one of these goroutines and returned by the Handshake, Read and Write of others,
+// and its route then begins at that Handshake and not at the top of a goroutine
+// (SPEC §14.2). For that, the work returns its error, and it is stored (fail) only
+// after it has passed through the hand-off, which gives the error its route: no
+// other goroutine sees the error with the route of the goroutine alone.
 func (s *Session) start() {
 	s.started = true
 	s.began = time.Now()
+	read := errors.Async(s.readLoop)
+	loop := errors.Async(s.loop)
+	closeLink := errors.Async(s.closeLink)
+	write := errors.Async(s.writeLoop)
+	// The TLS goroutine of key id 0 starts the sender of PUSH_REQUEST. Its hand-off is
+	// made here all the same: made in that goroutine, which runs under a hand-off
+	// itself, it would give a route that begins there and not at the Handshake, because
+	// the error does not return through the TLS goroutine.
+	s.push = errors.Async(s.pushRequests)
 	s.wg.Add(3)
-	go s.readLoop()
-	go s.loop()
-	go s.writeLoop()
+	go s.runRead(read)
+	go s.runLoop(loop, closeLink)
+	go s.runWrite(write)
 	if !s.opts.ResetOnly {
-		s.wg.Add(1)
-		go s.tlsMain(s.ks0)
+		s.startTLS(s.ks0)
+	}
+}
+
+// runRead is the goroutine of the reader of the link: the error that ended the
+// reading goes to the loop.
+func (s *Session) runRead(read func() error) {
+	defer s.wg.Done()
+	if err := read(); err != nil {
+		s.readErr <- err // room for one, and this is the only one
+	}
+}
+
+// runLoop is the goroutine of the loop: the error that the loop returns ends the
+// session, and then the link is closed.
+func (s *Session) runLoop(loop, closeLink func() error) {
+	defer s.wg.Done()
+	if err := loop(); err != nil {
+		s.fail(err)
+	}
+	if err := closeLink(); err != nil {
+		s.mu.Lock()
+		s.closeErr = err
+		s.mu.Unlock()
+	}
+}
+
+// runWrite is the goroutine of the writer of the link: a write that fails for good
+// ends the session; then, after Close, what the loop still gave it goes out.
+func (s *Session) runWrite(write func() error) {
+	defer s.wg.Done()
+	defer close(s.ctlDone)
+	if err := write(); err != nil {
+		s.fail(err)
+	}
+	s.drainCtl()
+}
+
+// startTLS starts the goroutine of the TLS session of a key state: start for key
+// id 0, and the loop for a renegotiation (beginKey).
+func (s *Session) startTLS(ks *keyState) {
+	made := false // the key exchange is done; the new goroutine alone sets and reads it
+	work := errors.Async(func() error { return s.tlsMain(ks, &made) })
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := work(); err != nil {
+			s.tlsEnded(ks, err, made)
+		}
+	}()
+}
+
+// tlsEnded takes the error that ended the TLS goroutine of a key state. For key id 0
+// it ends the session. For a renegotiation it goes to the loop, which returns it: the
+// loop started that goroutine while it ran under its own hand-off, so the route of
+// the error is whole (from the Handshake that started the session, through the loop
+// and beginKey) only when the error returns through the hand-off of the loop too;
+// otherwise it would begin at the loop.
+// made says that the key exchange was done: the error is then one that ends the
+// session whatever became of the key state, and before that it is the failure of the
+// renegotiation.
+func (s *Session) tlsEnded(ks *keyState, err error, made bool) {
+	if ks.id == 0 {
+		s.fail(err)
+		return
+	}
+	select {
+	case s.events <- keyEvent{ks: ks, err: err, ends: made}:
+	case <-s.done:
+	}
+}
+
+// runPush is the goroutine of the sender of PUSH_REQUEST.
+func (s *Session) runPush() {
+	defer s.wg.Done()
+	if err := s.push(); err != nil {
+		s.fail(err)
 	}
 }
 

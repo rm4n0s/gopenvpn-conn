@@ -28,12 +28,14 @@ import (
 // events, and the data channel tells it with requestRenegotiation.
 
 // keyEvent is what the TLS goroutine of a renegotiation tells the loop: the TLS
-// session is made and the key exchange done (conn and state), or it failed (err).
+// session is made and the key exchange done (conn and state), or it failed (err), or,
+// with ends, it met an error that ends the session after its key was made (err).
 type keyEvent struct {
 	ks    *keyState
 	conn  *tls.Conn
 	state tls.ConnectionState
 	err   error
+	ends  bool
 }
 
 // wakeLoop makes the loop look at what changed.
@@ -111,9 +113,9 @@ func (s *Session) dueAt() (time.Time, bool) {
 
 // renegTick does what is due: it gives up a renegotiation that takes too long, drops
 // the keys that are past their end, starts a renegotiation when the key in use is due
-// to be replaced, and chooses the key that data is sealed with. It reports false when
-// the session has failed.
-func (s *Session) renegTick() bool {
+// to be replaced, and chooses the key that data is sealed with. It returns the error
+// that ends the session, or nil.
+func (s *Session) renegTick() error {
 	now := time.Now()
 	p := s.primary
 	if p.established.IsZero() && !now.Before(s.attemptEnd) {
@@ -121,9 +123,8 @@ func (s *Session) renegTick() bool {
 		// no other soft reset of it (ssl.c tls_multi_process: move_session to the lame
 		// duck; tls_pre_decrypt: "stale session-id", "key IDs out of sync"): a retry in
 		// this session cannot work, so the session ends and the caller dials again.
-		s.fail(errors.New(TagRenegotiationFailed, "a renegotiation did not finish in time",
-			"key_id", p.id, "timeout", s.opts.HandshakeTimeout.String()))
-		return false
+		return errors.New(TagRenegotiationFailed, "a renegotiation did not finish in time",
+			"key_id", p.id, "timeout", s.opts.HandshakeTimeout.String())
 	}
 	if l := s.lame; l != nil && !l.mustDie.IsZero() && !now.Before(l.mustDie) {
 		if p.established.IsZero() {
@@ -142,22 +143,21 @@ func (s *Session) renegTick() bool {
 				id = id%datachan.MaxKeyID + 1
 			}
 			if _, err := s.beginKey(id, now); err != nil {
-				s.fail(err)
-				return false
+				return err
 			}
 		}
 	}
 	if s.dirty || (!s.sendAt.IsZero() && !now.Before(s.sendAt)) {
 		s.updateTable(now)
 	}
-	return true
+	return nil
 }
 
-// expired ends the session: the key in use is past its end and there is no other.
-func (s *Session) expired(ks *keyState) bool {
-	s.fail(errors.New(TagRenegotiationFailed, "the key reached the end of its life and no new key was made",
-		"key_id", ks.id))
-	return false
+// expired is the end of the session when the key in use is past its end and there is
+// no other: it returns the error that ends it.
+func (s *Session) expired(ks *keyState) error {
+	return errors.New(TagRenegotiationFailed, "the key reached the end of its life and no new key was made",
+		"key_id", ks.id)
 }
 
 // renegWait is the next time that renegTick has something to do.
@@ -221,24 +221,19 @@ func (s *Session) beginKey(id uint8, now time.Time) (*keyState, error) {
 		s.rekey.Store(&under)
 	}
 	s.log.Debug("a renegotiation began", "key_id", id)
-	s.wg.Add(1)
-	go s.tlsMain(ks)
+	s.startTLS(ks)
 	return ks, nil
 }
 
 // acceptSoftReset starts a renegotiation that the server began: a soft reset of a key
 // id that is free, while the newest key is complete (OpenVPN takes it in no other
-// state). It returns nil when the soft reset is not accepted.
-func (s *Session) acceptSoftReset(id uint8) *keyState {
+// state). It returns no key state when the soft reset is not accepted, and the error
+// that ends the session when the new key cannot be begun.
+func (s *Session) acceptSoftReset(id uint8) (*keyState, error) {
 	if s.primary.established.IsZero() || s.keys[id] != nil || id == 0 {
-		return nil
+		return nil, nil
 	}
-	ks, err := s.beginKey(id, time.Now())
-	if err != nil {
-		s.fail(err)
-		return nil
-	}
-	return ks
+	return s.beginKey(id, time.Now())
 }
 
 // dropKey throws away a key that is past its end: the data key and the control state.
@@ -251,26 +246,31 @@ func (s *Session) dropKey(ks *keyState) {
 	s.dirty = true
 }
 
-// onKeyEvent takes what the TLS goroutine of a renegotiation says.
-func (s *Session) onKeyEvent(ev keyEvent) {
+// onKeyEvent takes what the TLS goroutine of a renegotiation says. It returns the
+// error that ends the session, or nil.
+func (s *Session) onKeyEvent(ev keyEvent) error {
 	ks := ev.ks
+	if ev.ends {
+		// The control channel of a key that was made met what ends the session (the
+		// server's HALT, a TLS session that broke): it is the loop that returns it, for
+		// the route of the error (tlsEnded).
+		return ev.err
+	}
 	if s.keys[ks.id] != ks || ks != s.primary || !ks.established.IsZero() {
-		return // a key state that is gone
+		return nil // a key state that is gone
 	}
 	now := time.Now()
 	if ev.err != nil {
 		// The session ends with what made the renegotiation fail: see renegTick for
 		// why it is not tried again.
 		s.log.Warn("a renegotiation failed", "key_id", ks.id, "err", ev.err)
-		s.fail(ev.err)
-		return
+		return ev.err
 	}
 	d := s.data.Load()
 	dk, err := s.makeKey(d, ks.id, &ev.state)
 	if err != nil {
 		s.log.Warn("a renegotiation failed", "key_id", ks.id, "err", err)
-		s.fail(err)
-		return
+		return err
 	}
 	ks.dk, ks.tlsConn = dk, ev.conn
 	s.ctlTLS.Store(ev.conn)
@@ -279,6 +279,7 @@ func (s *Session) onKeyEvent(ev keyEvent) {
 	}
 	s.keyMade(ks, now)
 	s.log.Debug("a renegotiation is done", "key_id", ks.id)
+	return nil
 }
 
 // updateTable publishes the keys that are valid, and chooses the one to seal with:

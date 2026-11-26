@@ -98,7 +98,9 @@ func TestKeyExchangeWithRealServer(t *testing.T) {
 			if !ok || appErr.Tag != TagAuthFailed {
 				t.Fatalf("Dial = %v, want %s\nserver log:\n%s", err, TagAuthFailed, srv.Log())
 			}
-			if !strings.HasSuffix(appErr.Route(), "control.AuthFailed") {
+			// The TLS goroutine of the Conn read the server's AUTH_FAILED; the route begins
+			// at the Dial that started the Conn.
+			if !appErr.HasRoute("Dial->Dialer.Dial->Conn.HandshakeContext->Session.Handshake->Session.start->Session.startTLS->Session.startTLS.func1->Session.tlsMain->Session.controlLoop->Session.control.AuthFailed") {
 				t.Errorf("route = %s", appErr.Route())
 			}
 			t.Logf("the server's reason: %q", appErr.Metadata["reason"])

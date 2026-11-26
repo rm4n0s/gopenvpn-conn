@@ -192,7 +192,7 @@ func TestDatagramWriteErrorsDoNotEndTheSession(t *testing.T) {
 			synctest.Wait()
 			link.set(func(c *faultConn) { c.writeErr = syscall.ENETUNREACH })
 			_, err := r.session.Read(make([]byte, 10))
-			wantRoute(t, err, TagPingTimeout, "Session.keepaliveTick.PingTimeout")
+			wantRoute(t, err, TagPingTimeout, routeStart+"Session.loop->Session.keepaliveTick.PingTimeout")
 		})
 	})
 	t.Run("with no keepalive timeout, writes that fail for two minutes end it", func(t *testing.T) {
@@ -224,7 +224,7 @@ func TestDatagramWriteErrorsDoNotEndTheSession(t *testing.T) {
 			link.set(func(c *faultConn) { c.writeErr = syscall.ENETUNREACH })
 			start := time.Now()
 			err := r.session.Handshake(t.Context())
-			wantRoute(t, err, TagLinkFailed, "Session.writeLoop->Session.writeLink.LinkFailed")
+			wantRoute(t, err, TagLinkFailed, routeStart+"Session.writeLoop->Session.writeLink.LinkFailed")
 			if !errors.Is(err, syscall.ENETUNREACH) || time.Since(start) != 0 {
 				t.Errorf("Handshake = %v after %v", err, time.Since(start))
 			}
@@ -250,7 +250,7 @@ func TestStuckStreamLink(t *testing.T) {
 			wrote := make(chan error, 1)
 			go func() { _, err := r.session.Write([]byte{0x45, 1}); wrote <- err }()
 			_, err := r.session.Read(make([]byte, 10))
-			wantRoute(t, err, TagPingTimeout, "Session.keepaliveTick.PingTimeout")
+			wantRoute(t, err, TagPingTimeout, routeStart+"Session.loop->Session.keepaliveTick.PingTimeout")
 			if elapsed := time.Since(start); elapsed < 59*time.Second || elapsed > 61*time.Second {
 				t.Errorf("the session ended after %v, want the ping-restart of 60 s", elapsed)
 			}
@@ -403,7 +403,7 @@ func TestServerPollTimeout(t *testing.T) {
 				})
 				start := time.Now()
 				err := r.session.Handshake(t.Context())
-				wantRoute(t, err, TagServerPollTimeout, "Session.loop.ServerPollTimeout")
+				wantRoute(t, err, TagServerPollTimeout, routeStart+"Session.loop.ServerPollTimeout")
 				if elapsed := time.Since(start); elapsed != 4*time.Second {
 					t.Errorf("%s: failed after %v, want 4s", tr.name, elapsed)
 				}

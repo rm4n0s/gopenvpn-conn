@@ -19,9 +19,9 @@ import (
 )
 
 // readLoop reads packets from the link and gives them to the loop, each in a
-// slice of its own. It returns when the link fails or the session has ended.
-func (s *Session) readLoop() {
-	defer s.wg.Done()
+// slice of its own. It returns when the link fails, with the error of that, or
+// when the session has ended, with nil.
+func (s *Session) readLoop() error {
 	buf := make([]byte, maxPacket)
 	failures := 0 // read errors of a datagram link in a row, none of which was a packet
 	var br *bufio.Reader
@@ -49,10 +49,10 @@ func (s *Session) readLoop() {
 			}
 			select {
 			case <-s.done: // the link was closed by the session: not a failure
+				return nil
 			default:
-				s.readErr <- errors.NewErr(TagLinkFailed, err).SetMetadata("op", "read")
+				return errors.NewErr(TagLinkFailed, err).SetMetadata("op", "read")
 			}
-			return
 		}
 		failures = 0
 		pb := s.packetFor(buf[:n])
@@ -60,7 +60,7 @@ func (s *Session) readLoop() {
 		case s.in <- pb:
 		case <-s.done:
 			s.pool.put(pb)
-			return
+			return nil
 		}
 	}
 }
@@ -111,11 +111,10 @@ func (s *Session) transientRead(err error, failures *int) bool {
 }
 
 // loop owns the state: it handles the packets that the reader gives it, sends
-// what is due, and runs the timers. It closes the link when it returns.
-func (s *Session) loop() {
-	defer s.wg.Done()
-	defer s.closeLink()
-
+// what is due, and runs the timers. It returns the error that ends the session, or
+// nil when the session has ended without it (another goroutine's failure, or
+// Close); its goroutine stores the error and closes the link (runLoop).
+func (s *Session) loop() error {
 	handshake := time.NewTimer(s.opts.HandshakeTimeout)
 	defer handshake.Stop()
 	deadline := s.began.Add(s.opts.HandshakeTimeout)
@@ -140,8 +139,7 @@ func (s *Session) loop() {
 	}
 
 	if _, err := s.ks0.sender.Queue(s.ks0.resetOp, nil); err != nil {
-		s.fail(err)
-		return
+		return err
 	}
 	complete := false
 	tlsReady := s.tlsReady // nil once it has fired, and in ResetOnly mode
@@ -149,12 +147,13 @@ func (s *Session) loop() {
 		tlsReady = nil
 	}
 	for {
-		if complete && !s.opts.ResetOnly && !s.renegTick() {
-			return
+		if complete && !s.opts.ResetOnly {
+			if err := s.renegTick(); err != nil {
+				return err
+			}
 		}
 		if err := s.flush(); err != nil {
-			s.fail(err)
-			return
+			return err
 		}
 		if !s.drainedClosed && s.exitSent.Load() && s.settled() {
 			s.drainedClosed = true // EXIT, and all that came before it, is acknowledged
@@ -193,14 +192,19 @@ func (s *Session) loop() {
 		}
 		select {
 		case <-s.done:
-			return
+			return nil
 		case pb := <-s.in:
-			s.handle(pb.b)
+			err := s.handle(pb.b)
 			s.pool.put(pb)
+			if err != nil {
+				return err
+			}
 		case m := <-s.out:
 			s.take(m)
 		case ev := <-s.events:
-			s.onKeyEvent(ev)
+			if err := s.onKeyEvent(ev); err != nil {
+				return err
+			}
 		case <-tlsReady:
 			tlsReady = nil
 		case <-s.extend:
@@ -212,25 +216,22 @@ func (s *Session) loop() {
 				handshake.Reset(time.Until(at))
 			}
 		case err := <-s.readErr:
-			s.fail(err)
-			return
+			return err
 		case <-poll:
 			poll = nil
 			if !s.haveRemote {
-				s.fail(errors.New(TagServerPollTimeout, "the server did not answer in time",
-					"timeout", s.opts.ServerPollTimeout.String()))
-				return
+				return errors.New(TagServerPollTimeout, "the server did not answer in time",
+					"timeout", s.opts.ServerPollTimeout.String())
 			}
 		case <-handshake.C:
-			s.fail(errors.New(TagHandshakeTimeout, "the handshake did not finish in time",
-				"timeout", s.opts.HandshakeTimeout.String()))
-			return
+			return errors.New(TagHandshakeTimeout, "the handshake did not finish in time",
+				"timeout", s.opts.HandshakeTimeout.String())
 		case <-retransmit.C:
 		case <-reneg.C:
 		case <-s.wake:
 		case <-keepalive.C:
-			if !s.keepaliveTick() {
-				return
+			if err := s.keepaliveTick(); err != nil {
+				return err
 			}
 		}
 	}
@@ -239,8 +240,8 @@ func (s *Session) loop() {
 // closeLink closes the link, once the loop is done with it. After Close (not after a
 // failure) the writer of the link first sends what the loop gave it, for at most
 // exitWait: the write deadline that is set here ends a write that the link does not
-// take.
-func (s *Session) closeLink() {
+// take. It returns the error of closing the link, which Close returns.
+func (s *Session) closeLink() error {
 	close(s.loopDone)
 	if s.closing.Load() {
 		if err := s.opts.Link.SetWriteDeadline(time.Now().Add(exitWait)); err == nil {
@@ -253,10 +254,9 @@ func (s *Session) closeLink() {
 		}
 	}
 	if err := s.opts.Link.Close(); err != nil {
-		s.mu.Lock()
-		s.closeErr = errors.NewErr(tagLinkCloseFailed, err)
-		s.mu.Unlock()
+		return errors.NewErr(tagLinkCloseFailed, err)
 	}
+	return nil
 }
 
 // take keeps what crypto/tls wrote to the conn of a key state, until it is in packets.
@@ -394,22 +394,22 @@ func (s *Session) send(ks *keyState, c *wire.Control) error {
 
 // handle takes one packet from the link. Anyone can send a packet, so one that
 // does not belong is dropped, and nothing in it is used before it is shown to
-// be from the server: the protection first, then the session ids.
-func (s *Session) handle(raw []byte) {
+// be from the server: the protection first, then the session ids. It returns an
+// error only when the session ends with it.
+func (s *Session) handle(raw []byte) error {
 	if len(raw) > 0 {
 		if op, _ := wire.SplitFirstByte(raw[0]); op.IsData() {
-			s.handleData(raw)
-			return
+			return s.handleData(raw)
 		}
 	}
 	if len(raw) < 1+wire.SessionIDSize {
 		s.drop("too short", nil)
-		return
+		return nil
 	}
 	op, keyID := wire.SplitFirstByte(raw[0])
 	if !op.IsControl() {
 		s.drop("not a control packet", nil)
-		return
+		return nil
 	}
 	switch {
 	case op == wire.HardResetServerV2 && keyID == 0:
@@ -417,23 +417,23 @@ func (s *Session) handle(raw []byte) {
 	case op == wire.ControlV1 || op == wire.AckV1:
 	default:
 		s.drop("an opcode that only a client sends, or a reset of the wrong key id", nil)
-		return
+		return nil
 	}
 	ks := s.keys[keyID]
 	if ks == nil && op != wire.SoftResetV1 {
 		s.drop("a control packet of a key id that has no key state", nil)
-		return
+		return nil
 	}
 	wrap := s.wrapperFor(keyID)
 	body, err := wrap.Unwrap(raw)
 	if err != nil {
 		s.drop("the protection does not check", err)
-		return
+		return nil
 	}
 	c, err := wire.ParseControlBody(op, body)
 	if err != nil {
 		s.drop("does not parse", err)
-		return
+		return nil
 	}
 	copy(c.SessionID[:], raw[1:1+wire.SessionIDSize])
 	c.KeyID = keyID
@@ -441,34 +441,37 @@ func (s *Session) handle(raw []byte) {
 	if s.haveRemote {
 		if c.SessionID != s.remote {
 			s.drop("from another session", nil)
-			return
+			return nil
 		}
 	} else if op != wire.HardResetServerV2 {
 		s.drop("not a reset, and no session yet", nil)
-		return
+		return nil
 	}
 	if len(c.Acks) > 0 && c.RemoteSessionID != s.sid {
 		s.drop("acknowledges another session", nil)
-		return
+		return nil
 	}
 	isReset := op == wire.HardResetServerV2 || op == wire.SoftResetV1
 	if isReset && c.PacketID != 0 {
 		s.drop("a reset with an id that is not 0", nil)
-		return
+		return nil
 	}
 	if ks == nil {
 		// The server asks for a renegotiation: a soft reset of a key id that is free,
 		// once the key in use is complete. It is authentic here, so it is answered.
-		if ks = s.acceptSoftReset(keyID); ks == nil {
+		if ks, err = s.acceptSoftReset(keyID); err != nil {
+			return err
+		}
+		if ks == nil {
 			s.drop("a soft reset that is not accepted now", nil)
-			return
+			return nil
 		}
 	}
 	resend := false
 	if op == wire.HardResetServerV2 && !ks.peerReset && s.resetOp == wire.HardResetClientV3 {
 		if resend, err = wire.ParseEarlyNegotiation(c.Payload); err != nil {
 			s.drop("the payload of the reset does not parse", err)
-			return
+			return nil
 		}
 	}
 
@@ -482,18 +485,18 @@ func (s *Session) handle(raw []byte) {
 		ks.sender.Ack(id)
 	}
 	if op == wire.AckV1 {
-		return
+		return nil
 	}
 	if !s.opts.ResetOnly && ks.adapter.queued() >= inboundLimit {
 		// Not acknowledged, so the server sends it again when TLS has caught
 		// up. Its acknowledgements were taken above.
 		s.drop("the TLS side has not read what is waiting", nil)
-		return
+		return nil
 	}
 	payloads, ack := ks.receiver.Receive(c.PacketID, c.Payload)
 	if !ack {
 		s.drop("not accepted by the reliability layer", nil)
-		return
+		return nil
 	}
 	if isReset && !ks.peerReset {
 		ks.peerReset = true
@@ -506,8 +509,7 @@ func (s *Session) handle(raw []byte) {
 			// to send it with: an empty packet carries it, and the acknowledgement.
 			ks.wkcQueued = true
 			if _, err := ks.sender.Queue(wire.ControlWKCV1, nil); err != nil {
-				s.fail(err)
-				return
+				return err
 			}
 		}
 	}
@@ -518,25 +520,26 @@ func (s *Session) handle(raw []byte) {
 		}
 		ks.adapter.push(p)
 	}
+	return nil
 }
 
 // tlsMain runs the TLS handshake over the control channel of a key state, and then
-// reads its control messages. It is a goroutine of the session: it ends when the
-// session does, and when its key state is thrown away (the conn that crypto/tls
-// reads and writes then fails). A failure of key id 0 ends the session; a failure
-// of a renegotiation is told to the loop, which tries again later.
-func (s *Session) tlsMain(ks *keyState) {
-	defer s.wg.Done()
+// reads its control messages. It is the work of a goroutine of the session
+// (startTLS): it ends when the session does, and when its key state is thrown away
+// (the conn that crypto/tls reads and writes then fails). It returns the error that
+// ended it, or nil; *made is set once the key exchange is done. A failure of key id 0
+// ends the session; a failure of a renegotiation is told to the loop, which ends the
+// session with it (tlsEnded).
+func (s *Session) tlsMain(ks *keyState, made *bool) error {
 	conn := tls.Client(ks.adapter, s.tlsCfg)
 	if err := conn.Handshake(); err != nil {
-		s.keyFailed(ks, errors.NewErr(TagTLSHandshakeFailed, err))
-		return
+		return errors.NewErr(TagTLSHandshakeFailed, err)
 	}
 	kx, err := s.keyExchange(ks, conn)
 	if err != nil {
-		s.keyFailed(ks, err)
-		return
+		return err
 	}
+	*made = true
 	if ks.id == 0 {
 		s.tlsConn, s.serverKX = conn, kx
 		ks.tlsConn = conn
@@ -545,37 +548,25 @@ func (s *Session) tlsMain(ks *keyState) {
 		select {
 		case s.events <- keyEvent{ks: ks, conn: conn, state: conn.ConnectionState()}:
 		case <-s.done:
-			return
+			return nil
 		}
 	}
-	s.controlLoop(ks, conn)
-}
-
-// keyFailed ends the session for a failure of key id 0, and tells the loop about the
-// failure of a renegotiation.
-func (s *Session) keyFailed(ks *keyState, err error) {
-	if ks.id == 0 {
-		s.fail(err)
-		return
-	}
-	select {
-	case s.events <- keyEvent{ks: ks, err: err}:
-	case <-s.done:
-	}
+	return s.controlLoop(ks, conn)
 }
 
 // controlLoop reads the control messages that the server sends in TLS, for as
 // long as the session lives. The handshake is complete when the PUSH_REPLY is:
 // until then PUSH_REQUEST is sent every 5 seconds. Messages that are not yet
-// understood are ignored and logged by name only.
+// understood are ignored and logged by name only. It returns the error that ends
+// the session, or nil when the session or the key state ended first.
 //
 // OpenVPN: push.c send_push_request, incoming_push_message.
-func (s *Session) controlLoop(ks *keyState, conn *tls.Conn) {
+func (s *Session) controlLoop(ks *keyState, conn *tls.Conn) error {
 	var pushed ctrlmsg.Pushed
 	ready := ks.id != 0 // the push is of the first key only
 	if !ready {
 		s.wg.Add(1)
-		go s.pushRequests(conn)
+		go s.runPush()
 	}
 	buf := make([]byte, 1<<15)
 	var stream []byte // bytes read that do not make a whole message yet
@@ -588,12 +579,12 @@ func (s *Session) controlLoop(ks *keyState, conn *tls.Conn) {
 				switch {
 				case ks.closing.Load(): // the key was thrown away: this is how the read stops
 				case s.ctlTLS.Load() == conn:
-					s.fail(errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "read"))
+					return errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "read")
 				default:
 					s.log.Debug("the control channel of an old key ended", "key_id", ks.id, "err", err)
 				}
 			}
-			return
+			return nil
 		}
 		stream = append(stream, buf[:n]...)
 		// A message ends with a NUL and has none inside. OpenVPN's servers send
@@ -606,13 +597,12 @@ func (s *Session) controlLoop(ks *keyState, conn *tls.Conn) {
 			}
 			record := stream[:end+1]
 			stream = stream[end+1:]
-			if failed := s.control(record, &pushed, &ready); failed {
-				return
+			if err := s.control(record, &pushed, &ready); err != nil {
+				return err
 			}
 		}
 		if len(stream) > maxControlMessage {
-			s.fail(errors.New(tagControlMessageTooLong, "a control message is too long", "max", maxControlMessage))
-			return
+			return errors.New(tagControlMessageTooLong, "a control message is too long", "max", maxControlMessage)
 		}
 		if len(stream) == 0 {
 			stream = nil
@@ -620,61 +610,53 @@ func (s *Session) controlLoop(ks *keyState, conn *tls.Conn) {
 	}
 }
 
-// control handles one control message. It reports true when the session has
-// failed and the loop is to stop.
-func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (failed bool) {
+// control handles one control message. It returns the error that ends the session
+// (io.EOF for the server's EXIT once the handshake is complete), or nil.
+func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) error {
 	text := string(record[:len(record)-1]) // the text, without its NUL
 	switch {
 	case ctrlmsg.IsAuthFailed(text):
 		f := ctrlmsg.ParseAuthFailed(text)
-		s.fail(errors.New(TagAuthFailed, "the server refused the credentials",
+		return errors.New(TagAuthFailed, "the server refused the credentials",
 			"reason", f.Reason, "session", f.Session, "temporary", f.Temporary,
-			"backoff", int(f.Backoff/time.Second), "advance", f.Advance))
-		return true
+			"backoff", int(f.Backoff/time.Second), "advance", f.Advance)
 	case ctrlmsg.IsAuthPending(text):
 		s.extendHandshake(ctrlmsg.ParseAuthPending(text))
-		return false
+		return nil
 	case isExit(text):
-		s.serverExited()
-		return true
+		return s.serverExited()
 	}
 	if sig, ok := ctrlmsg.ParseSignal(text); ok {
 		if sig.Restart {
-			s.fail(errors.New(TagServerRestart, "the server asked the client to connect again", "reason", sig.Reason, "flags", sig.Flags))
-		} else {
-			s.fail(errors.New(TagServerHalt, "the server told the client to stop", "reason", sig.Reason))
+			return errors.New(TagServerRestart, "the server asked the client to connect again", "reason", sig.Reason, "flags", sig.Flags)
 		}
-		return true
+		return errors.New(TagServerHalt, "the server told the client to stop", "reason", sig.Reason)
 	}
 	if ctrlmsg.IsPushReply(text) && *ready {
 		s.pushUpdate(text)
-		return false
+		return nil
 	}
 	if !ctrlmsg.IsPushReply(text) {
 		s.log.Debug("ignored a control message", "name", ctrlmsg.Name(text))
-		return false
+		return nil
 	}
 	reply, err := ctrlmsg.ParsePushReply(text)
 	if err != nil {
-		s.fail(err)
-		return true
+		return err
 	}
 	if s.opts.PullFilter != nil {
 		if err := reply.Filter(s.opts.PullFilter); err != nil {
-			s.fail(err)
-			return true
+			return err
 		}
 	}
 	if err := pushed.Add(reply, s.opts.Ciphers); err != nil {
-		s.fail(err)
-		return true
+		return err
 	}
 	if reply.More {
-		return false
+		return nil
 	}
 	if err := pushed.Finish(); err != nil {
-		s.fail(err)
-		return true
+		return err
 	}
 	for _, name := range pushed.Unknown {
 		s.log.Warn("the server pushed an option that is not known", "option", name)
@@ -684,14 +666,13 @@ func (s *Session) control(record []byte, pushed *ctrlmsg.Pushed, ready *bool) (f
 	}
 	state := s.tlsConn.ConnectionState()
 	if err := s.setupData(pushed, &state); err != nil {
-		s.fail(err)
-		return true
+		return err
 	}
 	s.keepToken(pushed.AuthToken, pushed.AuthTokenUser)
 	s.pushed, *ready = pushed, true
 	close(s.pushDone)
 	close(s.tlsReady)
-	return false
+	return nil
 }
 
 // extendHandshake makes the end of the handshake later, as AUTH_PENDING asks: the
@@ -718,28 +699,29 @@ func (s *Session) extendHandshake(asked time.Duration) {
 	}
 }
 
-// pushRequests sends PUSH_REQUEST at once and then every 5 seconds, until the
-// reply is complete or the session ends.
-func (s *Session) pushRequests(conn *tls.Conn) {
-	defer s.wg.Done()
+// pushRequests sends PUSH_REQUEST at once and then every 5 seconds over the TLS
+// session of key id 0, until the reply is complete or the session ends. It returns
+// the error of a write that failed, which ends the session.
+func (s *Session) pushRequests() error {
+	conn := s.tlsConn // set by the TLS goroutine of key id 0 before it starts this one
 	request := ctrlmsg.AppendMessage(nil, ctrlmsg.PushRequest)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
 		select {
 		case <-s.pushDone:
-			return
+			return nil
 		case <-s.done:
-			return
+			return nil
 		case <-timer.C:
 		}
 		if _, err := conn.Write(request); err != nil {
 			select {
 			case <-s.done:
+				return nil
 			default:
-				s.fail(errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "write"))
+				return errors.NewErr(TagControlChannelFailed, err).SetMetadata("op", "write")
 			}
-			return
 		}
 		timer.Reset(pushRequestInterval)
 	}
